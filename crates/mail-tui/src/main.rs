@@ -11,15 +11,28 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
-use mail_core::{Account, Envelope, Message};
+use mail_core::{Account, Envelope, Message, Store};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use app::{App, BodyState, ListState};
 
+/// Everything a background task needs to talk to IMAP and the local
+/// cache. Cheap to clone — `Account`/`Store` are just handles.
+#[derive(Clone)]
+struct Ctx {
+    account: Account,
+    store: Store,
+    account_id: i64,
+    folder_id: i64,
+    fetch_limit: u32,
+}
+
 enum BgMsg {
-    Envelopes(Result<Vec<Envelope>, String>),
+    /// A sync finished (or failed) — carries the freshly re-read cached
+    /// envelope list so the UI never has to reason about deltas itself.
+    SyncDone(Result<Vec<Envelope>, String>),
     Body(u32, Result<Message, String>),
 }
 
@@ -71,11 +84,46 @@ async fn run(
     let config = mail_core::config::Config::load()?;
     let theme = theme::resolve(&config.theme.mode);
 
-    let mut app = App::new(account.config.email.clone());
+    let store = Store::open(&mail_core::config::db_path()?)?;
+    let account_id = store
+        .upsert_account(
+            account.config.email.clone(),
+            account.config.display_name.clone(),
+        )
+        .await?;
+    let folder = store
+        .get_or_create_folder(account_id, "INBOX".to_string())
+        .await?;
+
+    let fetch_limit = account.config.fetch_limit;
+    let ctx = Ctx {
+        account,
+        store,
+        account_id,
+        folder_id: folder.id,
+        fetch_limit,
+    };
+
+    let mut app = App::new(ctx.account.config.email.clone());
+
+    // Render instantly from whatever's cached, then reconcile with the
+    // server in the background — this is what makes launch feel instant
+    // even before the first sync of a session completes.
+    match ctx.store.list_envelopes(ctx.folder_id, ctx.fetch_limit).await {
+        Ok(envelopes) => {
+            app.list_state = if envelopes.is_empty() {
+                ListState::Loading
+            } else {
+                ListState::Loaded
+            };
+            app.envelopes = envelopes;
+        }
+        Err(e) => app.list_state = ListState::Error(e.to_string()),
+    }
 
     let (tx, mut rx) = mpsc::channel::<BgMsg>(8);
 
-    spawn_fetch_envelopes(account.clone(), tx.clone());
+    spawn_sync(ctx.clone(), tx.clone());
 
     let mut events = EventStream::new();
 
@@ -90,7 +138,7 @@ async fn run(
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        handle_key(&mut app, key.code, &account, tx.clone());
+                        handle_key(&mut app, key.code, &ctx, tx.clone());
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
@@ -101,12 +149,17 @@ async fn run(
             }
             msg = rx.recv() => {
                 match msg {
-                    Some(BgMsg::Envelopes(Ok(envelopes))) => {
+                    Some(BgMsg::SyncDone(Ok(envelopes))) => {
+                        let selected_uid = app.selected_uid();
                         app.envelopes = envelopes;
-                        app.selected = 0;
                         app.list_state = ListState::Loaded;
+                        // Keep the cursor on the same message across a
+                        // resync instead of snapping back to the top.
+                        app.selected = selected_uid
+                            .and_then(|uid| app.envelopes.iter().position(|e| e.uid == uid))
+                            .unwrap_or(0);
                     }
-                    Some(BgMsg::Envelopes(Err(e))) => {
+                    Some(BgMsg::SyncDone(Err(e))) => {
                         app.list_state = ListState::Error(e);
                     }
                     Some(BgMsg::Body(uid, Ok(message))) if app.selected_uid() == Some(uid) => {
@@ -124,35 +177,51 @@ async fn run(
     }
 }
 
-fn handle_key(app: &mut App, code: KeyCode, account: &Account, tx: mpsc::Sender<BgMsg>) {
+fn handle_key(app: &mut App, code: KeyCode, ctx: &Ctx, tx: mpsc::Sender<BgMsg>) {
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => app.select_next(),
         KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
+        KeyCode::Char('r') => {
+            app.list_state = ListState::Loading;
+            spawn_sync(ctx.clone(), tx);
+        }
         KeyCode::Enter => {
             if let Some(uid) = app.selected_uid() {
                 app.body = BodyState::Loading;
-                spawn_fetch_body(account.clone(), uid, tx);
+                spawn_fetch_body(ctx.clone(), uid, tx);
             }
         }
         _ => {}
     }
 }
 
-fn spawn_fetch_envelopes(account: Account, tx: mpsc::Sender<BgMsg>) {
+fn spawn_sync(ctx: Ctx, tx: mpsc::Sender<BgMsg>) {
     tokio::spawn(async move {
-        let result = mail_core::imap::fetch_envelopes(&account)
-            .await
-            .map_err(|e| e.to_string());
-        let _ = tx.send(BgMsg::Envelopes(result)).await;
+        let sync_result = mail_core::sync::sync_inbox(&ctx.account, &ctx.store).await;
+        let result = match sync_result {
+            Ok(_) => ctx
+                .store
+                .list_envelopes(ctx.folder_id, ctx.fetch_limit)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(BgMsg::SyncDone(result)).await;
     });
 }
 
-fn spawn_fetch_body(account: Account, uid: u32, tx: mpsc::Sender<BgMsg>) {
+fn spawn_fetch_body(ctx: Ctx, uid: u32, tx: mpsc::Sender<BgMsg>) {
     tokio::spawn(async move {
-        let result = mail_core::imap::fetch_message(&account, uid)
-            .await
-            .map_err(|e| e.to_string());
+        let result = mail_core::sync::fetch_body(
+            &ctx.account,
+            &ctx.store,
+            ctx.account_id,
+            ctx.folder_id,
+            uid,
+        )
+        .await
+        .map_err(|e| e.to_string());
         let _ = tx.send(BgMsg::Body(uid, result)).await;
     });
 }

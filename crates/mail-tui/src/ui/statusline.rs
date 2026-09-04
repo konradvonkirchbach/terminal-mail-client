@@ -9,7 +9,7 @@ use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let count = app.envelopes.len();
-    let hints = "j/k move  Enter read  q quit";
+    let hints = "j/k move  Enter read  r sync  q quit";
     let line = Line::from(vec![
         Span::styled(
             format!(" {} ", app.account_email),

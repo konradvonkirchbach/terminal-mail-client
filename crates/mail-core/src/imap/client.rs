@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use async_imap::types::Flag as ImapFlag;
+use async_imap::types::{Fetch, Flag as ImapFlag};
 use async_imap::Session;
 use futures::TryStreamExt;
 use tokio::net::TcpStream;
@@ -10,7 +10,15 @@ use crate::account::Account;
 use crate::error::{Error, Result};
 use crate::types::{Address, Envelope, Flags, Message};
 
-type ImapSession = Session<TlsStream<TcpStream>>;
+pub(crate) type ImapSession = Session<TlsStream<TcpStream>>;
+
+/// The subset of `SELECT`'s response the sync engine needs to decide
+/// between an initial and an incremental sync.
+pub(crate) struct MailboxInfo {
+    pub exists: u32,
+    pub uid_validity: u32,
+    pub uid_next: u32,
+}
 
 fn tls_connector() -> Result<TlsConnector> {
     let mut root_store = rustls::RootCertStore::empty();
@@ -30,14 +38,20 @@ fn tls_connector() -> Result<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-async fn connect(host: &str, port: u16, email: &str, password: &str) -> Result<ImapSession> {
-    let tcp = TcpStream::connect((host, port))
+/// Opens a fresh authenticated session. Callers drive `SELECT`/`FETCH`
+/// themselves so a whole sync pass (select + several fetches) can share
+/// one connection instead of reconnecting per command.
+pub(crate) async fn open_session(account: &Account) -> Result<ImapSession> {
+    let password = account.password()?;
+    let cfg = &account.config;
+
+    let tcp = TcpStream::connect((cfg.imap_host.as_str(), cfg.imap_port))
         .await
-        .map_err(|e| Error::ImapConnect(format!("{host}:{port}: {e}")))?;
+        .map_err(|e| Error::ImapConnect(format!("{}:{}: {e}", cfg.imap_host, cfg.imap_port)))?;
 
     let connector = tls_connector()?;
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|e| Error::Tls(format!("invalid hostname {host:?}: {e}")))?;
+    let server_name = rustls::pki_types::ServerName::try_from(cfg.imap_host.clone())
+        .map_err(|e| Error::Tls(format!("invalid hostname {:?}: {e}", cfg.imap_host)))?;
     let tls_stream = connector
         .connect(server_name, tcp)
         .await
@@ -45,34 +59,37 @@ async fn connect(host: &str, port: u16, email: &str, password: &str) -> Result<I
 
     let client = async_imap::Client::new(tls_stream);
     let session = client
-        .login(email, password)
+        .login(&cfg.email, &password)
         .await
         .map_err(|(e, _client)| Error::ImapConnect(format!("login failed: {e}")))?;
 
     Ok(session)
 }
 
-/// Fetches the most recent `fetch_limit` message headers from INBOX. Opens
-/// a fresh connection per call — Phase 1 has no persistent session/cache
-/// yet, that arrives with the sync engine.
-pub async fn fetch_envelopes(account: &Account) -> Result<Vec<Envelope>> {
-    let password = account.password()?;
-    let cfg = &account.config;
-    let mut session = connect(&cfg.imap_host, cfg.imap_port, &cfg.email, &password).await?;
-
+pub(crate) async fn select_inbox(session: &mut ImapSession) -> Result<MailboxInfo> {
     let mailbox = session
         .select("INBOX")
         .await
         .map_err(|e| Error::Imap(format!("SELECT INBOX: {e}")))?;
 
-    if mailbox.exists == 0 {
-        let _ = session.logout().await;
-        return Ok(Vec::new());
-    }
+    Ok(MailboxInfo {
+        exists: mailbox.exists,
+        uid_validity: mailbox.uid_validity.unwrap_or(0),
+        uid_next: mailbox.uid_next.unwrap_or(mailbox.exists + 1),
+    })
+}
 
-    let end = mailbox.exists;
-    let start = end.saturating_sub(cfg.fetch_limit.saturating_sub(1)).max(1);
+pub(crate) async fn logout(session: &mut ImapSession) {
+    let _ = session.logout().await;
+}
 
+/// Fetches envelopes for a sequence-number range (`start:end`), used for
+/// the initial bulk sync of a folder.
+pub(crate) async fn fetch_envelope_seq_range(
+    session: &mut ImapSession,
+    start: u32,
+    end: u32,
+) -> Result<Vec<Envelope>> {
     let fetches: Vec<_> = session
         .fetch(format!("{start}:{end}"), "(UID FLAGS BODY.PEEK[HEADER])")
         .await
@@ -81,51 +98,79 @@ pub async fn fetch_envelopes(account: &Account) -> Result<Vec<Envelope>> {
         .await
         .map_err(|e| Error::Imap(e.to_string()))?;
 
-    let mut envelopes = Vec::with_capacity(fetches.len());
-    for f in &fetches {
-        let Some(uid) = f.uid else { continue };
-        let flags = to_flags(f.flags());
-        let header_bytes = f.header().unwrap_or_default();
-        let parsed = mail_parser::MessageParser::default().parse(header_bytes);
-
-        let (subject, from, to, date) = match &parsed {
-            Some(msg) => (
-                msg.subject().unwrap_or_default().to_string(),
-                convert_addresses(msg.from()),
-                convert_addresses(msg.to()),
-                msg.date().map(mail_date_to_chrono),
-            ),
-            None => (String::new(), Vec::new(), Vec::new(), None),
-        };
-
-        envelopes.push(Envelope {
-            uid,
-            subject,
-            from,
-            to,
-            date,
-            flags,
-            has_attachments: false,
-        });
-    }
-
-    // Newest first.
-    envelopes.sort_by_key(|e| std::cmp::Reverse(e.uid));
-
-    let _ = session.logout().await;
-    Ok(envelopes)
+    Ok(fetches.iter().filter_map(envelope_from_fetch).collect())
 }
 
-/// Fetches and parses the full body of a single message by UID.
-pub async fn fetch_message(account: &Account, uid: u32) -> Result<Message> {
-    let password = account.password()?;
-    let cfg = &account.config;
-    let mut session = connect(&cfg.imap_host, cfg.imap_port, &cfg.email, &password).await?;
-
-    session
-        .select("INBOX")
+/// Fetches envelopes for a specific UID set (e.g. `"42,57:60"`), used to
+/// pull down mail that arrived since the last sync.
+pub(crate) async fn fetch_envelopes_by_uid(
+    session: &mut ImapSession,
+    uid_set: &str,
+) -> Result<Vec<Envelope>> {
+    let fetches: Vec<_> = session
+        .uid_fetch(uid_set, "(UID FLAGS BODY.PEEK[HEADER])")
         .await
-        .map_err(|e| Error::Imap(format!("SELECT INBOX: {e}")))?;
+        .map_err(|e| Error::Imap(format!("UID FETCH {uid_set}: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| Error::Imap(e.to_string()))?;
+
+    Ok(fetches.iter().filter_map(envelope_from_fetch).collect())
+}
+
+/// Fetches just flags for a UID set — the cheap half of the incremental
+/// sync's "did anything change" sweep over recently-cached messages.
+pub(crate) async fn fetch_flags_by_uid(
+    session: &mut ImapSession,
+    uid_set: &str,
+) -> Result<Vec<(u32, Flags)>> {
+    let fetches: Vec<_> = session
+        .uid_fetch(uid_set, "(UID FLAGS)")
+        .await
+        .map_err(|e| Error::Imap(format!("UID FETCH {uid_set}: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| Error::Imap(e.to_string()))?;
+
+    Ok(fetches
+        .iter()
+        .filter_map(|f| f.uid.map(|uid| (uid, to_flags(f.flags()))))
+        .collect())
+}
+
+fn envelope_from_fetch(f: &Fetch) -> Option<Envelope> {
+    let uid = f.uid?;
+    let flags = to_flags(f.flags());
+    let header_bytes = f.header().unwrap_or_default();
+    let parsed = mail_parser::MessageParser::default().parse(header_bytes);
+
+    let (subject, from, to, date) = match &parsed {
+        Some(msg) => (
+            msg.subject().unwrap_or_default().to_string(),
+            convert_addresses(msg.from()),
+            convert_addresses(msg.to()),
+            msg.date().map(mail_date_to_chrono),
+        ),
+        None => (String::new(), Vec::new(), Vec::new(), None),
+    };
+
+    Some(Envelope {
+        uid,
+        subject,
+        from,
+        to,
+        date,
+        flags,
+        has_attachments: false,
+    })
+}
+
+/// Fetches the raw RFC822 bytes of a single message by UID. Opens its own
+/// connection — called on demand when the user opens a message that isn't
+/// already cached on disk.
+pub(crate) async fn fetch_message_raw(account: &Account, uid: u32) -> Result<Vec<u8>> {
+    let mut session = open_session(account).await?;
+    select_inbox(&mut session).await?;
 
     let fetches: Vec<_> = session
         .uid_fetch(uid.to_string(), "(UID BODY[])")
@@ -135,13 +180,18 @@ pub async fn fetch_message(account: &Account, uid: u32) -> Result<Message> {
         .await
         .map_err(|e| Error::Imap(e.to_string()))?;
 
-    let _ = session.logout().await;
+    logout(&mut session).await;
 
-    let raw = fetches
+    fetches
         .first()
         .and_then(|f| f.body())
-        .ok_or_else(|| Error::Imap(format!("no such message: uid {uid}")))?;
+        .map(|b| b.to_vec())
+        .ok_or_else(|| Error::Imap(format!("no such message: uid {uid}")))
+}
 
+/// Parses raw RFC822 bytes (freshly fetched or read back from the on-disk
+/// cache) into our `Message` type.
+pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
     let parsed = mail_parser::MessageParser::default()
         .parse(raw)
         .ok_or_else(|| Error::Parse(format!("failed to parse message uid {uid}")))?;

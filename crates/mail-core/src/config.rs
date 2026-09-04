@@ -86,6 +86,24 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(dirs.config_dir().join("config.toml"))
 }
 
+fn data_dir() -> Result<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "email_client")
+        .ok_or_else(|| Error::Config("could not determine data directory".into()))?;
+    Ok(dirs.data_dir().to_path_buf())
+}
+
+/// Path to the local SQLite cache.
+pub fn db_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join("mail.db"))
+}
+
+/// Directory raw `.eml` bodies are cached under for one account, keyed by
+/// its local (SQLite) account id rather than its email address so the
+/// on-disk layout survives an account being renamed/re-added.
+pub fn messages_dir(account_id: i64) -> Result<PathBuf> {
+    Ok(data_dir()?.join(account_id.to_string()).join("messages"))
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let path = config_path()?;

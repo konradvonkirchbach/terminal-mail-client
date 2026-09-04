@@ -6,8 +6,11 @@ pub mod account;
 pub mod config;
 pub mod error;
 pub mod imap;
+pub mod store;
+pub mod sync;
 pub mod types;
 
 pub use account::Account;
 pub use error::{Error, Result};
+pub use store::Store;
 pub use types::{Envelope, Flag, Message};
