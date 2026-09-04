@@ -1,0 +1,21 @@
+[package]
+name = "mail-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-imap = { version = "0.11.3", default-features = false, features = ["runtime-tokio"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+directories = "6.0.0"
+futures = "0.3.34"
+keyring = "4.2.0"
+mail-parser = "0.11.8"
+rustls = "0.23.43"
+rustls-native-certs = "0.8.4"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+tokio-rustls = "0.26.5"
+toml = "1.1.5"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
