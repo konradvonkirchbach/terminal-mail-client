@@ -190,6 +190,60 @@ pub fn get_message_raw_path(conn: &Connection, folder_id: i64, uid: u32) -> Resu
     .map_err(Into::into)
 }
 
+pub struct OutboxItem {
+    pub id: i64,
+    pub raw_mime_path: String,
+    pub recipients: Vec<String>,
+    pub attempts: i64,
+}
+
+pub fn insert_outbox(
+    conn: &Connection,
+    account_id: i64,
+    raw_mime_path: &str,
+    recipients: &[String],
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO outbox (account_id, raw_mime_path, recipients, created_at)
+         VALUES (?1, ?2, ?3, strftime('%s','now'))",
+        params![account_id, raw_mime_path, recipients.join(",")],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_outbox(conn: &Connection, account_id: i64) -> Result<Vec<OutboxItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, raw_mime_path, recipients, attempts FROM outbox WHERE account_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![account_id], |row| {
+        let recipients: String = row.get(2)?;
+        Ok(OutboxItem {
+            id: row.get(0)?,
+            raw_mime_path: row.get(1)?,
+            recipients: recipients
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            attempts: row.get(3)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
+pub fn delete_outbox(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM outbox WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn record_outbox_failure(conn: &Connection, id: i64, error: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE outbox SET attempts = attempts + 1, last_error = ?2 WHERE id = ?1",
+        params![id, error],
+    )?;
+    Ok(())
+}
+
 fn parse_addrs(json: &str) -> Vec<Address> {
     serde_json::from_str(json).unwrap_or_default()
 }

@@ -63,6 +63,10 @@ CREATE TABLE outbox (
     id              INTEGER PRIMARY KEY,
     account_id      INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     raw_mime_path   TEXT NOT NULL,
+    -- Comma-separated envelope recipients (To+Cc+Bcc). Kept separately
+    -- because the Bcc header itself is stripped from raw_mime_path's
+    -- contents before sending, so it can't be recovered by re-parsing.
+    recipients      TEXT NOT NULL DEFAULT '',
     created_at      INTEGER NOT NULL,
     attempts        INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT

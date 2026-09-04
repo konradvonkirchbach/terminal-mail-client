@@ -104,6 +104,12 @@ pub fn messages_dir(account_id: i64) -> Result<PathBuf> {
     Ok(data_dir()?.join(account_id.to_string()).join("messages"))
 }
 
+/// Directory queued-but-unsent raw messages are held under, for one
+/// account, until `send::flush_outbox` manages to deliver them.
+pub fn outbox_dir(account_id: i64) -> Result<PathBuf> {
+    Ok(data_dir()?.join(account_id.to_string()).join("outbox"))
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let path = config_path()?;

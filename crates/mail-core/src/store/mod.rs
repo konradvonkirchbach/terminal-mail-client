@@ -3,7 +3,7 @@ mod queries;
 mod schema;
 
 pub use db::Store;
-pub use queries::FolderRow;
+pub use queries::{FolderRow, OutboxItem};
 
 use crate::error::Result;
 use crate::types::{Envelope, Flags};
@@ -70,6 +70,30 @@ impl Store {
 
     pub async fn get_message_raw_path(&self, folder_id: i64, uid: u32) -> Result<Option<String>> {
         self.run(move |conn| queries::get_message_raw_path(conn, folder_id, uid))
+            .await
+    }
+
+    pub async fn insert_outbox(
+        &self,
+        account_id: i64,
+        raw_mime_path: String,
+        recipients: Vec<String>,
+    ) -> Result<i64> {
+        self.run(move |conn| queries::insert_outbox(conn, account_id, &raw_mime_path, &recipients))
+            .await
+    }
+
+    pub async fn list_outbox(&self, account_id: i64) -> Result<Vec<OutboxItem>> {
+        self.run(move |conn| queries::list_outbox(conn, account_id))
+            .await
+    }
+
+    pub async fn delete_outbox(&self, id: i64) -> Result<()> {
+        self.run(move |conn| queries::delete_outbox(conn, id)).await
+    }
+
+    pub async fn record_outbox_failure(&self, id: i64, error: String) -> Result<()> {
+        self.run(move |conn| queries::record_outbox_failure(conn, id, &error))
             .await
     }
 }

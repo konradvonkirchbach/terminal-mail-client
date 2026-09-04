@@ -210,6 +210,37 @@ pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
     })
 }
 
+/// Common `Sent` mailbox names across providers. We don't yet do
+/// SPECIAL-USE detection (`LIST ... RETURN (SPECIAL-USE)`), so this is a
+/// best-effort fallback list rather than a guarantee — filing a sent copy
+/// is not allowed to block the send itself.
+const SENT_FOLDER_CANDIDATES: &[&str] = &["Sent", "Sent Mail", "Sent Items", "[Gmail]/Sent Mail"];
+
+/// Files a copy of a just-sent message into the account's Sent folder.
+/// Opens its own connection; failures are non-fatal to the caller (the
+/// message was already sent via SMTP) so this returns an error only when
+/// none of the candidate folder names worked.
+pub async fn append_to_sent(account: &Account, raw: &[u8]) -> Result<()> {
+    let mut session = open_session(account).await?;
+
+    let mut last_err = None;
+    for name in SENT_FOLDER_CANDIDATES {
+        match session.append(*name, Some(r"(\Seen)"), None, raw).await {
+            Ok(()) => {
+                logout(&mut session).await;
+                return Ok(());
+            }
+            Err(e) => last_err = Some(e.to_string()),
+        }
+    }
+
+    logout(&mut session).await;
+    Err(Error::Imap(format!(
+        "could not file a Sent copy in any of {SENT_FOLDER_CANDIDATES:?}: {}",
+        last_err.unwrap_or_default()
+    )))
+}
+
 fn to_flags<'a>(flags: impl Iterator<Item = ImapFlag<'a>>) -> Flags {
     let mut out = Flags::default();
     for flag in flags {

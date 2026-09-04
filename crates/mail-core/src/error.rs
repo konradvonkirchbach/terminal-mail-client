@@ -17,6 +17,9 @@ pub enum Error {
     #[error("IMAP protocol error: {0}")]
     Imap(String),
 
+    #[error("SMTP error: {0}")]
+    Smtp(String),
+
     #[error("TLS error: {0}")]
     Tls(String),
 

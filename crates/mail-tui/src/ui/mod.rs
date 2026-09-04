@@ -1,3 +1,4 @@
+mod compose;
 mod message_list;
 mod reading_pane;
 mod sidebar;
@@ -10,6 +11,14 @@ use crate::app::App;
 use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
+    // Compose is a full-screen takeover, not a floating popup — a flat
+    // aesthetic gets nothing from stacking panes.
+    if let Some(compose_state) = &app.compose {
+        let area = frame.area();
+        compose::draw(frame, area, compose_state, theme);
+        return;
+    }
+
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
