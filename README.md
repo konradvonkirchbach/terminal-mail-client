@@ -23,10 +23,12 @@ notifications for new mail.
 - **Recipient autocomplete** — fuzzy-find To/Cc/Bcc against everyone you've
   ever received mail from (automated no-reply senders excluded)
 - **Spellcheck** — underlines misspelled words in the compose body, checked
-  against every Hunspell dictionary installed on your system at once (so it
-  works across languages with no configuration); move the cursor onto a
-  flagged word to see its suggested corrections; off automatically if none
-  is installed
+  against the Hunspell dictionary matching your active keyboard layout
+  (re-detected each time you open compose, so switching layout before
+  writing picks the right one) — no configuration needed beyond installing
+  a dictionary per language you type in; move the cursor onto a flagged
+  word to see its suggested corrections; off automatically if none is
+  installed
 - **Attachment downloads** — same directory browser, in reverse
 - **Search** — live filter the inbox by sender or subject; if nothing
   matches locally, hitting `Enter` falls back to a server-side search so you
@@ -86,10 +88,14 @@ that plus a dictionary for whichever language(s) you write in:
 sudo pacman -S hunspell hunspell-en_us   # or hunspell-de, hunspell-es_es, ...
 ```
 
-Every dictionary you have installed is checked against at once — install
-more than one and compose flags misspellings correctly in each language,
-no configuration needed. If neither is installed, spellcheck just stays off
-(you'll see a one-time status message saying so at launch).
+It automatically uses the dictionary matching your **active keyboard
+layout** (via `hyprctl`), so typing in German only flags German mistakes
+and typing in English only flags English ones — switch layouts, open
+compose, and it picks the right dictionary with no configuration. If
+Hyprland's layout can't be read (not running under Hyprland, say), it
+falls back to your system locale (`$LANG`). If nothing installed matches
+either, spellcheck just stays off (a one-time status message says so at
+launch) — install a dictionary per language you type in to cover them all.
 
 ## Getting started
 

@@ -115,6 +115,118 @@ fn has_dictionary_pair(dir: &Path, stem: &str) -> bool {
     dir.join(format!("{stem}.aff")).is_file() && dir.join(format!("{stem}.dic")).is_file()
 }
 
+/// The single dictionary matching the language actually being typed in
+/// right now, rather than every installed dictionary at once — see
+/// `active_language`. Prefers a dictionary matching the system locale's
+/// own region (`de_DE` over `de_AT`) when more than one is installed for
+/// that language, otherwise the alphabetically first match; falls back
+/// to `None` when nothing installed matches.
+pub fn find_dictionary_for_active_language(search_dirs: &[PathBuf]) -> Option<PathBuf> {
+    best_dictionary_for_language(&active_language(), &detect_locale(), search_dirs)
+}
+
+/// The language currently being typed in: Hyprland's active keyboard
+/// layout when that can be read (re-checking this each time compose
+/// opens is how switching layout before writing a new email picks up
+/// the right dictionary — see `spawn_spellchecker_reload` in `main.rs`),
+/// falling back to the system locale's language otherwise. Exposed
+/// separately from `find_dictionary_for_active_language` so a caller
+/// can name the language in a message (e.g. "no dictionary installed
+/// for German") without duplicating this fallback logic.
+pub fn active_language() -> String {
+    active_keyboard_language().unwrap_or_else(|| {
+        let locale = detect_locale();
+        locale.split('_').next().unwrap_or(&locale).to_string()
+    })
+}
+
+fn best_dictionary_for_language(lang_prefix: &str, preferred_locale: &str, search_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = find_dictionaries(search_dirs)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|stem| stem.split('_').next())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(lang_prefix))
+        })
+        .collect();
+    candidates.sort();
+
+    candidates
+        .iter()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(preferred_locale))
+        .or_else(|| candidates.first())
+        .cloned()
+}
+
+/// Reads Hyprland's currently active keyboard layout via `hyprctl` and
+/// reduces it to the two-letter language code Hunspell dictionary
+/// filenames use as their prefix. `None` when `hyprctl` isn't available
+/// (not running under Hyprland), its output can't be parsed, or the
+/// active layout's language isn't in `language_name_to_code`'s table.
+fn active_keyboard_language() -> Option<String> {
+    let output = std::process::Command::new("hyprctl").args(["devices", "-j"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let keyboards = json.get("keyboards")?.as_array()?;
+    // Several virtual "keyboards" (power button, lid switch, ...) report
+    // a layout too; `main` picks out the real physical/primary one.
+    let active_keymap = keyboards
+        .iter()
+        .find(|kb| kb.get("main").and_then(serde_json::Value::as_bool) == Some(true))
+        .or_else(|| keyboards.first())
+        .and_then(|kb| kb.get("active_keymap"))
+        .and_then(|v| v.as_str())?;
+    language_name_to_code(keymap_language_name(active_keymap)).map(str::to_string)
+}
+
+/// Reduces an XKB "active keymap" description, as Hyprland reports it
+/// (e.g. `"German (no dead keys)"` or `"English (US, intl., with dead
+/// keys)"`), to just the language-name part before the first `(`.
+fn keymap_language_name(active_keymap: &str) -> &str {
+    active_keymap.split('(').next().unwrap_or(active_keymap).trim()
+}
+
+/// Maps the English language name XKB layout descriptions use to the
+/// two-letter code Hunspell dictionary filenames use as their prefix.
+/// Covers common European layouts; anything else falls through to the
+/// locale-based fallback in `active_language`.
+fn language_name_to_code(name: &str) -> Option<&'static str> {
+    Some(match name.to_lowercase().as_str() {
+        "english" => "en",
+        "german" => "de",
+        "french" => "fr",
+        "spanish" => "es",
+        "italian" => "it",
+        "portuguese" => "pt",
+        "dutch" => "nl",
+        "polish" => "pl",
+        "russian" => "ru",
+        "swedish" => "sv",
+        "norwegian" => "nb",
+        "danish" => "da",
+        "finnish" => "fi",
+        "czech" => "cs",
+        "slovak" => "sk",
+        "hungarian" => "hu",
+        "romanian" => "ro",
+        "greek" => "el",
+        "turkish" => "tr",
+        "ukrainian" => "uk",
+        "croatian" => "hr",
+        "bulgarian" => "bg",
+        "serbian" => "sr",
+        "slovenian" => "sl",
+        "estonian" => "et",
+        "latvian" => "lv",
+        "lithuanian" => "lt",
+        "icelandic" => "is",
+        _ => return None,
+    })
+}
+
 /// Parses one line of Hunspell's `-a` pipe output. A `&` line (a "near
 /// miss" with suggestions) or a `#` line (no suggestions found) marks a
 /// misspelled word; every other line — `*` exact match, `+`/`-`
@@ -474,6 +586,81 @@ mod tests {
 
         let found = find_dictionaries(&[real.0.clone(), linked.0.clone()]);
         assert_eq!(found, vec![real.0.join("en_US")], "the symlinked duplicate must be skipped");
+    }
+
+    // -- keyboard-layout language mapping ---------------------------------
+
+    #[test]
+    fn keymap_language_name_strips_the_parenthetical_variant() {
+        assert_eq!(keymap_language_name("German (no dead keys)"), "German");
+        assert_eq!(keymap_language_name("English (US, intl., with dead keys)"), "English");
+    }
+
+    #[test]
+    fn keymap_language_name_leaves_a_plain_name_untouched() {
+        assert_eq!(keymap_language_name("German"), "German");
+    }
+
+    #[test]
+    fn language_name_to_code_maps_common_layout_names_case_insensitively() {
+        assert_eq!(language_name_to_code("German"), Some("de"));
+        assert_eq!(language_name_to_code("english"), Some("en"));
+        assert_eq!(language_name_to_code("FRENCH"), Some("fr"));
+    }
+
+    #[test]
+    fn language_name_to_code_returns_none_for_an_unrecognized_name() {
+        assert_eq!(language_name_to_code("Klingon"), None);
+    }
+
+    // -- picking a single dictionary for a language ---------------------------
+
+    #[test]
+    fn best_dictionary_for_language_matches_the_language_prefix_only() {
+        let dir = ScratchDir::new("lang-match");
+        dir.touch("de_DE.aff");
+        dir.touch("de_DE.dic");
+        dir.touch("en_US.aff");
+        dir.touch("en_US.dic");
+
+        let found = best_dictionary_for_language("de", "de_AT", std::slice::from_ref(&dir.0));
+        assert_eq!(found, Some(dir.0.join("de_DE")));
+    }
+
+    #[test]
+    fn best_dictionary_for_language_prefers_the_locales_own_region() {
+        let dir = ScratchDir::new("lang-region-preference");
+        dir.touch("de_AT.aff");
+        dir.touch("de_AT.dic");
+        dir.touch("de_DE.aff");
+        dir.touch("de_DE.dic");
+
+        // de_AT sorts first alphabetically, but the caller's locale says
+        // de_DE — that must win over alphabetical order.
+        let found = best_dictionary_for_language("de", "de_DE", std::slice::from_ref(&dir.0));
+        assert_eq!(found, Some(dir.0.join("de_DE")));
+    }
+
+    #[test]
+    fn best_dictionary_for_language_falls_back_to_the_first_match_when_the_locale_region_is_not_installed() {
+        let dir = ScratchDir::new("lang-no-region-match");
+        dir.touch("de_AT.aff");
+        dir.touch("de_AT.dic");
+        dir.touch("de_CH.aff");
+        dir.touch("de_CH.dic");
+
+        // Neither installed dictionary matches the de_DE locale exactly.
+        let found = best_dictionary_for_language("de", "de_DE", std::slice::from_ref(&dir.0));
+        assert_eq!(found, Some(dir.0.join("de_AT")), "falls back to the alphabetically first match");
+    }
+
+    #[test]
+    fn best_dictionary_for_language_returns_none_when_nothing_matches() {
+        let dir = ScratchDir::new("lang-no-match-at-all");
+        dir.touch("fr_FR.aff");
+        dir.touch("fr_FR.dic");
+
+        assert_eq!(best_dictionary_for_language("de", "de_DE", std::slice::from_ref(&dir.0)), None);
     }
 
     // -- word normalization -----------------------------------------------------

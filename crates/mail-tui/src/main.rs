@@ -118,6 +118,13 @@ enum BgMsg {
     /// Sent instead of `SpellCheckLine` after an edit that changes the
     /// line count, since a single patched index could no longer line up.
     SpellCheckFull(Vec<std::collections::HashMap<String, Vec<String>>>),
+    /// A (re)detection of the dictionary matching the active keyboard
+    /// layout finished — replaces whatever spellchecker was running.
+    /// Fired at startup and again every time compose opens, so switching
+    /// keyboard layout before writing a new email picks up the matching
+    /// dictionary; `None` if no installed dictionary matches (or none is
+    /// installed at all), which simply turns spellcheck off.
+    SpellCheckerReady(Option<spellcheck::SpellCheckHandle>),
 }
 
 fn init_tracing() -> anyhow::Result<()> {
@@ -241,15 +248,16 @@ async fn run(
     spawn_known_senders(accounts.current().clone(), tx.clone());
 
     // Compose's spellcheck rides on whatever Hunspell dictionary matches
-    // the system's language — entirely optional, so a missing binary or
-    // dictionary just leaves it off for the session instead of failing
-    // startup.
+    // the language actually being typed in — entirely optional, so a
+    // missing binary or dictionary just leaves it off for the session
+    // instead of failing startup. Re-detected on every compose open too
+    // (see the 'c'/'r' key handlers), so switching keyboard layout
+    // before writing a new email picks up the matching dictionary.
     let spellcheck_handle = spawn_spellchecker(tx.clone()).await;
     if spellcheck_handle.is_none() {
-        let lang = spellcheck::detect_locale();
-        let lang_prefix = lang.split('_').next().unwrap_or(&lang);
+        let lang = spellcheck::active_language();
         app.set_status(format!(
-            "Spellcheck unavailable — install hunspell and a matching dictionary (e.g. hunspell-{lang_prefix}) to enable it."
+            "Spellcheck unavailable — install hunspell and a matching dictionary (e.g. hunspell-{lang}) to enable it."
         ));
     }
 
@@ -422,6 +430,9 @@ async fn run(
                             compose.set_all_misspellings(by_line);
                         }
                     }
+                    Some(BgMsg::SpellCheckerReady(handle)) => {
+                        session.spellcheck = handle;
+                    }
                     Some(BgMsg::RemoteSearchDone { account_id, query, result }) => {
                         let still_relevant = account_id == session.accounts.current().account_id
                             && app.search.as_ref().is_some_and(|s| s.value.trim() == query);
@@ -550,12 +561,14 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session: &m
         KeyCode::Char('c') => {
             app.status_message = None;
             app.compose = Some(ComposeState::blank());
+            spawn_spellchecker_reload(session.tx.clone());
         }
         KeyCode::Char('r') => {
             let reply = app.selected_envelope().map(ComposeState::reply);
             if let Some(reply) = reply {
                 app.status_message = None;
                 app.compose = Some(reply);
+                spawn_spellchecker_reload(session.tx.clone());
             }
         }
         KeyCode::Enter => {
@@ -1067,17 +1080,15 @@ fn spawn_known_senders(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
     );
 }
 
-/// Spawns the Hunspell process for the detected system locale (if a
-/// matching dictionary is installed) along with the task that feeds it
-/// text and reports results back over `tx`. Returns `None` — spellcheck
-/// simply stays off for the session — when there's no `hunspell` binary
-/// or no dictionary for the detected language; see `spellcheck.rs`.
+/// Spawns the Hunspell process for whichever dictionary matches the
+/// language currently being typed in (see `spellcheck::active_language`)
+/// along with the task that feeds it text and reports results back over
+/// `tx`. Returns `None` — spellcheck simply stays off — when there's no
+/// `hunspell` binary or no dictionary installed for that language; see
+/// `spellcheck.rs`.
 async fn spawn_spellchecker(tx: mpsc::Sender<BgMsg>) -> Option<spellcheck::SpellCheckHandle> {
-    let dicts = spellcheck::find_dictionaries(&spellcheck::default_search_dirs());
-    if dicts.is_empty() {
-        return None;
-    }
-    let mut checker = spellcheck::SpellChecker::spawn(&dicts).await.ok()?;
+    let dict = spellcheck::find_dictionary_for_active_language(&spellcheck::default_search_dirs())?;
+    let mut checker = spellcheck::SpellChecker::spawn(std::slice::from_ref(&dict)).await.ok()?;
 
     let (request_tx, mut request_rx) = tokio::sync::watch::channel(spellcheck::SpellCheckRequest::default());
     tokio::spawn(async move {
@@ -1128,6 +1139,20 @@ async fn spawn_spellchecker(tx: mpsc::Sender<BgMsg>) -> Option<spellcheck::Spell
     });
 
     Some(spellcheck::SpellCheckHandle::new(request_tx))
+}
+
+/// Re-detects the active keyboard layout and (re)spawns a spellchecker
+/// for whatever dictionary now matches it, replacing whatever was
+/// running — called every time compose opens, so switching layout
+/// before writing a new email is picked up. Always spawns fresh rather
+/// than checking whether the language actually changed first: starting
+/// a new Hunspell process is cheap (tens of milliseconds) and this only
+/// runs once per compose session, not per keystroke.
+fn spawn_spellchecker_reload(tx: mpsc::Sender<BgMsg>) {
+    tokio::spawn(async move {
+        let handle = spawn_spellchecker(tx.clone()).await;
+        let _ = tx.send(BgMsg::SpellCheckerReady(handle)).await;
+    });
 }
 
 fn spawn_delete_message(ctx: AccountCtx, uid: u32, tx: mpsc::Sender<BgMsg>) {
