@@ -113,6 +113,12 @@ async fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--add-account") {
         return setup::add_account();
     }
+    if std::env::args().any(|a| a == "--remove-account") {
+        return setup::remove_account().await;
+    }
+    if std::env::args().any(|a| a == "--set-default-account") {
+        return setup::set_default_account();
+    }
 
     init_tracing()?;
     let accounts = load_or_setup_accounts()?;
@@ -156,9 +162,15 @@ async fn run(
             fetch_limit,
         });
     }
-    let mut accounts = Accounts { list, current: 0 };
+    let current = config
+        .default_account
+        .as_deref()
+        .and_then(|email| list.iter().position(|a| a.account.config.email == email))
+        .unwrap_or(0);
+    let mut accounts = Accounts { list, current };
 
     let mut app = App::new(accounts.list.iter().map(|a| a.account.config.email.clone()).collect());
+    app.current_account = accounts.current;
 
     // Render instantly from whatever's cached, then reconcile with the
     // server in the background — this is what makes launch feel instant

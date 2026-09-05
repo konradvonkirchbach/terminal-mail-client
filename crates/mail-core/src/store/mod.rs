@@ -14,6 +14,10 @@ impl Store {
             .await
     }
 
+    pub async fn delete_account(&self, account_id: i64) -> Result<()> {
+        self.run(move |conn| queries::delete_account(conn, account_id)).await
+    }
+
     pub async fn get_or_create_folder(&self, account_id: i64, name: String) -> Result<FolderRow> {
         self.run(move |conn| queries::get_or_create_folder(conn, account_id, &name))
             .await

@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use mail_core::config::{AccountConfig, Config};
-use mail_core::Account;
+use mail_core::{Account, Store};
 
 /// First-run interactive wizard: prompts for one account's connection
 /// details on stdin, stores the password in the OS keyring, and writes
@@ -57,6 +57,81 @@ pub fn add_account() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `mailc --remove-account`: deletes an account's config entry, its
+/// keyring secret, and its entire local cache (cached messages,
+/// attachments, on-disk `.eml`/outbox files) — asks for confirmation
+/// first since none of that is recoverable.
+pub async fn remove_account() -> anyhow::Result<()> {
+    let mut config = Config::load()?;
+    if config.accounts.is_empty() {
+        anyhow::bail!("no accounts configured");
+    }
+
+    let index = pick_account(&config.accounts, "remove")?;
+    let account_config = config.accounts[index].clone();
+
+    print!(
+        "Remove {} and delete its local cache? This cannot be undone. [y/N] ",
+        account_config.email
+    );
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    if !line.trim().eq_ignore_ascii_case("y") {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    config.accounts.remove(index);
+    if config.default_account.as_deref() == Some(account_config.email.as_str()) {
+        config.default_account = None;
+    }
+    config.save()?;
+
+    let account = Account::new(account_config.clone());
+    if let Err(e) = account.delete_password() {
+        eprintln!("warning: failed to remove keyring entry: {e}");
+    }
+
+    // The accounts row cascades to folders/messages/attachments/drafts/
+    // outbox via foreign keys; only the on-disk files need a separate pass.
+    let store = Store::open(&mail_core::config::db_path()?)?;
+    let account_id = store
+        .upsert_account(account_config.email.clone(), account_config.display_name.clone())
+        .await?;
+    store.delete_account(account_id).await?;
+    let _ = std::fs::remove_dir_all(mail_core::config::messages_dir(account_id)?);
+    let _ = std::fs::remove_dir_all(mail_core::config::outbox_dir(account_id)?);
+
+    println!("Removed {}.", account_config.email);
+    Ok(())
+}
+
+/// `mailc --set-default-account`: picks which configured account should
+/// be current when `mailc` launches, instead of always whichever happens
+/// to be first in the config file.
+pub fn set_default_account() -> anyhow::Result<()> {
+    let mut config = Config::load()?;
+    if config.accounts.is_empty() {
+        anyhow::bail!("no accounts configured yet — run `mailc` once to set one up first");
+    }
+
+    if config.accounts.len() == 1 {
+        let email = config.accounts[0].email.clone();
+        config.default_account = Some(email.clone());
+        config.save()?;
+        println!("Only one account configured ({email}) — nothing else for it to default over.");
+        return Ok(());
+    }
+
+    let index = pick_account(&config.accounts, "set as default")?;
+    let email = config.accounts[index].email.clone();
+    config.default_account = Some(email.clone());
+    config.save()?;
+    println!("{email} will now be open when mailc launches.");
+    Ok(())
+}
+
 /// `mailc --set-password`: updates the stored password/app-password for
 /// an already-configured account without touching anything else (host,
 /// port, etc.) or wiping the config file. Doesn't touch the TUI at all.
@@ -66,27 +141,33 @@ pub fn set_password() -> anyhow::Result<()> {
         anyhow::bail!("no account configured yet — run `mailc` once to set one up first");
     }
 
-    let account_config = if config.accounts.len() == 1 {
-        config.accounts.into_iter().next().unwrap()
-    } else {
-        println!("Multiple accounts configured:");
-        for (i, a) in config.accounts.iter().enumerate() {
-            println!("  {}) {}", i + 1, a.email);
-        }
-        let choice: usize = prompt("Which account")?
-            .parse()
-            .ok()
-            .filter(|n| *n >= 1 && *n <= config.accounts.len())
-            .ok_or_else(|| anyhow::anyhow!("enter a number from the list above"))?;
-        config.accounts.into_iter().nth(choice - 1).unwrap()
-    };
-
-    let account = Account::new(account_config);
+    let index = pick_account(&config.accounts, "update")?;
+    let account = Account::new(config.accounts[index].clone());
     println!("Updating password for {}", account.config.email);
     let password = rpassword::prompt_password("New password (or app password): ")?;
     account.set_password(&password)?;
     println!("Saved to your OS keyring.");
     Ok(())
+}
+
+/// Prompts for which configured account a CLI action applies to, when
+/// there's more than one — returns its index into `accounts` directly
+/// (no picker) when there's only one.
+fn pick_account(accounts: &[AccountConfig], verb: &str) -> anyhow::Result<usize> {
+    if accounts.len() == 1 {
+        return Ok(0);
+    }
+
+    println!("Accounts:");
+    for (i, a) in accounts.iter().enumerate() {
+        println!("  {}) {}", i + 1, a.email);
+    }
+    let choice: usize = prompt(&format!("Which account to {verb}"))?
+        .parse()
+        .ok()
+        .filter(|n| *n >= 1 && *n <= accounts.len())
+        .ok_or_else(|| anyhow::anyhow!("enter a number from the list above"))?;
+    Ok(choice - 1)
 }
 
 fn prompt_account_details() -> anyhow::Result<(AccountConfig, String)> {

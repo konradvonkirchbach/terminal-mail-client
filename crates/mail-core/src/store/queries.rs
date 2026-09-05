@@ -24,6 +24,15 @@ pub fn upsert_account(conn: &Connection, email: &str, display_name: Option<&str>
     Ok(id)
 }
 
+/// Deletes an account's row and, via `ON DELETE CASCADE`, every folder,
+/// message, attachment, draft, and outbox row that referenced it. Doesn't
+/// touch anything on disk (raw `.eml` files, outbox files) — those live
+/// outside SQLite and are the caller's responsibility to clean up.
+pub fn delete_account(conn: &Connection, account_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
+    Ok(())
+}
+
 pub fn get_or_create_folder(conn: &Connection, account_id: i64, name: &str) -> Result<FolderRow> {
     conn.execute(
         "INSERT INTO folders (account_id, name) VALUES (?1, ?2)

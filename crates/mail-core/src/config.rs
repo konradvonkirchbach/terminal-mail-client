@@ -14,6 +14,10 @@ pub struct Config {
     pub accounts: Vec<AccountConfig>,
     #[serde(default)]
     pub theme: ThemeConfig,
+    /// Email of the account that should be current on launch. `None`
+    /// (the default) falls back to whichever is first in `accounts`.
+    #[serde(default)]
+    pub default_account: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -37,4 +37,16 @@ impl Account {
         entry.set_password(password)?;
         Ok(())
     }
+
+    /// Removes the stored secret entirely — used when the account itself
+    /// is being removed. Treats "nothing was stored" as success rather
+    /// than an error, since the end state (no secret in the keyring) is
+    /// the same either way.
+    pub fn delete_password(&self) -> Result<()> {
+        let entry = self.keyring_entry()?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(Error::Keyring(e)),
+        }
+    }
 }

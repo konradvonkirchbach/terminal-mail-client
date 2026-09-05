@@ -91,6 +91,20 @@ Update a stored password (e.g. after rotating an app password):
 mailc --set-password
 ```
 
+Remove an account — also deletes its keyring secret and entire local
+cache (asks for confirmation first):
+
+```sh
+mailc --remove-account
+```
+
+Choose which account opens by default (otherwise it's whichever is first
+in the config file):
+
+```sh
+mailc --set-default-account
+```
+
 ## Keybindings
 
 | Key | Action |
