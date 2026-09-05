@@ -27,6 +27,15 @@ use attach::AttachmentEntry;
 use editable::{TextArea, TextInput};
 use filebrowser::FileBrowser;
 
+/// Ceiling on how many cached envelopes we'll ever read back from the
+/// store for display in one go. Deliberately not the same as
+/// `fetch_limit` (which sizes one "page" fetched from the server, for
+/// both the initial sync and each "load more"): `fetch_limit` bounds a
+/// single network round-trip, while this just needs to be generous
+/// enough to show everything pagination has accumulated so far without
+/// an unbounded query against a mailbox synced over a very long time.
+const DISPLAY_LIMIT: u32 = 5000;
+
 /// Everything a background task needs to talk to IMAP and the local
 /// cache for one account. Cheap to clone — `Account`/`Store` are just
 /// handles.
@@ -36,7 +45,6 @@ struct AccountCtx {
     store: Store,
     account_id: i64,
     folder_id: i64,
-    fetch_limit: u32,
 }
 
 /// Every configured account plus which one is currently shown. Lives only
@@ -70,6 +78,14 @@ enum BgMsg {
     /// resolves, so there's no other account it could apply to.
     SendDone(Result<SendOutcome, String>),
     MessageDeleted { account_id: i64, uid: u32, result: Result<(), String> },
+    /// A "load older mail" backfill finished — `result` is how many
+    /// envelopes were found (`0` means the real start of the mailbox has
+    /// been reached, so the caller should stop trying).
+    FetchedOlder { account_id: i64, result: Result<usize, String> },
+    /// A server-side search finished. Carries the query it was run for so
+    /// the handler can drop a stale result if the user has since changed
+    /// or cleared the search box.
+    RemoteSearchDone { account_id: i64, query: String, result: Result<Vec<Envelope>, String> },
 }
 
 fn init_tracing() -> anyhow::Result<()> {
@@ -154,13 +170,11 @@ async fn run(
             .upsert_account(account.config.email.clone(), account.config.display_name.clone())
             .await?;
         let folder = store.get_or_create_folder(account_id, "INBOX".to_string()).await?;
-        let fetch_limit = account.config.fetch_limit;
         list.push(AccountCtx {
             account,
             store: store.clone(),
             account_id,
             folder_id: folder.id,
-            fetch_limit,
         });
     }
     let current = config
@@ -177,7 +191,7 @@ async fn run(
     // server in the background — this is what makes launch feel instant
     // even before the first sync of a session completes.
     let current = accounts.current();
-    match current.store.list_envelopes(current.folder_id, current.fetch_limit).await {
+    match current.store.list_envelopes(current.folder_id, DISPLAY_LIMIT).await {
         Ok(envelopes) => {
             app.list_state = if envelopes.is_empty() {
                 ListState::Loading
@@ -326,6 +340,52 @@ async fn run(
                         }
                     }
                     Some(BgMsg::MessageDeleted { .. }) => {}
+                    Some(BgMsg::FetchedOlder { account_id, result })
+                        if account_id == accounts.current().account_id =>
+                    {
+                        app.loading_more = false;
+                        match result {
+                            Ok(0) => app.has_more_older = false,
+                            Ok(_) => spawn_account_envelopes(accounts.current().clone(), tx.clone()),
+                            Err(e) => {
+                                tracing::error!("fetch older failed: {e}");
+                                app.set_status(format!("Couldn't load more mail: {e}"));
+                            }
+                        }
+                    }
+                    Some(BgMsg::FetchedOlder { .. }) => {}
+                    Some(BgMsg::RemoteSearchDone { account_id, query, result }) => {
+                        let still_relevant = account_id == accounts.current().account_id
+                            && app.search.as_ref().is_some_and(|s| s.value.trim() == query);
+                        if still_relevant {
+                            match result {
+                                Ok(envelopes) => {
+                                    let existing: std::collections::HashSet<u32> =
+                                        app.envelopes.iter().map(|e| e.uid).collect();
+                                    let new_envelopes: Vec<Envelope> = envelopes
+                                        .into_iter()
+                                        .filter(|e| !existing.contains(&e.uid))
+                                        .collect();
+                                    if new_envelopes.is_empty() {
+                                        app.set_status(format!(
+                                            "No matches found on the server for \"{query}\"."
+                                        ));
+                                    } else {
+                                        app.set_status(format!(
+                                            "Found {} more match(es) on the server.",
+                                            new_envelopes.len()
+                                        ));
+                                        app.envelopes.extend(new_envelopes);
+                                        app.envelopes.sort_by_key(|e| std::cmp::Reverse(e.uid));
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("remote search failed: {e}");
+                                    app.set_status(format!("Server search failed: {e}"));
+                                }
+                            }
+                        }
+                    }
                     None => {}
                 }
             }
@@ -364,7 +424,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, accounts: &
     }
 
     if app.search_editing {
-        handle_search_key(app, code);
+        handle_search_key(app, code, accounts, tx);
         return;
     }
 
@@ -385,7 +445,20 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, accounts: &
                 app.should_quit = true;
             }
         }
-        KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('n') => app.select_next(),
+        KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('n') => {
+            app.select_next();
+            // Only chase "load more" against the real, unfiltered list —
+            // reaching the end of a search's matches doesn't mean the
+            // cache itself is exhausted.
+            if app.search.is_none()
+                && app.has_more_older
+                && !app.loading_more
+                && app.is_at_end_of_list()
+            {
+                app.loading_more = true;
+                spawn_fetch_older(accounts.current().clone(), tx.clone());
+            }
+        }
         KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('N') => app.select_prev(),
         KeyCode::Char('/') => app.start_search(),
         KeyCode::Char('S') => {
@@ -504,10 +577,20 @@ fn set_default_account(app: &mut App, accounts: &Accounts) {
     }
 }
 
-fn handle_search_key(app: &mut App, code: KeyCode) {
+fn handle_search_key(app: &mut App, code: KeyCode, accounts: &Accounts, tx: mpsc::Sender<BgMsg>) {
     match code {
         KeyCode::Esc => app.clear_search(),
-        KeyCode::Enter => app.search_editing = false,
+        KeyCode::Enter => {
+            app.search_editing = false;
+            // Local search came up empty — fall back to a server-side
+            // search, since the cache is only ever a bounded recent
+            // window and "not cached" doesn't mean "doesn't exist".
+            let query = app.search.as_ref().map(|s| s.value.trim().to_string()).unwrap_or_default();
+            if !query.is_empty() && app.visible_indices().is_empty() {
+                app.set_status(format!("Searching server for \"{query}\"..."));
+                spawn_remote_search(accounts.current().clone(), query, tx);
+            }
+        }
         KeyCode::Char(c) => {
             if let Some(search) = &mut app.search {
                 search.insert(c);
@@ -748,7 +831,7 @@ fn spawn_sync(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
         let result = match sync_result {
             Ok(_) => ctx
                 .store
-                .list_envelopes(ctx.folder_id, ctx.fetch_limit)
+                .list_envelopes(ctx.folder_id, DISPLAY_LIMIT)
                 .await
                 .map_err(|e| e.to_string()),
             Err(e) => Err(e.to_string()),
@@ -761,7 +844,7 @@ fn spawn_account_envelopes(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
     tokio::spawn(async move {
         let result = ctx
             .store
-            .list_envelopes(ctx.folder_id, ctx.fetch_limit)
+            .list_envelopes(ctx.folder_id, DISPLAY_LIMIT)
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(BgMsg::AccountEnvelopes { account_id: ctx.account_id, result }).await;
@@ -780,6 +863,35 @@ fn spawn_fetch_body(ctx: AccountCtx, uid: u32, tx: mpsc::Sender<BgMsg>) {
         .await
         .map_err(|e| e.to_string());
         let _ = tx.send(BgMsg::Body { account_id: ctx.account_id, uid, result }).await;
+    });
+}
+
+/// How many older messages to backfill per "scrolled to the bottom"
+/// trigger — deliberately the same size as a normal sync page.
+const LOAD_MORE_BATCH: u32 = 50;
+
+fn spawn_fetch_older(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
+    tokio::spawn(async move {
+        let result = mail_core::sync::fetch_older(&ctx.account, &ctx.store, ctx.folder_id, LOAD_MORE_BATCH)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(BgMsg::FetchedOlder { account_id: ctx.account_id, result }).await;
+    });
+}
+
+/// How many server-side search matches to pull back and cache, newest
+/// first — bounded so a single common word can't drag down a huge chunk
+/// of a large mailbox.
+const REMOTE_SEARCH_LIMIT: usize = 200;
+
+fn spawn_remote_search(ctx: AccountCtx, query: String, tx: mpsc::Sender<BgMsg>) {
+    tokio::spawn(async move {
+        let result = mail_core::sync::search_remote(&ctx.account, &ctx.store, ctx.folder_id, &query, REMOTE_SEARCH_LIMIT)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx
+            .send(BgMsg::RemoteSearchDone { account_id: ctx.account_id, query, result })
+            .await;
     });
 }
 

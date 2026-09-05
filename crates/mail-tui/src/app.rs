@@ -168,6 +168,15 @@ pub struct App {
     /// pressing `d`, resolved by the next keypress (`y`/`Y` confirms,
     /// anything else cancels).
     pub confirm_delete: Option<u32>,
+    /// Whether there's reason to believe older mail than what's cached
+    /// still exists on the server — starts `true`, flips to `false` once
+    /// a "load more" request comes back empty (i.e. we've reached the
+    /// real start of the mailbox), so scrolling to the bottom stops
+    /// trying.
+    pub has_more_older: bool,
+    /// Guards against firing multiple concurrent "load more" requests
+    /// while one is already in flight.
+    pub loading_more: bool,
     pub should_quit: bool,
 }
 
@@ -186,6 +195,8 @@ impl App {
             search: None,
             search_editing: false,
             file_browser: None,
+            has_more_older: true,
+            loading_more: false,
             confirm_delete: None,
             should_quit: false,
         }
@@ -209,6 +220,8 @@ impl App {
         self.body = BodyState::Empty;
         self.list_state = ListState::Loading;
         self.clear_search();
+        self.has_more_older = true;
+        self.loading_more = false;
     }
 
     /// Clears the status message once its TTL has elapsed; called from
@@ -251,6 +264,16 @@ impl App {
             return;
         }
         self.selected = (self.selected + 1).min(visible.len() - 1);
+    }
+
+    /// Whether the selection is on the last visible row — the trigger
+    /// point for "scroll to the bottom to load more older mail". Only
+    /// meaningful (and only checked by the caller) with no search filter
+    /// active, since "end of the filtered results" isn't the same thing
+    /// as "end of what's cached".
+    pub fn is_at_end_of_list(&self) -> bool {
+        let visible_len = self.visible_indices().len();
+        visible_len > 0 && self.selected + 1 >= visible_len
     }
 
     pub fn select_prev(&mut self) {

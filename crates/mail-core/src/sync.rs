@@ -133,6 +133,85 @@ fn uid_list(uids: &[u32]) -> String {
         .join(",")
 }
 
+/// Backfills up to `batch_size` messages older than whatever's currently
+/// cached — the initial sync only ever pulls the most recent
+/// `fetch_limit` messages, so this is what "scroll to the bottom to load
+/// more" calls on demand instead of eagerly fetching a whole mailbox's
+/// history up front. Returns how many were actually found and fetched;
+/// `0` means there's nothing older left on the server.
+pub async fn fetch_older(
+    account: &Account,
+    store: &Store,
+    folder_id: i64,
+    batch_size: u32,
+) -> Result<usize> {
+    let Some(min_uid) = store.min_uid(folder_id).await? else {
+        return Ok(0); // nothing cached yet at all — a plain sync should run first
+    };
+    if min_uid <= 1 {
+        return Ok(0); // already have UID 1 — nothing older can exist
+    }
+
+    let mut session = client::open_session(account).await?;
+    client::select_inbox(&mut session).await?;
+
+    let mut candidates = client::uid_search(&mut session, &format!("UID 1:{}", min_uid - 1)).await?;
+    candidates.sort_unstable();
+    candidates.reverse(); // newest-of-the-older first
+    candidates.truncate(batch_size as usize);
+
+    let count = if candidates.is_empty() {
+        0
+    } else {
+        let uid_set = uid_list(&candidates);
+        let envelopes = client::fetch_envelopes_by_uid(&mut session, &uid_set).await?;
+        let count = envelopes.len();
+        store.upsert_envelopes(folder_id, envelopes).await?;
+        count
+    };
+
+    client::logout(&mut session).await;
+    Ok(count)
+}
+
+/// Searches the *server's* copy of the mailbox (not just what's locally
+/// cached) for `query` matching subject or sender, for when a local
+/// search comes up empty — the local cache is deliberately a bounded
+/// recent window, so "not in the cache" doesn't mean "doesn't exist".
+/// Matches are cached like any other fetch, so a subsequent local filter
+/// picks them up automatically. Bounded to the `limit` most recent
+/// matches, newest first, to avoid a single common word pulling down a
+/// huge fraction of a large mailbox.
+pub async fn search_remote(
+    account: &Account,
+    store: &Store,
+    folder_id: i64,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<Envelope>> {
+    let mut session = client::open_session(account).await?;
+    client::select_inbox(&mut session).await?;
+
+    let escaped = client::escape_search_term(query);
+    let criteria = format!("OR SUBJECT \"{escaped}\" FROM \"{escaped}\"");
+    let mut candidates = client::uid_search(&mut session, &criteria).await?;
+    candidates.sort_unstable();
+    candidates.reverse();
+    candidates.truncate(limit);
+
+    let envelopes = if candidates.is_empty() {
+        Vec::new()
+    } else {
+        let uid_set = uid_list(&candidates);
+        let envelopes = client::fetch_envelopes_by_uid(&mut session, &uid_set).await?;
+        store.upsert_envelopes(folder_id, envelopes.clone()).await?;
+        envelopes
+    };
+
+    client::logout(&mut session).await;
+    Ok(envelopes)
+}
+
 /// Returns a message body, reading it from the on-disk cache if present
 /// and fetching + caching it from IMAP otherwise.
 pub async fn fetch_body(

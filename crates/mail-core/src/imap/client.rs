@@ -122,6 +122,27 @@ pub(crate) async fn fetch_envelopes_by_uid(
     Ok(fetches.iter().filter_map(envelope_from_fetch).collect())
 }
 
+/// Runs a `UID SEARCH` and returns the matching UIDs — used both to find
+/// older mail to backfill (`criteria` = a UID range) and for a
+/// server-side text search (`criteria` = an `OR SUBJECT ... FROM ...`).
+/// Just the UID numbers come back over the wire, so this is cheap even
+/// against a huge mailbox; the caller decides how many of the matches are
+/// actually worth fetching.
+pub(crate) async fn uid_search(session: &mut ImapSession, criteria: &str) -> Result<Vec<u32>> {
+    let uids = session
+        .uid_search(criteria)
+        .await
+        .map_err(|e| Error::Imap(format!("UID SEARCH {criteria}: {e}")))?;
+    Ok(uids.into_iter().collect())
+}
+
+/// Quotes and escapes a string for use inside an IMAP quoted-string
+/// search term (`"..."`), per RFC 3501: backslash and double-quote are
+/// the only characters that need escaping inside one.
+pub(crate) fn escape_search_term(term: &str) -> String {
+    term.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Fetches just flags for a UID set — the cheap half of the incremental
 /// sync's "did anything change" sweep over recently-cached messages.
 pub(crate) async fn fetch_flags_by_uid(

@@ -167,6 +167,18 @@ pub fn max_uid(conn: &Connection, folder_id: i64) -> Result<Option<u32>> {
     .map_err(Into::into)
 }
 
+/// The lowest UID cached for a folder — the boundary "load older mail"
+/// backfills below.
+pub fn min_uid(conn: &Connection, folder_id: i64) -> Result<Option<u32>> {
+    conn.query_row(
+        "SELECT MIN(uid) FROM messages WHERE folder_id = ?1",
+        params![folder_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .map(|v| v.map(|v| v as u32))
+    .map_err(Into::into)
+}
+
 /// UIDs of the most recently cached messages, for the periodic flag-refresh
 /// sweep (catches read/flag changes made from another client, without
 /// needing CONDSTORE/QRESYNC support from the server).

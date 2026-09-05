@@ -88,6 +88,10 @@ impl Store {
         self.run(move |conn| queries::max_uid(conn, folder_id)).await
     }
 
+    pub async fn min_uid(&self, folder_id: i64) -> Result<Option<u32>> {
+        self.run(move |conn| queries::min_uid(conn, folder_id)).await
+    }
+
     pub async fn recent_uids(&self, folder_id: i64, limit: u32) -> Result<Vec<u32>> {
         self.run(move |conn| queries::recent_uids(conn, folder_id, limit))
             .await

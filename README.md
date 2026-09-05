@@ -21,7 +21,11 @@ notifications for new mail.
 - **Full compose flow** — reply, attachments (with a keyboard-driven
   directory browser, not blind path typing), a 20MB size cap
 - **Attachment downloads** — same directory browser, in reverse
-- **Search** — live filter the inbox by sender or subject
+- **Search** — live filter the inbox by sender or subject; if nothing
+  matches locally, hitting `Enter` falls back to a server-side search so you
+  can find mail older than what's cached
+- **Pagination** — the initial sync only pulls your most recent mail;
+  scrolling to the bottom of the list fetches older messages on demand
 - **Omarchy-native theming** — reads the active theme's `colors.toml` and
   live-reloads if you switch themes; falls back to a bundled palette
   everywhere else
@@ -110,9 +114,9 @@ mailc --set-default-account
 
 | Key | Action |
 |---|---|
-| `j` / `k`, `↓` / `↑`, `n` / `N` | Move selection |
+| `j` / `k`, `↓` / `↑`, `n` / `N` | Move selection (scrolling past the last message loads older mail from the server) |
 | `Enter` | Read selected message |
-| `/` | Search (live filter by sender/subject); `Enter` confirms, `Esc` clears |
+| `/` | Search (live filter by sender/subject); `Enter` confirms — if there are no local matches, this also runs a server-side search — `Esc` clears |
 | `c` | Compose a new message |
 | `r` | Reply to selected message |
 | `[` / `]` | Cycle selected attachment on an open message |
