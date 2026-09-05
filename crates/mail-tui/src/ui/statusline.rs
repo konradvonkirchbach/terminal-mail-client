@@ -10,9 +10,9 @@ use crate::theme::Theme;
 pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let count = app.envelopes.len();
     let hints = if app.account_emails.len() > 1 {
-        "j/k move  / find  Enter read  a download  c compose  r reply  S sync  Tab switch  q quit"
+        "j/k move  / find  Enter read  d delete  a download  c compose  r reply  S sync  Tab switch  D set default  q quit"
     } else {
-        "j/k move  / find  Enter read  a download  c compose  r reply  S sync  q quit"
+        "j/k move  / find  Enter read  d delete  a download  c compose  r reply  S sync  q quit"
     };
     let mut spans = vec![
         Span::styled(
@@ -21,9 +21,17 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ),
         Span::raw(format!(" {count} messages  ")),
     ];
-    match &app.status_message {
-        Some((msg, _)) => spans.push(Span::styled(msg.clone(), Style::new().fg(theme.green))),
-        None => spans.push(Span::styled(hints, Style::new().fg(theme.muted))),
+
+    if app.confirm_delete.is_some() {
+        spans.push(Span::styled(
+            "Delete this message? [y/N]",
+            Style::new().fg(theme.red),
+        ));
+    } else {
+        match &app.status_message {
+            Some((msg, _)) => spans.push(Span::styled(msg.clone(), Style::new().fg(theme.green))),
+            None => spans.push(Span::styled(hints, Style::new().fg(theme.muted))),
+        }
     }
     let line = Line::from(spans);
 

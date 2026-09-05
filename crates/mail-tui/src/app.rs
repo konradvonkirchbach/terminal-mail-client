@@ -164,6 +164,10 @@ pub struct App {
     /// the reading pane (save an attachment). Rendered as one overlay
     /// regardless of which triggered it.
     pub file_browser: Option<(FileBrowser, BrowserPurpose)>,
+    /// `Some(uid)` while asking "delete this message? [y/N]" — set by
+    /// pressing `d`, resolved by the next keypress (`y`/`Y` confirms,
+    /// anything else cancels).
+    pub confirm_delete: Option<u32>,
     pub should_quit: bool,
 }
 
@@ -182,6 +186,7 @@ impl App {
             search: None,
             search_editing: false,
             file_browser: None,
+            confirm_delete: None,
             should_quit: false,
         }
     }
@@ -265,6 +270,23 @@ impl App {
         self.search = Some(TextInput::default());
         self.search_editing = true;
         self.selected = 0;
+    }
+
+    /// Drops a deleted message from view and keeps `selected` in bounds,
+    /// clearing the reading pane too if that's the message it was showing.
+    pub fn remove_envelope(&mut self, uid: u32) {
+        self.envelopes.retain(|e| e.uid != uid);
+
+        let visible_len = self.visible_indices().len();
+        if self.selected >= visible_len {
+            self.selected = visible_len.saturating_sub(1);
+        }
+
+        if let BodyState::Loaded(message) = &self.body {
+            if message.uid == uid {
+                self.body = BodyState::Empty;
+            }
+        }
     }
 
     pub fn clear_search(&mut self) {

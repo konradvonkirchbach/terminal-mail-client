@@ -69,6 +69,7 @@ enum BgMsg {
     /// all other key handling (including account switching) until it
     /// resolves, so there's no other account it could apply to.
     SendDone(Result<SendOutcome, String>),
+    MessageDeleted { account_id: i64, uid: u32, result: Result<(), String> },
 }
 
 fn init_tracing() -> anyhow::Result<()> {
@@ -312,6 +313,19 @@ async fn run(
                             compose.error = Some(e);
                         }
                     }
+                    Some(BgMsg::MessageDeleted { account_id, uid, result }) if account_id == accounts.current().account_id => {
+                        match result {
+                            Ok(()) => {
+                                app.remove_envelope(uid);
+                                app.set_status("Message deleted.".to_string());
+                            }
+                            Err(e) => {
+                                tracing::error!("delete failed: {e}");
+                                app.set_status(format!("Delete failed: {e}"));
+                            }
+                        }
+                    }
+                    Some(BgMsg::MessageDeleted { .. }) => {}
                     None => {}
                 }
             }
@@ -351,6 +365,14 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, accounts: &
 
     if app.search_editing {
         handle_search_key(app, code);
+        return;
+    }
+
+    if let Some(uid) = app.confirm_delete.take() {
+        if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            app.set_status("Deleting...".to_string());
+            spawn_delete_message(accounts.current().clone(), uid, tx);
+        }
         return;
     }
 
@@ -402,6 +424,12 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, accounts: &
             }
         }
         KeyCode::Char('a') => start_download(app),
+        KeyCode::Char('d') => {
+            if let Some(uid) = app.selected_uid() {
+                app.confirm_delete = Some(uid);
+            }
+        }
+        KeyCode::Char('D') => set_default_account(app, accounts),
         KeyCode::Tab if accounts.list.len() > 1 => {
             switch_account(app, accounts, (accounts.current + 1) % accounts.list.len(), tx);
         }
@@ -446,6 +474,22 @@ fn start_download(app: &mut App) {
         bytes: attachment.bytes.clone(),
     };
     app.file_browser = Some((browser, purpose));
+}
+
+/// Marks the currently active account as the one that opens by default
+/// on the next launch, persisted straight to config.toml. Local/sync file
+/// I/O, so this stays synchronous rather than round-tripping through a
+/// background task.
+fn set_default_account(app: &mut App, accounts: &Accounts) {
+    let email = accounts.current().account.config.email.clone();
+    let result = mail_core::config::Config::load().and_then(|mut config| {
+        config.default_account = Some(email.clone());
+        config.save()
+    });
+    match result {
+        Ok(()) => app.set_status(format!("{email} set as default account.")),
+        Err(e) => app.set_status(format!("Failed to set default account: {e}")),
+    }
 }
 
 fn handle_search_key(app: &mut App, code: KeyCode) {
@@ -724,6 +768,15 @@ fn spawn_fetch_body(ctx: AccountCtx, uid: u32, tx: mpsc::Sender<BgMsg>) {
         .await
         .map_err(|e| e.to_string());
         let _ = tx.send(BgMsg::Body { account_id: ctx.account_id, uid, result }).await;
+    });
+}
+
+fn spawn_delete_message(ctx: AccountCtx, uid: u32, tx: mpsc::Sender<BgMsg>) {
+    tokio::spawn(async move {
+        let result = mail_core::sync::delete_message(&ctx.account, &ctx.store, ctx.folder_id, uid)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(BgMsg::MessageDeleted { account_id: ctx.account_id, uid, result }).await;
     });
 }
 

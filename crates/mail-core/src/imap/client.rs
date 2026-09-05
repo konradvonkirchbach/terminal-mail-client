@@ -262,6 +262,57 @@ pub async fn append_to_sent(account: &Account, raw: &[u8]) -> Result<()> {
     )))
 }
 
+/// Common `Trash` mailbox names across providers, same best-effort
+/// approach as `SENT_FOLDER_CANDIDATES` above.
+const TRASH_FOLDER_CANDIDATES: &[&str] = &["Trash", "Deleted Items", "Deleted Messages", "Bin", "[Gmail]/Trash"];
+
+/// Deletes a message by UID from INBOX: tries moving it to a Trash-like
+/// folder first via the `MOVE` extension (recoverable, matches what most
+/// providers/clients do for "delete"), falling back to marking it
+/// `\Deleted` and expunging in place if no such folder exists or the
+/// server doesn't support `MOVE` at all — the same "try candidates on one
+/// connection" shape as `append_to_sent`.
+pub async fn delete_message(account: &Account, uid: u32) -> Result<()> {
+    let mut session = open_session(account).await?;
+    select_inbox(&mut session).await?;
+
+    let uid_str = uid.to_string();
+    let mut moved = false;
+    for folder in TRASH_FOLDER_CANDIDATES {
+        if session.uid_mv(&uid_str, *folder).await.is_ok() {
+            moved = true;
+            break;
+        }
+    }
+
+    if !moved {
+        session
+            .uid_store(&uid_str, "+FLAGS (\\Deleted)")
+            .await
+            .map_err(|e| Error::Imap(format!("STORE +Deleted uid {uid}: {e}")))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| Error::Imap(e.to_string()))?;
+
+        let expunged = match session.uid_expunge(&uid_str).await {
+            Ok(stream) => stream.try_collect::<Vec<_>>().await.is_ok(),
+            Err(_) => false,
+        };
+        if !expunged {
+            // Server lacks UIDPLUS (no UID EXPUNGE) — fall back to a
+            // blind EXPUNGE. This purges *every* \Deleted message in the
+            // folder, not just this one, but is the documented last
+            // resort for servers without UIDPLUS.
+            if let Ok(stream) = session.expunge().await {
+                let _ = stream.try_collect::<Vec<_>>().await;
+            }
+        }
+    }
+
+    logout(&mut session).await;
+    Ok(())
+}
+
 fn to_flags<'a>(flags: impl Iterator<Item = ImapFlag<'a>>) -> Flags {
     let mut out = Flags::default();
     for flag in flags {

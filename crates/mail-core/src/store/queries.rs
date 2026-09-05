@@ -199,6 +199,18 @@ pub fn get_message_raw_path(conn: &Connection, folder_id: i64, uid: u32) -> Resu
     .map_err(Into::into)
 }
 
+/// Removes a message from the cache and returns its on-disk raw path (if
+/// any) so the caller can delete that file too — it lives outside SQLite
+/// so cascading deletes don't reach it.
+pub fn delete_message(conn: &Connection, folder_id: i64, uid: u32) -> Result<Option<String>> {
+    let raw_path = get_message_raw_path(conn, folder_id, uid)?;
+    conn.execute(
+        "DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2",
+        params![folder_id, uid],
+    )?;
+    Ok(raw_path)
+}
+
 pub struct OutboxItem {
     pub id: i64,
     pub raw_mime_path: String,

@@ -164,6 +164,21 @@ pub async fn fetch_body(
     Ok(message)
 }
 
+/// Deletes a message on the server (moved to Trash if a candidate folder
+/// works, otherwise expunged in place — see `client::delete_message`) and
+/// removes it from the local cache, including its on-disk `.eml` if one
+/// was cached. The server-side delete happens first: if that fails, we'd
+/// rather leave the cache alone (so the message stays visible and the
+/// user can retry) than have the UI drop a message that's still there.
+pub async fn delete_message(account: &Account, store: &Store, folder_id: i64, uid: u32) -> Result<()> {
+    client::delete_message(account, uid).await?;
+
+    if let Some(raw_path) = store.delete_message(folder_id, uid).await? {
+        let _ = tokio::fs::remove_file(raw_path).await;
+    }
+    Ok(())
+}
+
 async fn cache_raw_message(
     store: &Store,
     account_id: i64,

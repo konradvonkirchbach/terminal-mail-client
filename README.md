@@ -99,7 +99,8 @@ mailc --remove-account
 ```
 
 Choose which account opens by default (otherwise it's whichever is first
-in the config file):
+in the config file) — either from the CLI, or press `D` on whichever
+account is currently active from inside the app:
 
 ```sh
 mailc --set-default-account
@@ -116,9 +117,11 @@ mailc --set-default-account
 | `r` | Reply to selected message |
 | `[` / `]` | Cycle selected attachment on an open message |
 | `a` | Download selected attachment |
+| `d` | Delete selected message (asks to confirm; moves to Trash if the provider supports it) |
 | `S` | Manual sync |
 | `Tab` / `Shift+Tab` | Switch account (when more than one is configured) |
 | `1`–`9` | Jump directly to account N |
+| `D` | Set the current account as the one that opens by default |
 | `q` / `Esc` | Quit |
 
 **Compose:**

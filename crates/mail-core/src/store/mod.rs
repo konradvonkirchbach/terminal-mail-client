@@ -77,6 +77,11 @@ impl Store {
             .await
     }
 
+    pub async fn delete_message(&self, folder_id: i64, uid: u32) -> Result<Option<String>> {
+        self.run(move |conn| queries::delete_message(conn, folder_id, uid))
+            .await
+    }
+
     pub async fn insert_outbox(
         &self,
         account_id: i64,
