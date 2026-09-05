@@ -16,7 +16,7 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
 use mail_core::send::SendOutcome;
-use mail_core::{Account, AttachmentFile, Envelope, Message, Store};
+use mail_core::{Account, AppEvent, AttachmentFile, Envelope, Message, Store};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -175,14 +175,22 @@ async fn run(
     }
 
     let (tx, mut rx) = mpsc::channel::<BgMsg>(8);
+    let (app_event_tx, mut app_events) = mpsc::unbounded_channel::<AppEvent>();
 
     // Every account gets synced (and its outbox flushed) concurrently at
     // startup, not just whichever is currently shown — so switching to
     // one later is likely to already have fresh data waiting in the
-    // cache instead of starting cold.
+    // cache instead of starting cold. Each also gets its own persistent
+    // IDLE connection so new mail shows up as it arrives rather than only
+    // on the next manual/account-switch sync.
     for account in &accounts.list {
         spawn_sync(account.clone(), tx.clone());
         spawn_flush_outbox(account.clone());
+        tokio::spawn(mail_core::idle::run(
+            account.account.clone(),
+            account.store.clone(),
+            app_event_tx.clone(),
+        ));
     }
 
     let mut events = EventStream::new();
@@ -291,6 +299,16 @@ async fn run(
                         }
                     }
                     None => {}
+                }
+            }
+            Some(AppEvent::NewMail { account_id, .. }) = app_events.recv() => {
+                // The IDLE loop already wrote the fresh data straight to
+                // the store; only re-read into the UI if this is the
+                // account currently being viewed. A background account's
+                // cache is still updated either way, ready for whenever
+                // the user switches to it.
+                if account_id == accounts.current().account_id {
+                    spawn_account_envelopes(accounts.current().clone(), tx.clone());
                 }
             }
             _ = tokio::time::sleep(tick) => {}

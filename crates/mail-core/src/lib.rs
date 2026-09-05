@@ -5,6 +5,8 @@
 pub mod account;
 pub mod config;
 pub mod error;
+pub mod events;
+pub mod idle;
 pub mod imap;
 pub mod send;
 pub mod smtp;
@@ -14,6 +16,7 @@ pub mod types;
 
 pub use account::Account;
 pub use error::{Error, Result};
+pub use events::AppEvent;
 pub use smtp::{AttachmentFile, Draft};
 pub use store::Store;
 pub use types::{Envelope, Flag, Message, MessageAttachment};
