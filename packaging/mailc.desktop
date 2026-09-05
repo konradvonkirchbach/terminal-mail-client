@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Mail
+GenericName=Terminal Email Client
+Comment=Minimalist terminal email client for reading, writing, and organizing mail
+Icon=mail-client
+Exec=omarchy-launch-or-focus-tui --app-id=org.omarchy.mailc mailc
+Terminal=false
+Categories=Network;Email;ConsoleOnly;
+Keywords=email;mail;imap;smtp;
+StartupNotify=true
