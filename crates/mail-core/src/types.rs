@@ -34,7 +34,7 @@ pub struct Envelope {
     pub has_attachments: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Address {
     pub name: Option<String>,
     pub email: String,

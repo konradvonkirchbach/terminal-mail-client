@@ -6,7 +6,7 @@ pub use db::Store;
 pub use queries::{FolderRow, OutboxItem};
 
 use crate::error::Result;
-use crate::types::{Envelope, Flags};
+use crate::types::{Address, Envelope, Flags};
 
 impl Store {
     pub async fn upsert_account(&self, email: String, display_name: Option<String>) -> Result<i64> {
@@ -133,6 +133,14 @@ impl Store {
 
     pub async fn record_outbox_failure(&self, id: i64, error: String) -> Result<()> {
         self.run(move |conn| queries::record_outbox_failure(conn, id, &error))
+            .await
+    }
+
+    /// The address book for compose's recipient autocomplete — every
+    /// sender this account has received mail from, minus automated
+    /// "no-reply" senders. See `queries::known_senders`.
+    pub async fn known_senders(&self, account_id: i64) -> Result<Vec<Address>> {
+        self.run(move |conn| queries::known_senders(conn, account_id))
             .await
     }
 }

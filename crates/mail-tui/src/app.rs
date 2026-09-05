@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use mail_core::{Draft, Envelope, Message};
+use mail_core::{Address, Draft, Envelope, Message};
 
 use crate::attach::AttachmentEntry;
 use crate::editable::{TextArea, TextInput};
@@ -13,6 +13,10 @@ pub const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(5);
 
 /// How many rows a vim-style `Ctrl-d`/`Ctrl-u` half-page jump moves.
 pub const PAGE_JUMP: usize = 10;
+
+/// How many fuzzy-matched sender suggestions to show at once under a
+/// recipient field in compose.
+pub const MAX_RECIPIENT_SUGGESTIONS: usize = 8;
 
 /// What a currently-open `FileBrowser` is for — decides what happens
 /// when the user picks a file or confirms a save location.
@@ -58,6 +62,11 @@ pub struct ComposeState {
     pub attachment_selected: usize,
     pub sending: bool,
     pub error: Option<String>,
+    /// Fuzzy-matched sender suggestions for whatever's typed after the
+    /// last comma in the currently focused recipient field (To/Cc/Bcc);
+    /// empty hides the dropdown. Recomputed by `refresh_suggestions`.
+    pub suggestions: Vec<Address>,
+    pub suggestion_selected: usize,
 }
 
 impl ComposeState {
@@ -73,6 +82,8 @@ impl ComposeState {
             attachment_selected: 0,
             sending: false,
             error: None,
+            suggestions: Vec::new(),
+            suggestion_selected: 0,
         }
     }
 
@@ -142,6 +153,53 @@ impl ComposeState {
             self.attachment_selected = self.attachments.len().saturating_sub(1);
         }
     }
+
+    /// Recomputes `suggestions` against whatever's typed after the last
+    /// comma in the currently focused field — call after every edit or
+    /// focus change. Clears immediately outside To/Cc/Bcc, or when that
+    /// fragment is empty (nothing to suggest against yet).
+    pub fn refresh_suggestions(&mut self, known_senders: &[Address]) {
+        self.suggestion_selected = 0;
+        let field_value = match self.focus {
+            ComposeField::To => &self.to.value,
+            ComposeField::Cc => &self.cc.value,
+            ComposeField::Bcc => &self.bcc.value,
+            ComposeField::Subject | ComposeField::Attachments | ComposeField::Body => {
+                self.suggestions.clear();
+                return;
+            }
+        };
+        let query = field_value.rsplit(',').next().unwrap_or("").trim();
+        self.suggestions = if query.is_empty() {
+            Vec::new()
+        } else {
+            crate::fuzzy::best_matches(query, known_senders, MAX_RECIPIENT_SUGGESTIONS)
+        };
+    }
+
+    /// Accepts the highlighted suggestion into the focused recipient
+    /// field, replacing whatever was typed after the last comma and
+    /// leaving a trailing ", " ready for the next address. A no-op
+    /// outside To/Cc/Bcc, or when there's nothing selected to accept.
+    pub fn accept_suggestion(&mut self) {
+        let Some(chosen) = self.suggestions.get(self.suggestion_selected).cloned() else {
+            return;
+        };
+        let field = match self.focus {
+            ComposeField::To => &mut self.to,
+            ComposeField::Cc => &mut self.cc,
+            ComposeField::Bcc => &mut self.bcc,
+            ComposeField::Subject | ComposeField::Attachments | ComposeField::Body => return,
+        };
+        let prefix = match field.value.rfind(',') {
+            Some(idx) => format!("{} ", field.value[..=idx].trim_end()),
+            None => String::new(),
+        };
+        field.value = format!("{prefix}{chosen}, ");
+        field.cursor = field.value.chars().count();
+        self.suggestions.clear();
+        self.suggestion_selected = 0;
+    }
 }
 
 pub struct App {
@@ -158,6 +216,12 @@ pub struct App {
     /// download — reset to 0 whenever a new message body loads.
     pub selected_attachment: usize,
     pub compose: Option<ComposeState>,
+    /// The address book fuzzy-matched against while typing a recipient in
+    /// compose: every sender the current account has received mail from,
+    /// minus no-reply senders. Loaded asynchronously (see `main.rs`'s
+    /// `spawn_known_senders`), so it may briefly be empty right after
+    /// startup or an account switch.
+    pub known_senders: Vec<Address>,
     pub status_message: Option<(String, Instant)>,
     /// `Some` whenever a filter is showing (being edited or confirmed).
     /// An empty query is equivalent to no filter.
@@ -198,6 +262,7 @@ impl App {
             body: BodyState::Empty,
             selected_attachment: 0,
             compose: None,
+            known_senders: Vec::new(),
             status_message: None,
             search: None,
             search_editing: false,
@@ -231,6 +296,7 @@ impl App {
         self.has_more_older = true;
         self.loading_more = false;
         self.pending_g = false;
+        self.known_senders.clear();
     }
 
     /// Clears the status message once its TTL has elapsed; called from
@@ -624,6 +690,7 @@ mod tests {
         app.has_more_older = false;
         app.loading_more = true;
         app.pending_g = true;
+        app.known_senders = vec![Address { name: None, email: "x@example.com".to_string() }];
         app.body = BodyState::Loaded(Message {
             uid: 1,
             subject: String::new(),
@@ -644,5 +711,89 @@ mod tests {
         assert!(app.has_more_older);
         assert!(!app.loading_more);
         assert!(!app.pending_g);
+        assert!(app.known_senders.is_empty());
+    }
+
+    // -- compose recipient suggestions ------------------------------------
+
+    fn senders() -> Vec<Address> {
+        vec![
+            Address { name: Some("Alice Doe".to_string()), email: "alice@example.com".to_string() },
+            Address { name: Some("Bob Smith".to_string()), email: "bob@example.com".to_string() },
+        ]
+    }
+
+    #[test]
+    fn refresh_suggestions_matches_against_the_fragment_after_the_last_comma() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::To;
+        compose.to = TextInput::with_value("bob@example.com, ali".to_string());
+
+        compose.refresh_suggestions(&senders());
+
+        assert_eq!(compose.suggestions.len(), 1);
+        assert_eq!(compose.suggestions[0].email, "alice@example.com");
+    }
+
+    #[test]
+    fn refresh_suggestions_is_empty_when_the_fragment_is_blank() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::To;
+        compose.to = TextInput::with_value("alice@example.com, ".to_string());
+
+        compose.refresh_suggestions(&senders());
+
+        assert!(compose.suggestions.is_empty());
+    }
+
+    #[test]
+    fn refresh_suggestions_is_always_empty_outside_recipient_fields() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::Subject;
+        compose.subject = TextInput::with_value("alice".to_string());
+
+        compose.refresh_suggestions(&senders());
+
+        assert!(compose.suggestions.is_empty());
+    }
+
+    #[test]
+    fn accept_suggestion_replaces_the_trailing_fragment_and_appends_a_separator() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::To;
+        compose.to = TextInput::with_value("ali".to_string());
+        compose.refresh_suggestions(&senders());
+        assert_eq!(compose.suggestions.len(), 1);
+
+        compose.accept_suggestion();
+
+        assert_eq!(compose.to.value, "Alice Doe <alice@example.com>, ");
+        assert_eq!(compose.to.cursor, compose.to.value.chars().count());
+        assert!(compose.suggestions.is_empty());
+    }
+
+    #[test]
+    fn accept_suggestion_preserves_earlier_recipients_before_the_last_comma() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::To;
+        compose.to = TextInput::with_value("bob@example.com, ali".to_string());
+        compose.refresh_suggestions(&senders());
+
+        compose.accept_suggestion();
+
+        assert_eq!(compose.to.value, "bob@example.com, Alice Doe <alice@example.com>, ");
+    }
+
+    #[test]
+    fn accept_suggestion_is_a_no_op_when_there_is_nothing_selected() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::To;
+        compose.to = TextInput::with_value("zzz_no_match".to_string());
+        compose.refresh_suggestions(&senders());
+        assert!(compose.suggestions.is_empty());
+
+        compose.accept_suggestion();
+
+        assert_eq!(compose.to.value, "zzz_no_match");
     }
 }

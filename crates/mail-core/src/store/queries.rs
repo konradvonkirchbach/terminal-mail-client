@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -281,6 +283,60 @@ fn parse_addrs(json: &str) -> Vec<Address> {
     serde_json::from_str(json).unwrap_or_default()
 }
 
+/// The set of distinct senders an account has ever received mail from
+/// (across whatever's cached — currently just INBOX), for compose's
+/// recipient autocomplete. Automated "do not reply" senders are dropped
+/// since suggesting them back as a recipient is never useful. When the
+/// same address turns up under multiple display names (or none), any
+/// non-empty name seen wins over a missing one.
+pub fn known_senders(conn: &Connection, account_id: i64) -> Result<Vec<Address>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.from_addrs FROM messages m
+         JOIN folders f ON f.id = m.folder_id
+         WHERE f.account_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![account_id], |row| row.get::<_, String>(0))?;
+
+    let mut by_email: HashMap<String, Address> = HashMap::new();
+    for json in rows {
+        for addr in parse_addrs(&json?) {
+            if is_no_reply_address(&addr.email) {
+                continue;
+            }
+            let key = addr.email.to_lowercase();
+            match by_email.get_mut(&key) {
+                Some(existing) if addr.name.is_some() => existing.name = addr.name,
+                Some(_) => {}
+                None => {
+                    by_email.insert(key, addr);
+                }
+            }
+        }
+    }
+
+    let mut senders: Vec<Address> = by_email.into_values().collect();
+    senders.sort_by(|a, b| {
+        let a_key = a.name.as_deref().unwrap_or(&a.email).to_lowercase();
+        let b_key = b.name.as_deref().unwrap_or(&b.email).to_lowercase();
+        a_key.cmp(&b_key)
+    });
+    Ok(senders)
+}
+
+/// Matches "no-reply", "noreply", "no.reply", "do-not-reply", etc.
+/// case-insensitively by stripping punctuation from the local part before
+/// comparing — catches more than the literal "no-reply@" without risking
+/// a false positive on a real name that merely contains "reply".
+fn is_no_reply_address(email: &str) -> bool {
+    let local = email.split('@').next().unwrap_or(email);
+    let normalized: String = local
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    normalized.contains("noreply") || normalized.contains("donotreply")
+}
+
 fn ts_to_datetime(ts: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_opt(ts, 0).single()
 }
@@ -510,5 +566,58 @@ mod tests {
     fn parse_addrs_falls_back_to_empty_on_malformed_json() {
         assert!(parse_addrs("not json").is_empty());
         assert!(parse_addrs("[]").is_empty());
+    }
+
+    #[test]
+    fn is_no_reply_address_matches_common_variants_but_not_real_senders() {
+        assert!(is_no_reply_address("no-reply@example.com"));
+        assert!(is_no_reply_address("NoReply@Example.com"));
+        assert!(is_no_reply_address("noreply@example.com"));
+        assert!(is_no_reply_address("no.reply@example.com"));
+        assert!(is_no_reply_address("do-not-reply@example.com"));
+        assert!(!is_no_reply_address("alice@example.com"));
+        assert!(!is_no_reply_address("replyguy@example.com"));
+    }
+
+    #[test]
+    fn known_senders_deduplicates_by_email_case_insensitively_and_excludes_no_reply_addresses() {
+        let conn = test_conn();
+        let account_id = upsert_account(&conn, "me@example.com", None).unwrap();
+        let folder = get_or_create_folder(&conn, account_id, "INBOX").unwrap();
+
+        let mut msg1 = sample_envelope(1, "Hi");
+        msg1.from = vec![Address { name: Some("Alice".into()), email: "alice@example.com".into() }];
+        upsert_envelope(&conn, folder.id, &msg1).unwrap();
+
+        let mut msg2 = sample_envelope(2, "Hi again");
+        msg2.from = vec![Address { name: None, email: "ALICE@example.com".into() }];
+        upsert_envelope(&conn, folder.id, &msg2).unwrap();
+
+        let mut msg3 = sample_envelope(3, "Your receipt");
+        msg3.from = vec![Address { name: Some("Shop".into()), email: "no-reply@shop.com".into() }];
+        upsert_envelope(&conn, folder.id, &msg3).unwrap();
+
+        let senders = known_senders(&conn, account_id).unwrap();
+
+        assert_eq!(senders.len(), 1, "alice's two case variants must collapse into one entry, and no-reply must be dropped");
+        assert_eq!(senders[0].email.to_lowercase(), "alice@example.com");
+        assert_eq!(senders[0].name.as_deref(), Some("Alice"), "a known name must survive even though a later message for the same address lacked one");
+    }
+
+    #[test]
+    fn known_senders_is_scoped_to_the_given_account() {
+        let conn = test_conn();
+        let account_a = upsert_account(&conn, "a@example.com", None).unwrap();
+        let account_b = upsert_account(&conn, "b@example.com", None).unwrap();
+        let folder_a = get_or_create_folder(&conn, account_a, "INBOX").unwrap();
+        let folder_b = get_or_create_folder(&conn, account_b, "INBOX").unwrap();
+
+        upsert_envelope(&conn, folder_a.id, &sample_envelope(1, "Hi")).unwrap();
+        upsert_envelope(&conn, folder_b.id, &sample_envelope(1, "Hi")).unwrap();
+
+        assert_eq!(known_senders(&conn, account_a).unwrap().len(), 1);
+
+        let account_c = upsert_account(&conn, "c@example.com", None).unwrap(); // an account with no mail at all
+        assert!(known_senders(&conn, account_c).unwrap().is_empty());
     }
 }

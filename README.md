@@ -20,6 +20,8 @@ notifications for new mail.
   new mail shows up on its own, no polling
 - **Full compose flow** — reply, attachments (with a keyboard-driven
   directory browser, not blind path typing), a 20MB size cap
+- **Recipient autocomplete** — fuzzy-find To/Cc/Bcc against everyone you've
+  ever received mail from (automated no-reply senders excluded)
 - **Attachment downloads** — same directory browser, in reverse
 - **Search** — live filter the inbox by sender or subject; if nothing
   matches locally, hitting `Enter` falls back to a server-side search so you
@@ -138,7 +140,16 @@ mailc --set-default-account
 | `Ctrl+A` | Attach a file (opens a directory browser) |
 | `Ctrl+S` | Send |
 | `Backspace` (on Files field) | Remove selected attachment |
-| `Esc` | Cancel |
+| `Esc` | Cancel (or dismiss the recipient-suggestion dropdown first, if one's open) |
+
+On To/Cc/Bcc, typing fuzzy-matches against everyone you've received mail
+from and drops a suggestion list under the field:
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` | Move the highlighted suggestion |
+| `Enter` / `Tab` | Accept the highlighted suggestion |
+| `Esc` | Dismiss the dropdown without accepting |
 
 **Directory browser** (attach a file / choose a save location):
 

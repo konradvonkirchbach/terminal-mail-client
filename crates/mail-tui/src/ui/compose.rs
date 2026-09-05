@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{ComposeField, ComposeState};
@@ -23,6 +23,9 @@ pub fn draw(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Theme
     draw_header(frame, rows[0], compose, theme);
     draw_body(frame, rows[1], compose, theme);
     draw_help(frame, rows[2], compose, theme);
+    // Drawn last so it floats over the body, since it can be taller than
+    // the header block it hangs off of.
+    draw_suggestions(frame, rows[0], compose, theme);
 }
 
 fn field_line(label: &str, value: &str, focused: bool, theme: &Theme) -> Line<'static> {
@@ -102,6 +105,60 @@ fn draw_header(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Th
     }
 }
 
+/// A fuzzy-matched sender dropdown, floating just under whichever
+/// recipient field is focused. Deliberately drawn over the body rather
+/// than shrinking it — this is a transient overlay, not part of the
+/// layout.
+fn draw_suggestions(frame: &mut Frame, header_area: Rect, compose: &ComposeState, theme: &Theme) {
+    if compose.suggestions.is_empty() {
+        return;
+    }
+    let Some((row, _)) = focused_input_row(compose) else { return };
+
+    let inner = Block::new().borders(Borders::ALL).inner(header_area);
+    let x = inner.x + LABEL_WIDTH as u16;
+    let y = inner.y + row + 1;
+
+    let frame_area = frame.area();
+    let content_width = compose
+        .suggestions
+        .iter()
+        .map(|a| a.to_string().chars().count() as u16)
+        .max()
+        .unwrap_or(10)
+        .clamp(10, 50);
+    let width = (content_width + 2).min(frame_area.width.saturating_sub(x));
+    let height = (compose.suggestions.len() as u16 + 2).min(frame_area.height.saturating_sub(y));
+    if width < 3 || height < 3 {
+        return; // no room to draw it without corrupting the layout
+    }
+    let popup = Rect { x, y, width, height };
+
+    let items: Vec<ListItem> = compose
+        .suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, addr)| {
+            let style = if i == compose.suggestion_selected {
+                Style::new().bg(theme.selection).fg(theme.bright_foreground)
+            } else {
+                Style::new().fg(theme.foreground)
+            };
+            ListItem::new(addr.to_string()).style(style)
+        })
+        .collect();
+    let list = List::new(items).block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::new().fg(theme.accent))
+            .style(Style::new().bg(theme.background)),
+    );
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(list, popup);
+}
+
 fn focused_input_row(compose: &ComposeState) -> Option<(u16, &crate::editable::TextInput)> {
     match compose.focus {
         ComposeField::To => Some((0, &compose.to)),
@@ -149,6 +206,11 @@ fn draw_help(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Them
         Line::from(Span::styled("Sending...", Style::new().fg(theme.accent)))
     } else if let Some(err) = &compose.error {
         Line::from(Span::styled(format!("Send failed: {err}"), Style::new().fg(theme.red)))
+    } else if !compose.suggestions.is_empty() {
+        Line::from(Span::styled(
+            "\u{2191}/\u{2193} choose suggestion   Enter/Tab accept   Esc dismiss",
+            Style::new().fg(theme.muted),
+        ))
     } else {
         let hint = match compose.focus {
             ComposeField::Attachments if !compose.attachments.is_empty() => {

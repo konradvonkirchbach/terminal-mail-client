@@ -3,6 +3,7 @@ mod attach;
 mod desktop_notify;
 mod editable;
 mod filebrowser;
+mod fuzzy;
 mod setup;
 mod theme;
 mod ui;
@@ -17,7 +18,7 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
 use mail_core::send::SendOutcome;
-use mail_core::{Account, AppEvent, AttachmentFile, Envelope, Message, Store};
+use mail_core::{Account, Address, AppEvent, AttachmentFile, Envelope, Message, Store};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -86,6 +87,10 @@ enum BgMsg {
     /// the handler can drop a stale result if the user has since changed
     /// or cleared the search box.
     RemoteSearchDone { account_id: i64, query: String, result: Result<Vec<Envelope>, String> },
+    /// A read of the local known-senders address book finished, for
+    /// compose's recipient autocomplete. A failure is silently dropped —
+    /// suggestions are a nice-to-have, not worth a status-bar error.
+    KnownSenders { account_id: i64, result: Result<Vec<Address>, String> },
 }
 
 fn init_tracing() -> anyhow::Result<()> {
@@ -206,6 +211,8 @@ async fn run(
     let (tx, mut rx) = mpsc::channel::<BgMsg>(8);
     let (app_event_tx, mut app_events) = mpsc::unbounded_channel::<AppEvent>();
 
+    spawn_known_senders(accounts.current().clone(), tx.clone());
+
     // Every account gets synced (and its outbox flushed) concurrently at
     // startup, not just whichever is currently shown — so switching to
     // one later is likely to already have fresh data waiting in the
@@ -282,6 +289,9 @@ async fn run(
                                     app.selected = selected_uid
                                         .and_then(|uid| app.envelopes.iter().position(|e| e.uid == uid))
                                         .unwrap_or(0);
+                                    // A sync can introduce new senders —
+                                    // keep compose's autocomplete current.
+                                    spawn_known_senders(accounts.current().clone(), tx.clone());
                                 }
                                 Err(e) => {
                                     tracing::error!("sync failed: {e}");
@@ -354,6 +364,12 @@ async fn run(
                         }
                     }
                     Some(BgMsg::FetchedOlder { .. }) => {}
+                    Some(BgMsg::KnownSenders { account_id, result: Ok(senders) })
+                        if account_id == accounts.current().account_id =>
+                    {
+                        app.known_senders = senders;
+                    }
+                    Some(BgMsg::KnownSenders { .. }) => {}
                     Some(BgMsg::RemoteSearchDone { account_id, query, result }) => {
                         let still_relevant = account_id == accounts.current().account_id
                             && app.search.as_ref().is_some_and(|s| s.value.trim() == query);
@@ -397,6 +413,7 @@ async fn run(
                 // the user switches to it.
                 if account_id == accounts.current().account_id {
                     spawn_account_envelopes(accounts.current().clone(), tx.clone());
+                    spawn_known_senders(accounts.current().clone(), tx.clone());
                 }
                 // Notifications fire regardless of which account is being
                 // viewed — arguably more useful for one that isn't.
@@ -548,6 +565,7 @@ fn switch_account(app: &mut App, accounts: &mut Accounts, index: usize, tx: mpsc
 
     let ctx = accounts.current().clone();
     spawn_account_envelopes(ctx.clone(), tx.clone());
+    spawn_known_senders(ctx.clone(), tx.clone());
     spawn_sync(ctx, tx);
 }
 
@@ -665,8 +683,43 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx
         return;
     }
 
+    // While the recipient-suggestion dropdown is showing, a handful of
+    // keys drive it instead of their usual field-editing meaning; anything
+    // else (typing, Backspace, Left/Right, …) falls through unchanged so
+    // the fragment being matched keeps updating live.
+    let showing_suggestions = matches!(compose.focus, ComposeField::To | ComposeField::Cc | ComposeField::Bcc)
+        && !compose.suggestions.is_empty();
+    if showing_suggestions {
+        match code {
+            KeyCode::Up => {
+                compose.suggestion_selected = compose.suggestion_selected.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down => {
+                compose.suggestion_selected =
+                    (compose.suggestion_selected + 1).min(compose.suggestions.len() - 1);
+                return;
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                compose.accept_suggestion();
+                return;
+            }
+            KeyCode::Esc => {
+                compose.suggestions.clear();
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match code {
-        KeyCode::Esc => app.compose = None,
+        // Returns immediately rather than falling through to the shared
+        // `refresh_suggestions` call below — `compose` no longer points
+        // at anything live once `app.compose` is cleared.
+        KeyCode::Esc => {
+            app.compose = None;
+            return;
+        }
         KeyCode::Tab => compose.next_field(),
         KeyCode::BackTab => compose.prev_field(),
         KeyCode::Char(c) => edit_field(compose, |f| f.insert(c), |a| a.insert(c)),
@@ -700,6 +753,8 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx
         },
         _ => {}
     }
+
+    compose.refresh_suggestions(&app.known_senders);
 }
 
 /// Dispatches an edit to whichever field is focused — the single-line
@@ -917,6 +972,13 @@ fn spawn_remote_search(ctx: AccountCtx, query: String, tx: mpsc::Sender<BgMsg>) 
         let _ = tx
             .send(BgMsg::RemoteSearchDone { account_id: ctx.account_id, query, result })
             .await;
+    });
+}
+
+fn spawn_known_senders(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
+    tokio::spawn(async move {
+        let result = ctx.store.known_senders(ctx.account_id).await.map_err(|e| e.to_string());
+        let _ = tx.send(BgMsg::KnownSenders { account_id: ctx.account_id, result }).await;
     });
 }
 
