@@ -16,7 +16,7 @@ pub use account::Account;
 pub use error::{Error, Result};
 pub use smtp::{AttachmentFile, Draft};
 pub use store::Store;
-pub use types::{Envelope, Flag, Message};
+pub use types::{Envelope, Flag, Message, MessageAttachment};
 
 /// Both our own IMAP TLS setup and lettre's SMTP TLS setup use `rustls`,
 /// but pull in different crypto backends (`aws-lc-rs` for us, `ring`

@@ -1,4 +1,5 @@
 mod compose;
+mod filebrowser;
 mod message_list;
 mod reading_pane;
 mod search_bar;
@@ -12,6 +13,18 @@ use crate::app::App;
 use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
+    draw_base(frame, app, theme);
+
+    // The directory browser is a modal overlay on top of whatever's
+    // underneath (compose or the normal 3-pane view) — it's opened from
+    // either, so it's drawn here rather than owned by one of them.
+    if let Some((browser, purpose)) = &app.file_browser {
+        let area = frame.area();
+        filebrowser::draw(frame, area, browser, purpose, theme);
+    }
+}
+
+fn draw_base(frame: &mut Frame, app: &App, theme: &Theme) {
     // Compose is a full-screen takeover, not a floating popup — a flat
     // aesthetic gets nothing from stacking panes.
     if let Some(compose_state) = &app.compose {

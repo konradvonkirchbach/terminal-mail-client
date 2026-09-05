@@ -1,11 +1,13 @@
 mod app;
 mod attach;
 mod editable;
+mod filebrowser;
 mod setup;
 mod theme;
 mod ui;
 
 use std::io::stdout;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -19,9 +21,10 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use app::{App, BodyState, ComposeField, ComposeState, ListState};
+use app::{App, BodyState, BrowserPurpose, ComposeField, ComposeState, ListState};
 use attach::AttachmentEntry;
 use editable::{TextArea, TextInput};
+use filebrowser::FileBrowser;
 
 /// Everything a background task needs to talk to IMAP and the local
 /// cache. Cheap to clone — `Account`/`Store` are just handles.
@@ -62,6 +65,18 @@ fn load_or_setup_account() -> anyhow::Result<Account> {
         return Ok(Account::new(account_config));
     }
     setup::run()
+}
+
+fn default_browse_dir() -> PathBuf {
+    directories::UserDirs::new()
+        .map(|u| u.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn default_download_dir() -> PathBuf {
+    directories::UserDirs::new()
+        .and_then(|u| u.download_dir().map(Path::to_path_buf))
+        .unwrap_or_else(default_browse_dir)
 }
 
 #[tokio::main]
@@ -139,6 +154,17 @@ async fn run(
     let mut events = EventStream::new();
 
     loop {
+        // Clear an expired status message *before* drawing — otherwise
+        // the redraw that fires exactly when the tick elapses still
+        // shows the stale message for one more frame, and (since the
+        // next tick then becomes the long idle sleep) it visually never
+        // clears until some other event happens to force a redraw.
+        //
+        // Only wake up early for the TTL when a message is actually
+        // showing — otherwise fall back to a long idle sleep so this
+        // branch doesn't spin the loop for no reason.
+        let tick = app.expire_status().unwrap_or(Duration::from_secs(3600));
+
         terminal.draw(|frame| ui::draw(frame, &app, &theme))?;
 
         if app.should_quit {
@@ -175,6 +201,7 @@ async fn run(
                         app.list_state = ListState::Error(e);
                     }
                     Some(BgMsg::Body(uid, Ok(message))) if app.selected_uid() == Some(uid) => {
+                        app.selected_attachment = 0;
                         app.body = BodyState::Loaded(message);
                     }
                     Some(BgMsg::Body(uid, Err(e))) if app.selected_uid() == Some(uid) => {
@@ -184,7 +211,7 @@ async fn run(
                     Some(BgMsg::Body(..)) => {}
                     Some(BgMsg::SendDone(Ok(outcome))) => {
                         app.compose = None;
-                        app.status_message = Some(match outcome {
+                        app.set_status(match outcome {
                             SendOutcome::Sent => "Sent.".to_string(),
                             SendOutcome::Queued => "Offline — queued, will retry.".to_string(),
                         });
@@ -199,12 +226,17 @@ async fn run(
                     None => {}
                 }
             }
-            _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
+            _ = tokio::time::sleep(tick) => {}
         }
     }
 }
 
 fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx: &Ctx, tx: mpsc::Sender<BgMsg>) {
+    if app.file_browser.is_some() {
+        handle_browser_key(app, code);
+        return;
+    }
+
     if app.compose.is_some() {
         handle_compose_key(app, code, modifiers, ctx, tx);
         return;
@@ -248,8 +280,34 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx: &Ctx, 
                 spawn_fetch_body(ctx.clone(), uid, tx);
             }
         }
+        KeyCode::Char('[') => {
+            if let BodyState::Loaded(message) = &app.body {
+                if !message.attachments.is_empty() {
+                    app.selected_attachment = app.selected_attachment.saturating_sub(1);
+                }
+            }
+        }
+        KeyCode::Char(']') => {
+            if let BodyState::Loaded(message) = &app.body {
+                if !message.attachments.is_empty() {
+                    app.selected_attachment = (app.selected_attachment + 1).min(message.attachments.len() - 1);
+                }
+            }
+        }
+        KeyCode::Char('a') => start_download(app),
         _ => {}
     }
+}
+
+fn start_download(app: &mut App) {
+    let BodyState::Loaded(message) = &app.body else { return };
+    let Some(attachment) = message.attachments.get(app.selected_attachment) else { return };
+
+    let browser = FileBrowser::open_for_save(default_download_dir(), attachment.filename.clone());
+    let purpose = BrowserPurpose::SaveAttachment {
+        bytes: attachment.bytes.clone(),
+    };
+    app.file_browser = Some((browser, purpose));
 }
 
 fn handle_search_key(app: &mut App, code: KeyCode) {
@@ -288,11 +346,6 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx
         return;
     }
 
-    if compose.attach_prompt.is_some() {
-        handle_attach_prompt_key(compose, code);
-        return;
-    }
-
     if modifiers.contains(KeyModifiers::CONTROL) {
         match code {
             KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -303,7 +356,7 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx
                 spawn_send(ctx.clone(), draft, attachments, tx);
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                compose.attach_prompt = Some((TextInput::default(), None));
+                app.file_browser = Some((FileBrowser::open(default_browse_dir()), BrowserPurpose::AttachToCompose));
             }
             _ => {} // swallow unrecognized ctrl-chords rather than typing them literally
         }
@@ -347,62 +400,6 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx
     }
 }
 
-fn handle_attach_prompt_key(compose: &mut ComposeState, code: KeyCode) {
-    match code {
-        KeyCode::Esc => compose.attach_prompt = None,
-        KeyCode::Enter => {
-            let path = compose
-                .attach_prompt
-                .as_ref()
-                .map(|(i, _)| i.value.clone())
-                .unwrap_or_default();
-            match attach::validate(&path) {
-                Ok(entry) => {
-                    compose.attachments.push(entry);
-                    compose.attachment_selected = compose.attachments.len() - 1;
-                    compose.attach_prompt = None;
-                }
-                Err(e) => {
-                    if let Some((_, error)) = &mut compose.attach_prompt {
-                        *error = Some(e);
-                    }
-                }
-            }
-        }
-        KeyCode::Tab => {
-            let current = compose.attach_prompt.as_ref().map(|(i, _)| i.value.clone());
-            if let Some(completed) = current.and_then(|c| attach::complete(&c)) {
-                if let Some((input, _)) = &mut compose.attach_prompt {
-                    *input = TextInput::with_value(completed);
-                }
-            }
-        }
-        KeyCode::Char(c) => {
-            if let Some((input, error)) = &mut compose.attach_prompt {
-                input.insert(c);
-                *error = None;
-            }
-        }
-        KeyCode::Backspace => {
-            if let Some((input, error)) = &mut compose.attach_prompt {
-                input.backspace();
-                *error = None;
-            }
-        }
-        KeyCode::Left => {
-            if let Some((input, _)) = &mut compose.attach_prompt {
-                input.left();
-            }
-        }
-        KeyCode::Right => {
-            if let Some((input, _)) = &mut compose.attach_prompt {
-                input.right();
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Dispatches an edit to whichever field is focused — the single-line
 /// fields share one `TextInput` op, the body uses the matching `TextArea`
 /// op. Attachments has no text of its own (handled separately above).
@@ -418,6 +415,136 @@ fn edit_field(
         ComposeField::Subject => input_op(&mut compose.subject),
         ComposeField::Attachments => {}
         ComposeField::Body => area_op(&mut compose.body),
+    }
+}
+
+/// Handles the directory browser modal, used both for picking a file to
+/// attach and for picking where to save a downloaded attachment. All of
+/// this is local filesystem work (stat/read-dir/write), so it stays
+/// synchronous rather than round-tripping through a background task.
+fn handle_browser_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            app.file_browser = None;
+            return;
+        }
+        KeyCode::Tab => {
+            if let Some((browser, _)) = &mut app.file_browser {
+                browser.toggle_focus();
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    let filename_focused = app
+        .file_browser
+        .as_ref()
+        .map(|(b, _)| b.filename_focused)
+        .unwrap_or(false);
+
+    if filename_focused {
+        match code {
+            KeyCode::Left => edit_browser_filename(app, TextInput::left),
+            KeyCode::Right => edit_browser_filename(app, TextInput::right),
+            KeyCode::Char(c) => edit_browser_filename(app, move |f| f.insert(c)),
+            KeyCode::Backspace => edit_browser_filename(app, TextInput::backspace),
+            KeyCode::Enter => confirm_save(app),
+            _ => {}
+        }
+        return;
+    }
+
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let Some((browser, _)) = &mut app.file_browser {
+                browser.move_down();
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let Some((browser, _)) = &mut app.file_browser {
+                browser.move_up();
+            }
+        }
+        KeyCode::Enter => {
+            let picked = app.file_browser.as_mut().and_then(|(b, _)| b.activate());
+            if let Some(path) = picked {
+                handle_browser_pick(app, path);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn edit_browser_filename(app: &mut App, op: impl Fn(&mut TextInput)) {
+    if let Some((browser, _)) = &mut app.file_browser {
+        if let Some(filename) = &mut browser.filename {
+            op(filename);
+        }
+    }
+}
+
+/// A file was activated in the browser's list (Enter on a non-directory
+/// entry — directories are already descended into by `activate()`).
+fn handle_browser_pick(app: &mut App, path: PathBuf) {
+    let is_attach = matches!(
+        app.file_browser.as_ref().map(|(_, p)| p),
+        Some(BrowserPurpose::AttachToCompose)
+    );
+
+    if is_attach {
+        finish_attach(app, path);
+    } else {
+        // Save mode: picking an existing file prefills the filename field
+        // with it and hands focus there for an explicit confirm, rather
+        // than silently overwriting it.
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        if let Some((browser, _)) = &mut app.file_browser {
+            if let Some(name) = name {
+                browser.filename = Some(TextInput::with_value(name));
+            }
+            browser.filename_focused = true;
+        }
+    }
+}
+
+fn finish_attach(app: &mut App, path: PathBuf) {
+    let Some(compose) = &mut app.compose else {
+        app.file_browser = None;
+        return;
+    };
+    let existing_total = compose.attachments_total_bytes();
+
+    match attach::validate(&path, existing_total) {
+        Ok(entry) => {
+            compose.attachments.push(entry);
+            compose.attachment_selected = compose.attachments.len() - 1;
+            app.file_browser = None;
+        }
+        Err(e) => {
+            if let Some((browser, _)) = &mut app.file_browser {
+                browser.error = Some(e);
+            }
+        }
+    }
+}
+
+fn confirm_save(app: &mut App) {
+    let Some((browser, purpose)) = &app.file_browser else { return };
+    let BrowserPurpose::SaveAttachment { bytes, .. } = purpose else { return };
+    let Some(save_path) = browser.save_path() else { return };
+    let bytes = bytes.clone();
+
+    match std::fs::write(&save_path, &bytes) {
+        Ok(()) => {
+            app.set_status(format!("Saved to {}", save_path.display()));
+            app.file_browser = None;
+        }
+        Err(e) => {
+            if let Some((browser, _)) = &mut app.file_browser {
+                browser.error = Some(format!("{}: {e}", save_path.display()));
+            }
+        }
     }
 }
 

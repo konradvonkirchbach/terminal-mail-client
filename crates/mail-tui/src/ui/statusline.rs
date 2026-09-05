@@ -9,7 +9,7 @@ use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let count = app.envelopes.len();
-    let hints = "j/k move  / find  Enter read  c compose  r reply  S sync  q quit";
+    let hints = "j/k move  / find  Enter read  a download  c compose  r reply  S sync  q quit";
     let mut spans = vec![
         Span::styled(
             format!(" {} ", app.account_email),
@@ -18,7 +18,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         Span::raw(format!(" {count} messages  ")),
     ];
     match &app.status_message {
-        Some(msg) => spans.push(Span::styled(msg.clone(), Style::new().fg(theme.green))),
+        Some((msg, _)) => spans.push(Span::styled(msg.clone(), Style::new().fg(theme.green))),
         None => spans.push(Span::styled(hints, Style::new().fg(theme.muted))),
     }
     let line = Line::from(spans);

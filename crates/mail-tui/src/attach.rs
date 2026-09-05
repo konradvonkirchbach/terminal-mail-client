@@ -1,7 +1,12 @@
-//! Keyboard-only file attachment: validating a typed path, and shell-like
-//! Tab completion so typing an absolute path blind isn't painful.
+//! Validating a file chosen via the directory browser as a compose
+//! attachment.
 
 use std::path::{Path, PathBuf};
+
+/// Total attachment size cap for one message. Conservative relative to
+/// common provider limits (Gmail/Yahoo ~25MB, Outlook ~20MB) since
+/// base64-encoding attachments inflates their wire size by about a third.
+pub const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct AttachmentEntry {
@@ -10,113 +15,37 @@ pub struct AttachmentEntry {
     pub size_bytes: u64,
 }
 
-/// Expands a leading `~` to $HOME — the one shell convenience worth
-/// supporting for a plain-text path field with no real shell behind it.
-fn expand_tilde(input: &str) -> PathBuf {
-    if let Some(rest) = input.strip_prefix('~') {
-        if rest.is_empty() || rest.starts_with('/') {
-            if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
-                return home.join(rest.trim_start_matches('/'));
-            }
-        }
-    }
-    PathBuf::from(input)
-}
-
-/// Validates a typed path and stats the file. Returns a human-readable
-/// error rather than an `anyhow`/`mail_core::Error` since this is pure
-/// UI-side input validation, shown directly in the attach prompt.
-pub fn validate(input: &str) -> Result<AttachmentEntry, String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err("enter a file path".to_string());
-    }
-    let path = expand_tilde(trimmed);
-
-    let metadata = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+/// Validates a file the browser resolved to a concrete path: it must
+/// exist, not be a directory, and fit within the remaining size budget
+/// alongside whatever's already attached.
+pub fn validate(path: &Path, existing_total_bytes: u64) -> Result<AttachmentEntry, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if metadata.is_dir() {
         return Err(format!("{} is a directory", path.display()));
     }
+
+    let size_bytes = metadata.len();
+    let total = existing_total_bytes + size_bytes;
+    if total > MAX_TOTAL_ATTACHMENT_BYTES {
+        return Err(format!(
+            "adding {} ({}) would bring attachments to {}, over the {} limit",
+            path.display(),
+            human_size(size_bytes),
+            human_size(total),
+            human_size(MAX_TOTAL_ATTACHMENT_BYTES),
+        ));
+    }
+
     let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| trimmed.to_string());
+        .unwrap_or_else(|| path.display().to_string());
 
     Ok(AttachmentEntry {
-        path,
+        path: path.to_path_buf(),
         filename,
-        size_bytes: metadata.len(),
+        size_bytes,
     })
-}
-
-/// Shell-style Tab completion: given what's typed so far, lists sibling
-/// entries in the parent directory matching the partial last segment and
-/// completes to either the single match or their longest common prefix.
-/// Returns `None` when there's nothing to add (no matches, or already at
-/// the longest common prefix).
-pub fn complete(input: &str) -> Option<String> {
-    let expanded = expand_tilde(input);
-    let (dir, partial): (PathBuf, String) = if input.ends_with('/') {
-        (expanded.clone(), String::new())
-    } else {
-        let parent = expanded.parent().map(Path::to_path_buf).unwrap_or_default();
-        let partial = expanded
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        (parent, partial)
-    };
-
-    let dir_to_read = if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir };
-    let entries = std::fs::read_dir(&dir_to_read).ok()?;
-
-    let mut matches: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with(&partial) {
-                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                Some(if is_dir { format!("{name}/") } else { name })
-            } else {
-                None
-            }
-        })
-        .collect();
-    matches.sort();
-
-    if matches.is_empty() {
-        return None;
-    }
-
-    let completed_suffix = if matches.len() == 1 {
-        matches.remove(0)
-    } else {
-        longest_common_prefix(&matches)
-    };
-    if completed_suffix.is_empty() || completed_suffix == partial {
-        return None;
-    }
-
-    let base = input.strip_suffix(&partial).unwrap_or(input);
-    Some(format!("{base}{completed_suffix}"))
-}
-
-fn longest_common_prefix(strings: &[String]) -> String {
-    let mut iter = strings.iter();
-    let Some(first) = iter.next() else {
-        return String::new();
-    };
-    let mut prefix_len = first.chars().count();
-    for s in iter {
-        prefix_len = prefix_len.min(
-            first
-                .chars()
-                .zip(s.chars())
-                .take_while(|(a, b)| a == b)
-                .count(),
-        );
-    }
-    first.chars().take(prefix_len).collect()
 }
 
 pub fn human_size(bytes: u64) -> String {

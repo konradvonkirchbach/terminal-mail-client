@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{ComposeField, ComposeState};
@@ -23,10 +23,6 @@ pub fn draw(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Theme
     draw_header(frame, rows[0], compose, theme);
     draw_body(frame, rows[1], compose, theme);
     draw_help(frame, rows[2], compose, theme);
-
-    if let Some((input, error)) = &compose.attach_prompt {
-        draw_attach_prompt(frame, area, input, error.as_deref(), theme);
-    }
 }
 
 fn field_line(label: &str, value: &str, focused: bool, theme: &Theme) -> Line<'static> {
@@ -163,53 +159,4 @@ fn draw_help(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Them
         Line::from(Span::styled(hint, Style::new().fg(theme.muted)))
     };
     frame.render_widget(Paragraph::new(text).style(Style::new().bg(theme.background)), area);
-}
-
-fn draw_attach_prompt(
-    frame: &mut Frame,
-    area: Rect,
-    input: &crate::editable::TextInput,
-    error: Option<&str>,
-    theme: &Theme,
-) {
-    let modal = centered_rect(70, 5, area);
-    frame.render_widget(Clear, modal);
-
-    let block = Block::new()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(Style::new().fg(theme.accent))
-        .style(Style::new().bg(theme.background).fg(theme.foreground))
-        .title(Span::styled(" attach file ", Style::new().fg(theme.bright_foreground)));
-
-    let inner = block.inner(modal);
-    frame.render_widget(block, modal);
-
-    let mut lines = vec![Line::from(vec![
-        Span::styled("Path: ", Style::new().fg(theme.muted)),
-        Span::styled(input.value.clone(), Style::new().fg(theme.foreground)),
-    ])];
-    if let Some(err) = error {
-        lines.push(Line::from(Span::styled(err.to_string(), Style::new().fg(theme.red))));
-    } else {
-        lines.push(Line::from(""));
-    }
-    lines.push(Line::from(Span::styled(
-        "Tab complete   Enter add   Esc cancel",
-        Style::new().fg(theme.muted),
-    )));
-
-    frame.render_widget(Paragraph::new(lines), inner);
-    frame.set_cursor_position((inner.x + 6 + input.cursor as u16, inner.y));
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    }
 }

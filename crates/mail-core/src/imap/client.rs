@@ -8,7 +8,9 @@ use tokio_rustls::{client::TlsStream, rustls, TlsConnector};
 
 use crate::account::Account;
 use crate::error::{Error, Result};
-use crate::types::{Address, Envelope, Flags, Message};
+use mail_parser::MimeHeaders;
+
+use crate::types::{Address, Envelope, Flags, Message, MessageAttachment};
 
 pub(crate) type ImapSession = Session<TlsStream<TcpStream>>;
 
@@ -198,6 +200,22 @@ pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
         .parse(raw)
         .ok_or_else(|| Error::Parse(format!("failed to parse message uid {uid}")))?;
 
+    let attachments = parsed
+        .attachments()
+        .enumerate()
+        .map(|(i, part)| {
+            let filename = part
+                .attachment_name()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("attachment-{}", i + 1));
+            MessageAttachment {
+                filename,
+                size_bytes: part.contents().len() as u64,
+                bytes: part.contents().to_vec(),
+            }
+        })
+        .collect();
+
     Ok(Message {
         uid,
         subject: parsed.subject().unwrap_or_default().to_string(),
@@ -209,6 +227,7 @@ pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
             .or_else(|| parsed.body_html(0))
             .map(|c| c.into_owned())
             .unwrap_or_default(),
+        attachments,
     })
 }
 

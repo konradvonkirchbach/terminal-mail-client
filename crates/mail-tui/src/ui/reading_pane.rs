@@ -5,6 +5,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, BodyState};
+use crate::attach::human_size;
 use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -53,11 +54,33 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     Span::styled("Date: ", Style::new().fg(theme.muted)),
                     Span::raw(date),
                 ]),
-                Line::from(Span::styled(
-                    "─".repeat(area.width.saturating_sub(2) as usize),
-                    Style::new().fg(theme.muted),
-                )),
             ];
+
+            if !message.attachments.is_empty() {
+                let mut spans = vec![Span::styled("Attachments: ", Style::new().fg(theme.muted))];
+                for (i, a) in message.attachments.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw("  "));
+                    }
+                    let text = format!("{} ({})", a.filename, human_size(a.size_bytes));
+                    let style = if i == app.selected_attachment {
+                        Style::new().bg(theme.selection).fg(theme.bright_foreground)
+                    } else {
+                        Style::new().fg(theme.foreground)
+                    };
+                    spans.push(Span::styled(text, style));
+                }
+                lines.push(Line::from(spans));
+                lines.push(Line::from(Span::styled(
+                    "[ ] select   a download",
+                    Style::new().fg(theme.muted),
+                )));
+            }
+
+            lines.push(Line::from(Span::styled(
+                "─".repeat(area.width.saturating_sub(2) as usize),
+                Style::new().fg(theme.muted),
+            )));
             for line in message.body_text.lines() {
                 lines.push(Line::from(line.to_string()));
             }

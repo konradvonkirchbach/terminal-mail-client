@@ -59,4 +59,15 @@ pub struct Message {
     pub to: Vec<Address>,
     pub date: Option<DateTime<Utc>>,
     pub body_text: String,
+    pub attachments: Vec<MessageAttachment>,
+}
+
+/// An attachment extracted from a received message, bytes and all — read
+/// alongside the body since we've already parsed the whole raw message by
+/// that point, so there's no separate fetch to save a download for later.
+#[derive(Debug, Clone)]
+pub struct MessageAttachment {
+    pub filename: String,
+    pub size_bytes: u64,
+    pub bytes: Vec<u8>,
 }
