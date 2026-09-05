@@ -406,3 +406,93 @@ fn mail_date_to_chrono(d: &mail_parser::DateTime) -> chrono::DateTime<chrono::Ut
         .single()
         .unwrap_or_else(chrono::Utc::now)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_search_term_leaves_plain_text_untouched() {
+        assert_eq!(escape_search_term("plain text"), "plain text");
+    }
+
+    #[test]
+    fn escape_search_term_escapes_quotes_and_backslashes() {
+        assert_eq!(escape_search_term(r#"say "hi""#), r#"say \"hi\""#);
+        assert_eq!(escape_search_term(r"back\slash"), r"back\\slash");
+        // Backslashes must be escaped before quotes, or a term ending in
+        // `\"` would produce a dangling, syntax-breaking escape.
+        assert_eq!(escape_search_term(r#"\""#), r#"\\\""#);
+    }
+
+    fn plain_message(body: &str) -> Vec<u8> {
+        format!(
+            "From: Alice <alice@example.com>\r\n\
+             To: Bob <bob@example.com>\r\n\
+             Subject: Hello\r\n\
+             Date: Mon, 1 Jan 2024 12:00:00 +0000\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             {body}"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn message_from_raw_parses_headers_and_plain_body() {
+        let raw = plain_message("Hello, world!");
+        let msg = message_from_raw(7, &raw).unwrap();
+
+        assert_eq!(msg.uid, 7);
+        assert_eq!(msg.subject, "Hello");
+        assert_eq!(msg.from[0].email, "alice@example.com");
+        assert_eq!(msg.to[0].email, "bob@example.com");
+        assert!(msg.body_text.contains("Hello, world!"));
+        assert!(msg.attachments.is_empty());
+        assert!(msg.date.is_some());
+    }
+
+    fn multipart_message_with_attachment(disposition_and_filename: &str) -> Vec<u8> {
+        format!(
+            "From: a@example.com\r\n\
+             To: b@example.com\r\n\
+             Subject: With attachment\r\n\
+             Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+             \r\n\
+             --BOUNDARY\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             See attached.\r\n\
+             --BOUNDARY\r\n\
+             Content-Type: application/octet-stream\r\n\
+             {disposition_and_filename}\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             \r\n\
+             aGVsbG8gd29ybGQ=\r\n\
+             --BOUNDARY--\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn message_from_raw_extracts_a_named_attachment() {
+        let raw = multipart_message_with_attachment(
+            "Content-Disposition: attachment; filename=\"notes.txt\"",
+        );
+        let msg = message_from_raw(1, &raw).unwrap();
+
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].filename, "notes.txt");
+        assert_eq!(msg.attachments[0].bytes, b"hello world");
+        assert_eq!(msg.attachments[0].size_bytes, 11);
+    }
+
+    #[test]
+    fn message_from_raw_synthesizes_a_filename_when_missing() {
+        let raw = multipart_message_with_attachment("Content-Disposition: attachment");
+        let msg = message_from_raw(1, &raw).unwrap();
+
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].filename, "attachment-1");
+    }
+}

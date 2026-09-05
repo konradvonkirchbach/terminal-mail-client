@@ -89,7 +89,7 @@ impl Store {
     }
 }
 
-fn init_connection(conn: &Connection) -> Result<()> {
+pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
 
@@ -107,4 +107,64 @@ fn init_connection(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "user_version", 2)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::OptionalExtension;
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap()
+    }
+
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .optional()
+        .unwrap()
+        .is_some()
+    }
+
+    #[test]
+    fn fresh_database_lands_on_current_schema_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_connection(&conn).unwrap();
+        assert_eq!(user_version(&conn), 2);
+        // Sanity check the schema actually applied, not just the pragma.
+        conn.execute("INSERT INTO accounts (email) VALUES ('a@example.com')", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn init_connection_is_idempotent_across_repeated_opens() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_connection(&conn).unwrap();
+        init_connection(&conn).unwrap();
+        assert_eq!(user_version(&conn), 2);
+    }
+
+    #[test]
+    fn migrates_a_version_1_database_by_dropping_the_dead_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate a database created before messages_folder_date was
+        // removed from SCHEMA_V1: apply the schema, then hand-add the
+        // index and stamp it as version 1, mirroring what an old install
+        // would actually have on disk.
+        conn.execute_batch(super::super::schema::SCHEMA_V1).unwrap();
+        conn.execute_batch(
+            "CREATE INDEX messages_folder_date ON messages(folder_id, date);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        assert!(index_exists(&conn, "messages_folder_date"));
+
+        init_connection(&conn).unwrap();
+
+        assert_eq!(user_version(&conn), 2);
+        assert!(!index_exists(&conn, "messages_folder_date"));
+    }
 }

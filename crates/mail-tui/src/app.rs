@@ -11,6 +11,9 @@ use crate::filebrowser::FileBrowser;
 /// become visible again without needing another keypress.
 pub const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(5);
 
+/// How many rows a vim-style `Ctrl-d`/`Ctrl-u` half-page jump moves.
+pub const PAGE_JUMP: usize = 10;
+
 /// What a currently-open `FileBrowser` is for — decides what happens
 /// when the user picks a file or confirms a save location.
 pub enum BrowserPurpose {
@@ -177,6 +180,10 @@ pub struct App {
     /// Guards against firing multiple concurrent "load more" requests
     /// while one is already in flight.
     pub loading_more: bool,
+    /// Set after a lone `g` keypress in normal mode, waiting to see if the
+    /// next key completes vim's `gg` ("jump to top"); cleared by any other
+    /// key.
+    pub pending_g: bool,
     pub should_quit: bool,
 }
 
@@ -197,6 +204,7 @@ impl App {
             file_browser: None,
             has_more_older: true,
             loading_more: false,
+            pending_g: false,
             confirm_delete: None,
             should_quit: false,
         }
@@ -222,6 +230,7 @@ impl App {
         self.clear_search();
         self.has_more_older = true;
         self.loading_more = false;
+        self.pending_g = false;
     }
 
     /// Clears the status message once its TTL has elapsed; called from
@@ -280,6 +289,32 @@ impl App {
         self.selected = self.selected.saturating_sub(1);
     }
 
+    /// Vim-style `gg` — jump to the first row.
+    pub fn select_top(&mut self) {
+        self.selected = 0;
+    }
+
+    /// Vim-style `G` — jump to the last visible row.
+    pub fn select_bottom(&mut self) {
+        let visible_len = self.visible_indices().len();
+        self.selected = visible_len.saturating_sub(1);
+    }
+
+    /// Vim-style `Ctrl-d` — jump `PAGE_JUMP` rows down, clamped to the
+    /// last visible row.
+    pub fn select_page_down(&mut self) {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + PAGE_JUMP).min(visible.len() - 1);
+    }
+
+    /// Vim-style `Ctrl-u` — jump `PAGE_JUMP` rows up, clamped to the top.
+    pub fn select_page_up(&mut self) {
+        self.selected = self.selected.saturating_sub(PAGE_JUMP);
+    }
+
     pub fn selected_uid(&self) -> Option<u32> {
         self.selected_envelope().map(|e| e.uid)
     }
@@ -325,4 +360,289 @@ fn envelope_matches(e: &Envelope, needle: &str) -> bool {
             a.email.to_lowercase().contains(needle)
                 || a.name.as_deref().unwrap_or("").to_lowercase().contains(needle)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mail_core::types::{Address, Flags};
+
+    fn env(uid: u32, subject: &str, from_name: &str, from_email: &str) -> Envelope {
+        Envelope {
+            uid,
+            subject: subject.to_string(),
+            from: vec![Address { name: Some(from_name.to_string()), email: from_email.to_string() }],
+            to: Vec::new(),
+            date: None,
+            flags: Flags::default(),
+            has_attachments: false,
+        }
+    }
+
+    fn app_with(envelopes: Vec<Envelope>) -> App {
+        let mut app = App::new(vec!["me@example.com".to_string()]);
+        app.envelopes = envelopes;
+        app
+    }
+
+    fn sample_app() -> App {
+        app_with(vec![
+            env(5, "Weekly digest", "News", "news@example.com"),
+            env(4, "Re: project plan", "Alice", "alice@example.com"),
+            env(3, "Invoice #42", "Billing", "billing@example.com"),
+            env(2, "Lunch?", "Bob", "bob@example.com"),
+            env(1, "Welcome", "Support", "support@example.com"),
+        ])
+    }
+
+    // -- visible_indices / search filtering --------------------------------
+
+    #[test]
+    fn visible_indices_with_no_search_returns_everything_in_order() {
+        let app = sample_app();
+        assert_eq!(app.visible_indices(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn visible_indices_filters_by_subject_case_insensitively() {
+        let mut app = sample_app();
+        app.search = Some(TextInput::with_value("invoice".to_string()));
+        assert_eq!(app.visible_indices(), vec![2]);
+    }
+
+    #[test]
+    fn visible_indices_filters_by_sender_name_or_email() {
+        let mut app = sample_app();
+        app.search = Some(TextInput::with_value("alice".to_string()));
+        assert_eq!(app.visible_indices(), vec![1]);
+
+        app.search = Some(TextInput::with_value("bob@example.com".to_string()));
+        assert_eq!(app.visible_indices(), vec![3]);
+    }
+
+    #[test]
+    fn visible_indices_treats_blank_or_whitespace_query_as_no_filter() {
+        let mut app = sample_app();
+        app.search = Some(TextInput::with_value("   ".to_string()));
+        assert_eq!(app.visible_indices(), vec![0, 1, 2, 3, 4]);
+    }
+
+    // -- selection movement --------------------------------------------------
+
+    #[test]
+    fn select_next_and_prev_clamp_at_the_list_bounds() {
+        let mut app = sample_app();
+        assert_eq!(app.selected, 0);
+        app.select_prev();
+        assert_eq!(app.selected, 0, "select_prev must not go below 0");
+
+        for _ in 0..10 {
+            app.select_next();
+        }
+        assert_eq!(app.selected, 4, "select_next must clamp at the last row");
+    }
+
+    #[test]
+    fn select_next_and_prev_on_an_empty_list_do_nothing() {
+        let mut app = app_with(Vec::new());
+        app.select_next();
+        assert_eq!(app.selected, 0);
+        app.select_prev();
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn select_top_and_bottom_jump_to_the_list_ends() {
+        let mut app = sample_app();
+        app.selected = 2;
+        app.select_bottom();
+        assert_eq!(app.selected, 4);
+        app.select_top();
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn select_bottom_on_an_empty_list_stays_at_zero() {
+        let mut app = app_with(Vec::new());
+        app.select_bottom();
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn select_page_down_and_up_jump_by_page_jump_and_clamp() {
+        let mut app = sample_app();
+        app.select_page_down();
+        assert_eq!(app.selected, 4, "only 5 rows exist, so a 10-row jump clamps to the last one");
+
+        app.select_page_up();
+        assert_eq!(app.selected, 0, "a 10-row jump back up from row 4 clamps to the top");
+    }
+
+    #[test]
+    fn select_page_down_on_an_empty_list_does_nothing() {
+        let mut app = app_with(Vec::new());
+        app.select_page_down();
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn is_at_end_of_list_is_true_only_on_the_last_row_of_a_nonempty_list() {
+        let mut app = sample_app();
+        assert!(!app.is_at_end_of_list());
+        app.selected = 4;
+        assert!(app.is_at_end_of_list());
+
+        let empty = app_with(Vec::new());
+        assert!(!empty.is_at_end_of_list(), "an empty list has no 'end' to reach");
+    }
+
+    // -- selected_uid / selected_envelope respect the active filter ---------
+
+    #[test]
+    fn selected_uid_maps_through_the_active_filter() {
+        let mut app = sample_app();
+        app.search = Some(TextInput::with_value("a".to_string())); // matches several
+        let visible = app.visible_indices();
+        assert!(!visible.is_empty());
+        assert_eq!(app.selected_uid(), Some(app.envelopes[visible[0]].uid));
+    }
+
+    #[test]
+    fn selected_uid_is_none_when_filter_matches_nothing() {
+        let mut app = sample_app();
+        app.search = Some(TextInput::with_value("zzz_no_match".to_string()));
+        assert_eq!(app.selected_uid(), None);
+    }
+
+    // -- remove_envelope ------------------------------------------------------
+
+    #[test]
+    fn remove_envelope_drops_the_row_and_keeps_selection_in_bounds() {
+        let mut app = sample_app();
+        app.selected = 4; // last row (uid 1)
+        app.remove_envelope(1);
+
+        assert_eq!(app.envelopes.len(), 4);
+        assert!(app.envelopes.iter().all(|e| e.uid != 1));
+        assert_eq!(app.selected, 3, "selection must move back onto the new last row");
+    }
+
+    #[test]
+    fn remove_envelope_clears_the_reading_pane_if_it_was_showing_that_message() {
+        let mut app = sample_app();
+        app.body = BodyState::Loaded(Message {
+            uid: 3,
+            subject: "Invoice #42".to_string(),
+            from: Vec::new(),
+            to: Vec::new(),
+            date: None,
+            body_text: String::new(),
+            attachments: Vec::new(),
+        });
+
+        app.remove_envelope(3);
+
+        assert!(matches!(app.body, BodyState::Empty));
+    }
+
+    #[test]
+    fn remove_envelope_leaves_the_reading_pane_alone_for_a_different_message() {
+        let mut app = sample_app();
+        app.body = BodyState::Loaded(Message {
+            uid: 3,
+            subject: "Invoice #42".to_string(),
+            from: Vec::new(),
+            to: Vec::new(),
+            date: None,
+            body_text: String::new(),
+            attachments: Vec::new(),
+        });
+
+        app.remove_envelope(1);
+
+        assert!(matches!(app.body, BodyState::Loaded(_)));
+    }
+
+    // -- search lifecycle -----------------------------------------------------
+
+    #[test]
+    fn start_search_opens_an_empty_editable_query_and_resets_selection() {
+        let mut app = sample_app();
+        app.selected = 3;
+        app.start_search();
+
+        assert!(app.search_editing);
+        assert_eq!(app.search.as_ref().unwrap().value, "");
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn clear_search_removes_the_filter_and_resets_selection() {
+        let mut app = sample_app();
+        app.search = Some(TextInput::with_value("invoice".to_string()));
+        app.search_editing = true;
+        app.selected = 0;
+
+        app.clear_search();
+
+        assert!(app.search.is_none());
+        assert!(!app.search_editing);
+        assert_eq!(app.visible_indices().len(), 5);
+    }
+
+    // -- status message TTL ----------------------------------------------------
+
+    #[test]
+    fn expire_status_clears_a_message_past_its_ttl() {
+        let mut app = sample_app();
+        app.status_message = Some(("old".to_string(), Instant::now() - STATUS_MESSAGE_TTL - Duration::from_secs(1)));
+
+        let remaining = app.expire_status();
+
+        assert!(remaining.is_none());
+        assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn expire_status_leaves_a_fresh_message_in_place() {
+        let mut app = sample_app();
+        app.set_status("fresh");
+
+        let remaining = app.expire_status();
+
+        assert!(remaining.is_some());
+        assert!(app.status_message.is_some());
+    }
+
+    // -- account switch reset --------------------------------------------------
+
+    #[test]
+    fn reset_for_account_switch_clears_everything_specific_to_the_previous_account() {
+        let mut app = sample_app();
+        app.selected = 3;
+        app.search = Some(TextInput::with_value("x".to_string()));
+        app.has_more_older = false;
+        app.loading_more = true;
+        app.pending_g = true;
+        app.body = BodyState::Loaded(Message {
+            uid: 1,
+            subject: String::new(),
+            from: Vec::new(),
+            to: Vec::new(),
+            date: None,
+            body_text: String::new(),
+            attachments: Vec::new(),
+        });
+
+        app.reset_for_account_switch();
+
+        assert!(app.envelopes.is_empty());
+        assert_eq!(app.selected, 0);
+        assert!(matches!(app.body, BodyState::Empty));
+        assert!(matches!(app.list_state, ListState::Loading));
+        assert!(app.search.is_none());
+        assert!(app.has_more_older);
+        assert!(!app.loading_more);
+        assert!(!app.pending_g);
+    }
 }

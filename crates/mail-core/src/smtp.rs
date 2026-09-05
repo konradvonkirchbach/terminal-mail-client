@@ -163,3 +163,98 @@ fn parse_mailboxes(field: &str) -> Result<Vec<Mailbox>> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AccountConfig, AuthMethod};
+
+    fn test_account() -> Account {
+        Account::new(AccountConfig {
+            email: "me@example.com".to_string(),
+            display_name: None,
+            imap_host: "imap.example.com".to_string(),
+            imap_port: 993,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            auth: AuthMethod::Password,
+            fetch_limit: 50,
+        })
+    }
+
+    fn draft(to: &str, cc: &str, bcc: &str) -> Draft {
+        Draft {
+            to: to.to_string(),
+            cc: cc.to_string(),
+            bcc: bcc.to_string(),
+            subject: "Test subject".to_string(),
+            body: "Test body".to_string(),
+        }
+    }
+
+    #[test]
+    fn build_produces_expected_headers_and_body() {
+        let built = build(&test_account(), &draft("bob@example.com", "", ""), &[]).unwrap();
+        let raw = String::from_utf8_lossy(&built.raw);
+
+        assert!(raw.contains("From: <me@example.com>") || raw.contains("me@example.com"));
+        assert!(raw.contains("To: <bob@example.com>") || raw.contains("bob@example.com"));
+        assert!(raw.contains("Subject: Test subject"));
+        assert!(raw.contains("Test body"));
+        assert_eq!(built.recipients, vec!["bob@example.com".to_string()]);
+    }
+
+    #[test]
+    fn build_with_no_recipients_at_all_is_rejected() {
+        match build(&test_account(), &draft("", "", ""), &[]) {
+            Err(e) => assert!(e.to_string().contains("no recipients")),
+            Ok(_) => panic!("expected an error for a message with no recipients"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_an_unparsable_address() {
+        match build(&test_account(), &draft("not-an-email", "", ""), &[]) {
+            Err(Error::Config(_)) => {}
+            Err(other) => panic!("expected Error::Config, got {other:?}"),
+            Ok(_) => panic!("expected an error for an unparsable address"),
+        }
+    }
+
+    #[test]
+    fn build_collects_cc_and_bcc_into_envelope_recipients_but_strips_the_bcc_header() {
+        let built = build(
+            &test_account(),
+            &draft("to@example.com", "cc@example.com", "bcc@example.com"),
+            &[],
+        )
+        .unwrap();
+
+        let mut recipients = built.recipients.clone();
+        recipients.sort();
+        assert_eq!(
+            recipients,
+            vec!["bcc@example.com".to_string(), "cc@example.com".to_string(), "to@example.com".to_string()]
+        );
+
+        let raw = String::from_utf8_lossy(&built.raw);
+        assert!(raw.contains("cc@example.com"), "Cc header should survive into the raw message");
+        assert!(
+            !raw.contains("bcc@example.com"),
+            "Bcc must never appear in the transmitted/cached raw bytes"
+        );
+    }
+
+    #[test]
+    fn build_with_an_attachment_includes_its_filename() {
+        let attachment = AttachmentFile {
+            filename: "notes.txt".to_string(),
+            bytes: b"hello world".to_vec(),
+        };
+        let built = build(&test_account(), &draft("bob@example.com", "", ""), &[attachment]).unwrap();
+        let raw = String::from_utf8_lossy(&built.raw);
+
+        assert!(raw.contains("notes.txt"));
+        assert!(raw.contains("Test body"));
+    }
+}

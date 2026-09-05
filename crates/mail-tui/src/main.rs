@@ -436,6 +436,12 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, accounts: &
         return;
     }
 
+    // `gg` needs to see two `g` presses in a row — any other key cancels
+    // the pending first one instead of being swallowed by it.
+    if !matches!(code, KeyCode::Char('g')) {
+        app.pending_g = false;
+    }
+
     match code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Esc => {
@@ -447,19 +453,26 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, accounts: &
         }
         KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('n') => {
             app.select_next();
-            // Only chase "load more" against the real, unfiltered list —
-            // reaching the end of a search's matches doesn't mean the
-            // cache itself is exhausted.
-            if app.search.is_none()
-                && app.has_more_older
-                && !app.loading_more
-                && app.is_at_end_of_list()
-            {
-                app.loading_more = true;
-                spawn_fetch_older(accounts.current().clone(), tx.clone());
-            }
+            maybe_load_more(app, accounts, &tx);
         }
         KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('N') => app.select_prev(),
+        KeyCode::Char('g') => {
+            if app.pending_g {
+                app.pending_g = false;
+                app.select_top();
+            } else {
+                app.pending_g = true;
+            }
+        }
+        KeyCode::Char('G') => {
+            app.select_bottom();
+            maybe_load_more(app, accounts, &tx);
+        }
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.select_page_down();
+            maybe_load_more(app, accounts, &tx);
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.select_page_up(),
         KeyCode::Char('/') => app.start_search(),
         KeyCode::Char('S') => {
             app.list_state = ListState::Loading;
@@ -536,6 +549,18 @@ fn switch_account(app: &mut App, accounts: &mut Accounts, index: usize, tx: mpsc
     let ctx = accounts.current().clone();
     spawn_account_envelopes(ctx.clone(), tx.clone());
     spawn_sync(ctx, tx);
+}
+
+/// Checks whether the selection just landed on the last visible row with
+/// nothing else in flight — the shared trigger for backfilling older mail,
+/// used by every key that can reach the end of the list (`j`, `G`,
+/// `Ctrl-d`). Only fires against the real, unfiltered list: reaching the
+/// end of a search's matches doesn't mean the cache itself is exhausted.
+fn maybe_load_more(app: &mut App, accounts: &Accounts, tx: &mpsc::Sender<BgMsg>) {
+    if app.search.is_none() && app.has_more_older && !app.loading_more && app.is_at_end_of_list() {
+        app.loading_more = true;
+        spawn_fetch_older(accounts.current().clone(), tx.clone());
+    }
 }
 
 fn start_download(app: &mut App) {

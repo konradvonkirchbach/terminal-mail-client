@@ -59,3 +59,40 @@ pub fn parse_hex(s: &str) -> Option<Color> {
     let b = u8::from_str_radix(&s[4..6], 16).ok()?;
     Some(Color::Rgb(r, g, b))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_reads_rgb_components() {
+        assert_eq!(parse_hex("#a8382c"), Some(Color::Rgb(0xa8, 0x38, 0x2c)));
+    }
+
+    #[test]
+    fn parse_hex_is_case_insensitive() {
+        assert_eq!(parse_hex("#A8382C"), Some(Color::Rgb(0xa8, 0x38, 0x2c)));
+    }
+
+    #[test]
+    fn parse_hex_trims_surrounding_whitespace() {
+        assert_eq!(parse_hex("  #ffffff  "), Some(Color::Rgb(0xff, 0xff, 0xff)));
+    }
+
+    #[test]
+    fn parse_hex_rejects_a_missing_hash_prefix() {
+        assert_eq!(parse_hex("a8382c"), None);
+    }
+
+    #[test]
+    fn parse_hex_rejects_the_wrong_number_of_digits() {
+        assert_eq!(parse_hex("#fff"), None);
+        assert_eq!(parse_hex("#a8382c1"), None);
+        assert_eq!(parse_hex("#"), None);
+    }
+
+    #[test]
+    fn parse_hex_rejects_non_hex_characters() {
+        assert_eq!(parse_hex("#zzzzzz"), None);
+    }
+}

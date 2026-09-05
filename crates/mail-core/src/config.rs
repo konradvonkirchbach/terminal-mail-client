@@ -165,3 +165,108 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A scratch directory under the OS temp dir, unique to this test
+    /// process/thread/call — deliberately not the real config/data dirs,
+    /// since these tests must never touch the user's actual mail cache.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "mail-core-test-{label}-{}-{:?}",
+                std::process::id(),
+                std::time::Instant::now()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn restrict_dir_sets_owner_only_permissions() {
+        let dir = ScratchDir::new("restrict-dir");
+        // Loosen it first so the test actually exercises restrict_dir
+        // rather than passing by accident on whatever mode it started at.
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        restrict_dir(&dir.0).unwrap();
+
+        let mode = std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn restrict_file_sets_owner_only_permissions() {
+        let dir = ScratchDir::new("restrict-file");
+        let file = dir.0.join("secret.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        restrict_file(&file).unwrap();
+
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn messages_dir_and_outbox_dir_are_scoped_by_account_id_and_kind() {
+        let messages = messages_dir(42).unwrap();
+        let outbox = outbox_dir(42).unwrap();
+        assert!(messages.ends_with("42/messages"));
+        assert!(outbox.ends_with("42/outbox"));
+        assert_ne!(messages, outbox);
+        assert_ne!(messages, messages_dir(7).unwrap());
+    }
+
+    #[test]
+    fn config_round_trips_through_toml() {
+        let mut config = Config {
+            default_account: Some("me@example.com".to_string()),
+            ..Config::default()
+        };
+        config.accounts.push(AccountConfig {
+            email: "me@example.com".to_string(),
+            display_name: Some("Me".to_string()),
+            imap_host: "imap.example.com".to_string(),
+            imap_port: 993,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            auth: AuthMethod::Password,
+            fetch_limit: 50,
+        });
+
+        let raw = toml::to_string_pretty(&config).unwrap();
+        let round_tripped: Config = toml::from_str(&raw).unwrap();
+
+        assert_eq!(round_tripped.default_account, config.default_account);
+        assert_eq!(round_tripped.accounts.len(), 1);
+        assert_eq!(round_tripped.accounts[0].email, "me@example.com");
+        assert_eq!(round_tripped.accounts[0].imap_port, 993);
+    }
+
+    #[test]
+    fn missing_optional_account_fields_fall_back_to_documented_defaults() {
+        let raw = r#"
+            email = "me@example.com"
+            imap_host = "imap.example.com"
+            smtp_host = "smtp.example.com"
+        "#;
+        let account: AccountConfig = toml::from_str(raw).unwrap();
+        assert_eq!(account.imap_port, 993);
+        assert_eq!(account.smtp_port, 587);
+        assert_eq!(account.fetch_limit, 50);
+        assert!(matches!(account.auth, AuthMethod::Password));
+    }
+}
