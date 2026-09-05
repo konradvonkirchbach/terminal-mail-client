@@ -1,4 +1,5 @@
 mod app;
+mod attach;
 mod editable;
 mod setup;
 mod theme;
@@ -13,12 +14,13 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
 use mail_core::send::SendOutcome;
-use mail_core::{Account, Envelope, Message, Store};
+use mail_core::{Account, AttachmentFile, Envelope, Message, Store};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use app::{App, BodyState, ComposeField, ComposeState, ListState};
+use attach::AttachmentEntry;
 use editable::{TextArea, TextInput};
 
 /// Everything a background task needs to talk to IMAP and the local
@@ -169,12 +171,14 @@ async fn run(
                             .unwrap_or(0);
                     }
                     Some(BgMsg::SyncDone(Err(e))) => {
+                        tracing::error!("sync failed: {e}");
                         app.list_state = ListState::Error(e);
                     }
                     Some(BgMsg::Body(uid, Ok(message))) if app.selected_uid() == Some(uid) => {
                         app.body = BodyState::Loaded(message);
                     }
                     Some(BgMsg::Body(uid, Err(e))) if app.selected_uid() == Some(uid) => {
+                        tracing::error!("fetching body for uid {uid} failed: {e}");
                         app.body = BodyState::Error(e);
                     }
                     Some(BgMsg::Body(..)) => {}
@@ -186,6 +190,7 @@ async fn run(
                         });
                     }
                     Some(BgMsg::SendDone(Err(e))) => {
+                        tracing::error!("send failed: {e}");
                         if let Some(compose) = &mut app.compose {
                             compose.sending = false;
                             compose.error = Some(e);
@@ -205,10 +210,23 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx: &Ctx, 
         return;
     }
 
+    if app.search_editing {
+        handle_search_key(app, code);
+        return;
+    }
+
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('j') | KeyCode::Down => app.select_next(),
-        KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc => {
+            if app.search.is_some() {
+                app.clear_search();
+            } else {
+                app.should_quit = true;
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('n') => app.select_next(),
+        KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('N') => app.select_prev(),
+        KeyCode::Char('/') => app.start_search(),
         KeyCode::Char('S') => {
             app.list_state = ListState::Loading;
             spawn_sync(ctx.clone(), tx);
@@ -234,17 +252,61 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx: &Ctx, 
     }
 }
 
+fn handle_search_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => app.clear_search(),
+        KeyCode::Enter => app.search_editing = false,
+        KeyCode::Char(c) => {
+            if let Some(search) = &mut app.search {
+                search.insert(c);
+            }
+            app.selected = 0;
+        }
+        KeyCode::Backspace => {
+            if let Some(search) = &mut app.search {
+                search.backspace();
+            }
+            app.selected = 0;
+        }
+        KeyCode::Left => {
+            if let Some(search) = &mut app.search {
+                search.left();
+            }
+        }
+        KeyCode::Right => {
+            if let Some(search) = &mut app.search {
+                search.right();
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx: &Ctx, tx: mpsc::Sender<BgMsg>) {
     let Some(compose) = &mut app.compose else { return };
     if compose.sending {
         return;
     }
 
-    if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('s') | KeyCode::Char('S')) {
-        compose.sending = true;
-        compose.error = None;
-        let draft = compose.to_draft();
-        spawn_send(ctx.clone(), draft, tx);
+    if compose.attach_prompt.is_some() {
+        handle_attach_prompt_key(compose, code);
+        return;
+    }
+
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        match code {
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                compose.sending = true;
+                compose.error = None;
+                let draft = compose.to_draft();
+                let attachments = compose.attachments.clone();
+                spawn_send(ctx.clone(), draft, attachments, tx);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                compose.attach_prompt = Some((TextInput::default(), None));
+            }
+            _ => {} // swallow unrecognized ctrl-chords rather than typing them literally
+        }
         return;
     }
 
@@ -253,19 +315,30 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx
         KeyCode::Tab => compose.next_field(),
         KeyCode::BackTab => compose.prev_field(),
         KeyCode::Char(c) => edit_field(compose, |f| f.insert(c), |a| a.insert(c)),
-        KeyCode::Backspace => edit_field(compose, TextInput::backspace, TextArea::backspace),
+        KeyCode::Backspace => {
+            if compose.focus == ComposeField::Attachments {
+                compose.remove_selected_attachment();
+            } else {
+                edit_field(compose, TextInput::backspace, TextArea::backspace);
+            }
+        }
         KeyCode::Left => edit_field(compose, TextInput::left, TextArea::left),
         KeyCode::Right => edit_field(compose, TextInput::right, TextArea::right),
-        KeyCode::Up => {
-            if let ComposeField::Body = compose.focus {
-                compose.body.up();
+        KeyCode::Up => match compose.focus {
+            ComposeField::Body => compose.body.up(),
+            ComposeField::Attachments => {
+                compose.attachment_selected = compose.attachment_selected.saturating_sub(1);
             }
-        }
-        KeyCode::Down => {
-            if let ComposeField::Body = compose.focus {
-                compose.body.down();
+            _ => {}
+        },
+        KeyCode::Down => match compose.focus {
+            ComposeField::Body => compose.body.down(),
+            ComposeField::Attachments if !compose.attachments.is_empty() => {
+                compose.attachment_selected =
+                    (compose.attachment_selected + 1).min(compose.attachments.len() - 1);
             }
-        }
+            _ => {}
+        },
         KeyCode::Enter => match compose.focus {
             ComposeField::Body => compose.body.newline(),
             _ => compose.next_field(),
@@ -274,9 +347,65 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx
     }
 }
 
+fn handle_attach_prompt_key(compose: &mut ComposeState, code: KeyCode) {
+    match code {
+        KeyCode::Esc => compose.attach_prompt = None,
+        KeyCode::Enter => {
+            let path = compose
+                .attach_prompt
+                .as_ref()
+                .map(|(i, _)| i.value.clone())
+                .unwrap_or_default();
+            match attach::validate(&path) {
+                Ok(entry) => {
+                    compose.attachments.push(entry);
+                    compose.attachment_selected = compose.attachments.len() - 1;
+                    compose.attach_prompt = None;
+                }
+                Err(e) => {
+                    if let Some((_, error)) = &mut compose.attach_prompt {
+                        *error = Some(e);
+                    }
+                }
+            }
+        }
+        KeyCode::Tab => {
+            let current = compose.attach_prompt.as_ref().map(|(i, _)| i.value.clone());
+            if let Some(completed) = current.and_then(|c| attach::complete(&c)) {
+                if let Some((input, _)) = &mut compose.attach_prompt {
+                    *input = TextInput::with_value(completed);
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some((input, error)) = &mut compose.attach_prompt {
+                input.insert(c);
+                *error = None;
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some((input, error)) = &mut compose.attach_prompt {
+                input.backspace();
+                *error = None;
+            }
+        }
+        KeyCode::Left => {
+            if let Some((input, _)) = &mut compose.attach_prompt {
+                input.left();
+            }
+        }
+        KeyCode::Right => {
+            if let Some((input, _)) = &mut compose.attach_prompt {
+                input.right();
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Dispatches an edit to whichever field is focused — the single-line
 /// fields share one `TextInput` op, the body uses the matching `TextArea`
-/// op.
+/// op. Attachments has no text of its own (handled separately above).
 fn edit_field(
     compose: &mut ComposeState,
     input_op: impl Fn(&mut TextInput),
@@ -287,6 +416,7 @@ fn edit_field(
         ComposeField::Cc => input_op(&mut compose.cc),
         ComposeField::Bcc => input_op(&mut compose.bcc),
         ComposeField::Subject => input_op(&mut compose.subject),
+        ComposeField::Attachments => {}
         ComposeField::Body => area_op(&mut compose.body),
     }
 }
@@ -321,13 +451,29 @@ fn spawn_fetch_body(ctx: Ctx, uid: u32, tx: mpsc::Sender<BgMsg>) {
     });
 }
 
-fn spawn_send(ctx: Ctx, draft: mail_core::Draft, tx: mpsc::Sender<BgMsg>) {
+fn spawn_send(ctx: Ctx, draft: mail_core::Draft, attachments: Vec<AttachmentEntry>, tx: mpsc::Sender<BgMsg>) {
     tokio::spawn(async move {
-        let result = mail_core::send::send_message(&ctx.account, &ctx.store, ctx.account_id, &draft)
+        let result = send_with_attachments(&ctx, &draft, &attachments)
             .await
             .map_err(|e| e.to_string());
         let _ = tx.send(BgMsg::SendDone(result)).await;
     });
+}
+
+async fn send_with_attachments(
+    ctx: &Ctx,
+    draft: &mail_core::Draft,
+    attachments: &[AttachmentEntry],
+) -> mail_core::Result<SendOutcome> {
+    let mut files = Vec::with_capacity(attachments.len());
+    for a in attachments {
+        let bytes = tokio::fs::read(&a.path).await?;
+        files.push(AttachmentFile {
+            filename: a.filename.clone(),
+            bytes,
+        });
+    }
+    mail_core::send::send_message(&ctx.account, &ctx.store, ctx.account_id, draft, &files).await
 }
 
 fn spawn_flush_outbox(ctx: Ctx) {

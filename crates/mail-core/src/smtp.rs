@@ -1,4 +1,5 @@
-use lettre::message::Mailbox;
+use lettre::message::header::ContentType;
+use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message as LettreMessage, Tokio1Executor};
 
@@ -16,6 +17,15 @@ pub struct Draft {
     pub body: String,
 }
 
+/// A file to attach, already read into memory — the compose view resolves
+/// the path and reads the bytes right before sending, so this stays a
+/// dumb value type with no I/O of its own.
+#[derive(Debug, Clone)]
+pub struct AttachmentFile {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
 /// A built, ready-to-send message plus the raw bytes and envelope
 /// recipient list. Kept separate from `formatted()`'s output because the
 /// `Bcc` header is intentionally stripped from what's transmitted/cached,
@@ -27,7 +37,7 @@ pub struct BuiltMessage {
     message: LettreMessage,
 }
 
-pub fn build(account: &Account, draft: &Draft) -> Result<BuiltMessage> {
+pub fn build(account: &Account, draft: &Draft, attachments: &[AttachmentFile]) -> Result<BuiltMessage> {
     let from: Mailbox = account
         .config
         .email
@@ -55,9 +65,25 @@ pub fn build(account: &Account, draft: &Draft) -> Result<BuiltMessage> {
         return Err(Error::Config("message has no recipients".into()));
     }
 
-    let message = builder
-        .body(draft.body.clone())
-        .map_err(|e| Error::Config(format!("failed to build message: {e}")))?;
+    let message = if attachments.is_empty() {
+        builder
+            .body(draft.body.clone())
+            .map_err(|e| Error::Config(format!("failed to build message: {e}")))?
+    } else {
+        let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(draft.body.clone()));
+        for att in attachments {
+            let content_type = ContentType::parse(
+                mime_guess::from_path(&att.filename)
+                    .first_or_octet_stream()
+                    .as_ref(),
+            )
+            .map_err(|e| Error::Config(format!("invalid attachment content type: {e}")))?;
+            multipart = multipart.singlepart(Attachment::new(att.filename.clone()).body(att.bytes.clone(), content_type));
+        }
+        builder
+            .multipart(multipart)
+            .map_err(|e| Error::Config(format!("failed to build message: {e}")))?
+    };
 
     let raw = message.formatted();
     let recipients = message

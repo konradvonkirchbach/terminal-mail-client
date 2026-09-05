@@ -11,6 +11,7 @@ futures = "0.3.34"
 keyring = "4.2.0"
 lettre = { version = "0.11.23", default-features = false, features = ["tokio1-rustls-tls", "builder", "smtp-transport"] }
 mail-parser = "0.11.8"
+mime_guess = "2.0.5"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustls = "0.23.43"
 rustls-native-certs = "0.8.4"

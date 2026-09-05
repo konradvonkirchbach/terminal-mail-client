@@ -1,6 +1,7 @@
 mod compose;
 mod message_list;
 mod reading_pane;
+mod search_bar;
 mod sidebar;
 mod statusline;
 
@@ -19,9 +20,14 @@ pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
         return;
     }
 
+    let search_bar_height = if app.search.is_some() { 1 } else { 0 };
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(search_bar_height),
+            Constraint::Length(1),
+        ])
         .split(frame.area());
 
     let columns = Layout::default()
@@ -36,5 +42,8 @@ pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
     sidebar::draw(frame, columns[0], app, theme);
     message_list::draw(frame, columns[1], app, theme);
     reading_pane::draw(frame, columns[2], app, theme);
-    statusline::draw(frame, root[1], app, theme);
+    if let Some(search) = &app.search {
+        search_bar::draw(frame, root[1], search, app.search_editing, theme);
+    }
+    statusline::draw(frame, root[2], app, theme);
 }

@@ -14,7 +14,7 @@ pub mod types;
 
 pub use account::Account;
 pub use error::{Error, Result};
-pub use smtp::Draft;
+pub use smtp::{AttachmentFile, Draft};
 pub use store::Store;
 pub use types::{Envelope, Flag, Message};
 

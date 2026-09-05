@@ -6,7 +6,7 @@ use crate::account::Account;
 use crate::config;
 use crate::error::Result;
 use crate::imap::client as imap_client;
-use crate::smtp::{self, Draft};
+use crate::smtp::{self, AttachmentFile, Draft};
 use crate::store::Store;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -20,8 +20,9 @@ pub async fn send_message(
     store: &Store,
     account_id: i64,
     draft: &Draft,
+    attachments: &[AttachmentFile],
 ) -> Result<SendOutcome> {
-    let built = smtp::build(account, draft)?;
+    let built = smtp::build(account, draft, attachments)?;
     let raw = built.raw.clone();
     let recipients = built.recipients.clone();
 

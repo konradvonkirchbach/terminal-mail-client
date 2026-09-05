@@ -1,17 +1,21 @@
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState};
+use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, ListState as AppListState};
 use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let visible = app.visible_indices();
     let title = match &app.list_state {
-        AppListState::Loading => " inbox (loading...) ",
-        AppListState::Loaded => " inbox ",
-        AppListState::Error(_) => " inbox (error) ",
+        AppListState::Loading => " inbox (loading...) ".to_string(),
+        AppListState::Loaded if app.search.is_some() => {
+            format!(" inbox ({}/{} match) ", visible.len(), app.envelopes.len())
+        }
+        AppListState::Loaded => " inbox ".to_string(),
+        AppListState::Error(_) => " inbox (error) ".to_string(),
     };
 
     let block = Block::new()
@@ -22,17 +26,19 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .title(Span::styled(title, Style::new().fg(theme.bright_foreground)));
 
     if let AppListState::Error(msg) = &app.list_state {
-        let items = vec![ListItem::new(Line::from(Span::styled(
-            msg.clone(),
-            Style::new().fg(theme.red),
-        )))];
-        frame.render_widget(List::new(items).block(block), area);
+        // A List doesn't wrap long items — it just clips them at the pane
+        // edge, which for a real IMAP error (often a whole server response
+        // line) hides the one detail that explains what went wrong. Use a
+        // wrapping Paragraph instead so the full message is always visible.
+        let text = Line::from(Span::styled(msg.clone(), Style::new().fg(theme.red)));
+        let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .envelopes
+    let items: Vec<ListItem> = visible
         .iter()
+        .filter_map(|&i| app.envelopes.get(i))
         .map(|env| {
             let flag = if env.flags.seen { " " } else { "*" };
             let from = env
@@ -62,7 +68,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .collect();
 
     let mut state = ListState::default();
-    if !app.envelopes.is_empty() {
+    if !visible.is_empty() {
         state.select(Some(app.selected));
     }
 
