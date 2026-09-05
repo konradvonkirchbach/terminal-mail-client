@@ -1,11 +1,14 @@
+use std::collections::HashSet;
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{ComposeField, ComposeState};
 use crate::attach;
+use crate::spellcheck::normalize_word;
 use crate::theme::Theme;
 
 const LABEL_WIDTH: usize = 9; // fits "Subject:" (8) plus a trailing space
@@ -184,12 +187,13 @@ fn draw_body(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Them
     let visible_height = inner.height.max(1);
     let scroll_y = (compose.body.cursor_row as u16).saturating_sub(visible_height - 1);
 
+    let flagged_style = Style::new().fg(theme.red).add_modifier(Modifier::UNDERLINED);
     let text = Text::from(
         compose
             .body
             .lines
             .iter()
-            .map(|l| Line::from(l.clone()))
+            .map(|l| spellcheck_line(l, &compose.misspelled, flagged_style))
             .collect::<Vec<_>>(),
     );
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false }).scroll((scroll_y, 0));
@@ -221,4 +225,124 @@ fn draw_help(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Them
         Line::from(Span::styled(hint, Style::new().fg(theme.muted)))
     };
     frame.render_widget(Paragraph::new(text).style(Style::new().bg(theme.background)), area);
+}
+
+/// Splits `line` into whitespace-delimited tokens, each paired with its
+/// byte offset into `line` — the unit spellcheck highlighting matches
+/// and underlines against. Trailing punctuation stays attached to the
+/// token (e.g. `"wrold."`); `spellcheck::normalize_word` strips it
+/// before comparing against the misspelled-word set.
+fn tokens(line: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut idx = 0;
+    line.split_inclusive(char::is_whitespace).filter_map(move |piece| {
+        let start = idx;
+        idx += piece.len();
+        let trimmed = piece.trim_end();
+        (!trimmed.is_empty()).then_some((start, trimmed))
+    })
+}
+
+/// Renders one body line, underlining whichever whitespace-delimited
+/// tokens match a misspelled word. Falls back to a single unstyled span
+/// (inheriting the block's own colors) when nothing in the line is
+/// flagged, which is the common case and keeps rendering cheap.
+fn spellcheck_line(line: &str, misspelled: &HashSet<String>, flagged: Style) -> Line<'static> {
+    if misspelled.is_empty() {
+        return Line::raw(line.to_string());
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut last_end = 0;
+    for (start, token) in tokens(line) {
+        if misspelled.contains(&normalize_word(token)) {
+            if start > last_end {
+                spans.push(Span::raw(line[last_end..start].to_string()));
+            }
+            spans.push(Span::styled(token.to_string(), flagged));
+            last_end = start + token.len();
+        }
+    }
+
+    if spans.is_empty() {
+        return Line::raw(line.to_string());
+    }
+    if last_end < line.len() {
+        spans.push(Span::raw(line[last_end..].to_string()));
+    }
+    Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_splits_on_whitespace_and_reports_correct_byte_offsets() {
+        let found: Vec<(usize, &str)> = tokens("hello  world").collect();
+        assert_eq!(found, vec![(0, "hello"), (7, "world")]);
+    }
+
+    #[test]
+    fn tokens_keeps_trailing_punctuation_attached() {
+        let found: Vec<(usize, &str)> = tokens("wrold. next").collect();
+        assert_eq!(found, vec![(0, "wrold."), (7, "next")]);
+    }
+
+    #[test]
+    fn tokens_handles_leading_and_trailing_whitespace_and_multibyte_text() {
+        // "Häuser" — multibyte UTF-8 (each ä/ü is 2 bytes) — the offsets
+        // must land on char boundaries or slicing later would panic.
+        let found: Vec<(usize, &str)> = tokens("  Häuser über").collect();
+        assert_eq!(found, vec![(2, "Häuser"), (10, "über")]);
+    }
+
+    #[test]
+    fn spellcheck_line_leaves_a_clean_line_as_one_unstyled_span() {
+        let line = spellcheck_line("all good here", &HashSet::new(), Style::new());
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].content.as_ref(), "all good here");
+    }
+
+    #[test]
+    fn spellcheck_line_underlines_only_the_misspelled_token() {
+        let misspelled: HashSet<String> = ["wrold".to_string()].into_iter().collect();
+        let flagged = Style::new().add_modifier(Modifier::UNDERLINED);
+        let line = spellcheck_line("hello wrold today", &misspelled, flagged);
+
+        let flagged_spans: Vec<&str> = line
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(flagged_spans, vec!["wrold"]);
+    }
+
+    #[test]
+    fn spellcheck_line_matches_a_token_despite_trailing_punctuation() {
+        let misspelled: HashSet<String> = ["wrold".to_string()].into_iter().collect();
+        let line = spellcheck_line("hello wrold.", &misspelled, Style::new().add_modifier(Modifier::UNDERLINED));
+
+        let flagged_spans: Vec<&str> = line
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(flagged_spans, vec!["wrold."], "the whole token (punctuation included) is styled, only the lookup key is stripped");
+    }
+
+    #[test]
+    fn spellcheck_line_reconstructs_the_exact_original_line() {
+        // Regression guard for the byte-offset splicing: whatever spans
+        // come out, concatenating their content must reproduce the input
+        // exactly — including with multibyte characters, where an
+        // off-by-one would panic rather than just mismatch.
+        let misspelled: HashSet<String> = ["wrold".to_string(), "häuser".to_string()].into_iter().collect();
+        for line in ["hello wrold today", "  wrold  ", "Häuser sind schön wrold.", "no matches at all"] {
+            let rendered = spellcheck_line(line, &misspelled, Style::new());
+            let reconstructed: String = rendered.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(reconstructed, line);
+        }
+    }
 }

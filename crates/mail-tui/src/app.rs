@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use mail_core::{Address, Draft, Envelope, Message};
@@ -67,6 +68,11 @@ pub struct ComposeState {
     /// empty hides the dropdown. Recomputed by `refresh_suggestions`.
     pub suggestions: Vec<Address>,
     pub suggestion_selected: usize,
+    /// Lowercased words the spellchecker flagged anywhere in the body,
+    /// refreshed asynchronously after each edit — checked against on
+    /// render to underline them. Always empty when spellcheck is
+    /// disabled (no matching dictionary found for this session).
+    pub misspelled: HashSet<String>,
 }
 
 impl ComposeState {
@@ -84,6 +90,7 @@ impl ComposeState {
             error: None,
             suggestions: Vec::new(),
             suggestion_selected: 0,
+            misspelled: HashSet::new(),
         }
     }
 

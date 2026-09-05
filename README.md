@@ -22,6 +22,10 @@ notifications for new mail.
   directory browser, not blind path typing), a 20MB size cap
 - **Recipient autocomplete** — fuzzy-find To/Cc/Bcc against everyone you've
   ever received mail from (automated no-reply senders excluded)
+- **Spellcheck** — underlines misspelled words in the compose body, checked
+  against every Hunspell dictionary installed on your system at once (so it
+  works across languages with no configuration); off automatically if none
+  is installed
 - **Attachment downloads** — same directory browser, in reverse
 - **Search** — live filter the inbox by sender or subject; if nothing
   matches locally, hitting `Enter` falls back to a server-side search so you
@@ -71,6 +75,20 @@ o.bind("SUPER + M", "Mail", { tui = "mailc", focus = true })
 
 (Pick a different key if `SUPER + M` is already bound to something on your
 system — check with `omarchy menu keybindings --print`.)
+
+### Spellcheck (optional)
+
+Compose's spellcheck shells out to the system `hunspell` binary, so it needs
+that plus a dictionary for whichever language(s) you write in:
+
+```sh
+sudo pacman -S hunspell hunspell-en_us   # or hunspell-de, hunspell-es_es, ...
+```
+
+Every dictionary you have installed is checked against at once — install
+more than one and compose flags misspellings correctly in each language,
+no configuration needed. If neither is installed, spellcheck just stays off
+(you'll see a one-time status message saying so at launch).
 
 ## Getting started
 

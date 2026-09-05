@@ -5,6 +5,7 @@ mod editable;
 mod filebrowser;
 mod fuzzy;
 mod setup;
+mod spellcheck;
 mod theme;
 mod ui;
 
@@ -91,6 +92,11 @@ enum BgMsg {
     /// compose's recipient autocomplete. A failure is silently dropped —
     /// suggestions are a nice-to-have, not worth a status-bar error.
     KnownSenders { account_id: i64, result: Result<Vec<Address>, String> },
+    /// A spellcheck pass over the compose body finished — carries every
+    /// misspelled word found (lowercased), replacing whatever was
+    /// flagged before. Not tagged to a particular compose session: if
+    /// compose has since closed, this is simply dropped.
+    SpellCheckDone(std::collections::HashSet<String>),
 }
 
 fn init_tracing() -> anyhow::Result<()> {
@@ -213,6 +219,19 @@ async fn run(
 
     spawn_known_senders(accounts.current().clone(), tx.clone());
 
+    // Compose's spellcheck rides on whatever Hunspell dictionary matches
+    // the system's language — entirely optional, so a missing binary or
+    // dictionary just leaves it off for the session instead of failing
+    // startup.
+    let spellcheck_handle = spawn_spellchecker(tx.clone()).await;
+    if spellcheck_handle.is_none() {
+        let lang = spellcheck::detect_locale();
+        let lang_prefix = lang.split('_').next().unwrap_or(&lang);
+        app.set_status(format!(
+            "Spellcheck unavailable — install hunspell and a matching dictionary (e.g. hunspell-{lang_prefix}) to enable it."
+        ));
+    }
+
     // Every account gets synced (and its outbox flushed) concurrently at
     // startup, not just whichever is currently shown — so switching to
     // one later is likely to already have fresh data waiting in the
@@ -261,7 +280,7 @@ async fn run(
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        handle_key(&mut app, key.code, key.modifiers, &mut accounts, tx.clone());
+                        handle_key(&mut app, key.code, key.modifiers, &mut accounts, tx.clone(), &spellcheck_handle);
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
@@ -370,6 +389,11 @@ async fn run(
                         app.known_senders = senders;
                     }
                     Some(BgMsg::KnownSenders { .. }) => {}
+                    Some(BgMsg::SpellCheckDone(words)) => {
+                        if let Some(compose) = &mut app.compose {
+                            compose.misspelled = words;
+                        }
+                    }
                     Some(BgMsg::RemoteSearchDone { account_id, query, result }) => {
                         let still_relevant = account_id == accounts.current().account_id
                             && app.search.as_ref().is_some_and(|s| s.value.trim() == query);
@@ -429,14 +453,21 @@ async fn run(
     }
 }
 
-fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, accounts: &mut Accounts, tx: mpsc::Sender<BgMsg>) {
+fn handle_key(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    accounts: &mut Accounts,
+    tx: mpsc::Sender<BgMsg>,
+    spellcheck_handle: &Option<spellcheck::SpellCheckHandle>,
+) {
     if app.file_browser.is_some() {
         handle_browser_key(app, code);
         return;
     }
 
     if app.compose.is_some() {
-        handle_compose_key(app, code, modifiers, accounts.current(), tx);
+        handle_compose_key(app, code, modifiers, accounts.current(), tx, spellcheck_handle);
         return;
     }
 
@@ -660,7 +691,14 @@ fn handle_search_key(app: &mut App, code: KeyCode, accounts: &Accounts, tx: mpsc
     }
 }
 
-fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx: &AccountCtx, tx: mpsc::Sender<BgMsg>) {
+fn handle_compose_key(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    ctx: &AccountCtx,
+    tx: mpsc::Sender<BgMsg>,
+    spellcheck_handle: &Option<spellcheck::SpellCheckHandle>,
+) {
     let Some(compose) = &mut app.compose else { return };
     if compose.sending {
         return;
@@ -755,6 +793,17 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx
     }
 
     compose.refresh_suggestions(&app.known_senders);
+
+    // Only the keys that actually change the body's text are worth a
+    // recheck — Left/Right/Up/Down and edits to other fields would just
+    // ask Hunspell to re-scan identical text.
+    let body_mutated = compose.focus == ComposeField::Body
+        && matches!(code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Enter);
+    if body_mutated {
+        if let Some(handle) = spellcheck_handle {
+            handle.request(compose.body.text());
+        }
+    }
 }
 
 /// Dispatches an edit to whichever field is focused — the single-line
@@ -980,6 +1029,40 @@ fn spawn_known_senders(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
         let result = ctx.store.known_senders(ctx.account_id).await.map_err(|e| e.to_string());
         let _ = tx.send(BgMsg::KnownSenders { account_id: ctx.account_id, result }).await;
     });
+}
+
+/// Spawns the Hunspell process for the detected system locale (if a
+/// matching dictionary is installed) along with the task that feeds it
+/// text and reports results back over `tx`. Returns `None` — spellcheck
+/// simply stays off for the session — when there's no `hunspell` binary
+/// or no dictionary for the detected language; see `spellcheck.rs`.
+async fn spawn_spellchecker(tx: mpsc::Sender<BgMsg>) -> Option<spellcheck::SpellCheckHandle> {
+    let dicts = spellcheck::find_dictionaries(&spellcheck::default_search_dirs());
+    if dicts.is_empty() {
+        return None;
+    }
+    let mut checker = spellcheck::SpellChecker::spawn(&dicts).await.ok()?;
+
+    let (request_tx, mut request_rx) = tokio::sync::watch::channel(String::new());
+    tokio::spawn(async move {
+        loop {
+            if request_rx.changed().await.is_err() {
+                return; // every SpellCheckHandle was dropped
+            }
+            let text = request_rx.borrow_and_update().clone();
+            match spellcheck::check_text(&mut checker, &text).await {
+                Ok(words) => {
+                    let _ = tx.send(BgMsg::SpellCheckDone(words)).await;
+                }
+                Err(e) => {
+                    tracing::warn!("spellcheck failed, disabling for the rest of the session: {e}");
+                    return;
+                }
+            }
+        }
+    });
+
+    Some(spellcheck::SpellCheckHandle::new(request_tx))
 }
 
 fn spawn_delete_message(ctx: AccountCtx, uid: u32, tx: mpsc::Sender<BgMsg>) {
