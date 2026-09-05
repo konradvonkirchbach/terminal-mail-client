@@ -142,7 +142,11 @@ impl ComposeState {
 }
 
 pub struct App {
-    pub account_email: String,
+    /// Every configured account's email, in the fixed order they were
+    /// loaded at startup — index-matched with the `Accounts` list main.rs
+    /// owns. Doesn't change after startup; only `current_account` does.
+    pub account_emails: Vec<String>,
+    pub current_account: usize,
     pub list_state: ListState,
     pub envelopes: Vec<Envelope>,
     pub selected: usize,
@@ -164,9 +168,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(account_email: String) -> Self {
+    pub fn new(account_emails: Vec<String>) -> Self {
         Self {
-            account_email,
+            account_emails,
+            current_account: 0,
             list_state: ListState::Loading,
             envelopes: Vec::new(),
             selected: 0,
@@ -183,6 +188,22 @@ impl App {
 
     pub fn set_status(&mut self, message: impl Into<String>) {
         self.status_message = Some((message.into(), Instant::now()));
+    }
+
+    pub fn current_account_email(&self) -> &str {
+        &self.account_emails[self.current_account]
+    }
+
+    /// Resets everything that's specific to whichever account was
+    /// previously active — called right after `current_account` changes,
+    /// before the new account's cached envelopes are loaded in.
+    pub fn reset_for_account_switch(&mut self) {
+        self.envelopes.clear();
+        self.selected = 0;
+        self.selected_attachment = 0;
+        self.body = BodyState::Empty;
+        self.list_state = ListState::Loading;
+        self.clear_search();
     }
 
     /// Clears the status message once its TTL has elapsed; called from

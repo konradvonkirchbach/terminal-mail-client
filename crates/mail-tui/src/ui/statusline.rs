@@ -9,10 +9,14 @@ use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let count = app.envelopes.len();
-    let hints = "j/k move  / find  Enter read  a download  c compose  r reply  S sync  q quit";
+    let hints = if app.account_emails.len() > 1 {
+        "j/k move  / find  Enter read  a download  c compose  r reply  S sync  Tab switch  q quit"
+    } else {
+        "j/k move  / find  Enter read  a download  c compose  r reply  S sync  q quit"
+    };
     let mut spans = vec![
         Span::styled(
-            format!(" {} ", app.account_email),
+            format!(" {} ", app.current_account_email()),
             Style::new().bg(theme.accent).fg(theme.background),
         ),
         Span::raw(format!(" {count} messages  ")),

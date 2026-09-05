@@ -27,9 +27,10 @@ use editable::{TextArea, TextInput};
 use filebrowser::FileBrowser;
 
 /// Everything a background task needs to talk to IMAP and the local
-/// cache. Cheap to clone — `Account`/`Store` are just handles.
+/// cache for one account. Cheap to clone — `Account`/`Store` are just
+/// handles.
 #[derive(Clone)]
-struct Ctx {
+struct AccountCtx {
     account: Account,
     store: Store,
     account_id: i64,
@@ -37,11 +38,35 @@ struct Ctx {
     fetch_limit: u32,
 }
 
+/// Every configured account plus which one is currently shown. Lives only
+/// in `run()`'s stack frame — background tasks get a cloned `AccountCtx`
+/// for one specific account, never this whole collection.
+struct Accounts {
+    list: Vec<AccountCtx>,
+    current: usize,
+}
+
+impl Accounts {
+    fn current(&self) -> &AccountCtx {
+        &self.list[self.current]
+    }
+}
+
 enum BgMsg {
-    /// A sync finished (or failed) — carries the freshly re-read cached
-    /// envelope list so the UI never has to reason about deltas itself.
-    SyncDone(Result<Vec<Envelope>, String>),
-    Body(u32, Result<Message, String>),
+    /// A sync finished (or failed) for some account — carries the
+    /// freshly re-read cached envelope list so the UI never has to
+    /// reason about deltas itself. Applied only if that account is still
+    /// the one being viewed when it arrives.
+    SyncDone { account_id: i64, result: Result<Vec<Envelope>, String> },
+    /// The cached envelope list for an account just switched into —
+    /// distinct from `SyncDone` since this is a plain cache read, not a
+    /// network sync (that's kicked off separately, see `switch_account`).
+    AccountEnvelopes { account_id: i64, result: Result<Vec<Envelope>, String> },
+    Body { account_id: i64, uid: u32, result: Result<Message, String> },
+    /// Unlike the other variants, sending isn't tagged by account: the
+    /// compose view captures its own `AccountCtx` at send time and blocks
+    /// all other key handling (including account switching) until it
+    /// resolves, so there's no other account it could apply to.
     SendDone(Result<SendOutcome, String>),
 }
 
@@ -59,12 +84,12 @@ fn init_tracing() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_or_setup_account() -> anyhow::Result<Account> {
+fn load_or_setup_accounts() -> anyhow::Result<Vec<Account>> {
     let config = mail_core::config::Config::load()?;
-    if let Some(account_config) = config.accounts.into_iter().next() {
-        return Ok(Account::new(account_config));
+    if config.accounts.is_empty() {
+        return Ok(vec![setup::run()?]);
     }
-    setup::run()
+    Ok(config.accounts.into_iter().map(Account::new).collect())
 }
 
 fn default_browse_dir() -> PathBuf {
@@ -84,16 +109,19 @@ async fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--set-password") {
         return setup::set_password();
     }
+    if std::env::args().any(|a| a == "--add-account") {
+        return setup::add_account();
+    }
 
     init_tracing()?;
-    let account = load_or_setup_account()?;
+    let accounts = load_or_setup_accounts()?;
 
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, account).await;
+    let result = run(&mut terminal, accounts).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -104,37 +132,37 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    account: Account,
+    accounts: Vec<Account>,
 ) -> anyhow::Result<()> {
     let config = mail_core::config::Config::load()?;
     let theme = theme::resolve(&config.theme.mode);
 
     let store = Store::open(&mail_core::config::db_path()?)?;
-    let account_id = store
-        .upsert_account(
-            account.config.email.clone(),
-            account.config.display_name.clone(),
-        )
-        .await?;
-    let folder = store
-        .get_or_create_folder(account_id, "INBOX".to_string())
-        .await?;
 
-    let fetch_limit = account.config.fetch_limit;
-    let ctx = Ctx {
-        account,
-        store,
-        account_id,
-        folder_id: folder.id,
-        fetch_limit,
-    };
+    let mut list = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        let account_id = store
+            .upsert_account(account.config.email.clone(), account.config.display_name.clone())
+            .await?;
+        let folder = store.get_or_create_folder(account_id, "INBOX".to_string()).await?;
+        let fetch_limit = account.config.fetch_limit;
+        list.push(AccountCtx {
+            account,
+            store: store.clone(),
+            account_id,
+            folder_id: folder.id,
+            fetch_limit,
+        });
+    }
+    let mut accounts = Accounts { list, current: 0 };
 
-    let mut app = App::new(ctx.account.config.email.clone());
+    let mut app = App::new(accounts.list.iter().map(|a| a.account.config.email.clone()).collect());
 
     // Render instantly from whatever's cached, then reconcile with the
     // server in the background — this is what makes launch feel instant
     // even before the first sync of a session completes.
-    match ctx.store.list_envelopes(ctx.folder_id, ctx.fetch_limit).await {
+    let current = accounts.current();
+    match current.store.list_envelopes(current.folder_id, current.fetch_limit).await {
         Ok(envelopes) => {
             app.list_state = if envelopes.is_empty() {
                 ListState::Loading
@@ -148,8 +176,14 @@ async fn run(
 
     let (tx, mut rx) = mpsc::channel::<BgMsg>(8);
 
-    spawn_sync(ctx.clone(), tx.clone());
-    spawn_flush_outbox(ctx.clone());
+    // Every account gets synced (and its outbox flushed) concurrently at
+    // startup, not just whichever is currently shown — so switching to
+    // one later is likely to already have fresh data waiting in the
+    // cache instead of starting cold.
+    for account in &accounts.list {
+        spawn_sync(account.clone(), tx.clone());
+        spawn_flush_outbox(account.clone());
+    }
 
     let mut events = EventStream::new();
 
@@ -183,7 +217,7 @@ async fn run(
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        handle_key(&mut app, key.code, key.modifiers, &ctx, tx.clone());
+                        handle_key(&mut app, key.code, key.modifiers, &mut accounts, tx.clone());
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
@@ -194,29 +228,54 @@ async fn run(
             }
             msg = rx.recv() => {
                 match msg {
-                    Some(BgMsg::SyncDone(Ok(envelopes))) => {
-                        let selected_uid = app.selected_uid();
-                        app.envelopes = envelopes;
-                        app.list_state = ListState::Loaded;
-                        // Keep the cursor on the same message across a
-                        // resync instead of snapping back to the top.
-                        app.selected = selected_uid
-                            .and_then(|uid| app.envelopes.iter().position(|e| e.uid == uid))
-                            .unwrap_or(0);
+                    Some(BgMsg::SyncDone { account_id, result }) => {
+                        if account_id != accounts.current().account_id {
+                            // Synced quietly in the background; the cache
+                            // is updated either way, so switching to this
+                            // account later will pick it up fresh.
+                        } else {
+                            match result {
+                                Ok(envelopes) => {
+                                    let selected_uid = app.selected_uid();
+                                    app.envelopes = envelopes;
+                                    app.list_state = ListState::Loaded;
+                                    // Keep the cursor on the same message
+                                    // across a resync instead of snapping
+                                    // back to the top.
+                                    app.selected = selected_uid
+                                        .and_then(|uid| app.envelopes.iter().position(|e| e.uid == uid))
+                                        .unwrap_or(0);
+                                }
+                                Err(e) => {
+                                    tracing::error!("sync failed: {e}");
+                                    app.list_state = ListState::Error(e);
+                                }
+                            }
+                        }
                     }
-                    Some(BgMsg::SyncDone(Err(e))) => {
-                        tracing::error!("sync failed: {e}");
-                        app.list_state = ListState::Error(e);
+                    Some(BgMsg::AccountEnvelopes { account_id, result }) if account_id == accounts.current().account_id => {
+                        match result {
+                            Ok(envelopes) => {
+                                app.list_state = if envelopes.is_empty() { ListState::Loading } else { ListState::Loaded };
+                                app.envelopes = envelopes;
+                            }
+                            Err(e) => app.list_state = ListState::Error(e),
+                        }
                     }
-                    Some(BgMsg::Body(uid, Ok(message))) if app.selected_uid() == Some(uid) => {
+                    Some(BgMsg::AccountEnvelopes { .. }) => {}
+                    Some(BgMsg::Body { account_id, uid, result: Ok(message) })
+                        if account_id == accounts.current().account_id && app.selected_uid() == Some(uid) =>
+                    {
                         app.selected_attachment = 0;
                         app.body = BodyState::Loaded(message);
                     }
-                    Some(BgMsg::Body(uid, Err(e))) if app.selected_uid() == Some(uid) => {
+                    Some(BgMsg::Body { account_id, uid, result: Err(e) })
+                        if account_id == accounts.current().account_id && app.selected_uid() == Some(uid) =>
+                    {
                         tracing::error!("fetching body for uid {uid} failed: {e}");
                         app.body = BodyState::Error(e);
                     }
-                    Some(BgMsg::Body(..)) => {}
+                    Some(BgMsg::Body { .. }) => {}
                     Some(BgMsg::SendDone(Ok(outcome))) => {
                         app.compose = None;
                         app.set_status(match outcome {
@@ -239,14 +298,14 @@ async fn run(
     }
 }
 
-fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx: &Ctx, tx: mpsc::Sender<BgMsg>) {
+fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, accounts: &mut Accounts, tx: mpsc::Sender<BgMsg>) {
     if app.file_browser.is_some() {
         handle_browser_key(app, code);
         return;
     }
 
     if app.compose.is_some() {
-        handle_compose_key(app, code, modifiers, ctx, tx);
+        handle_compose_key(app, code, modifiers, accounts.current(), tx);
         return;
     }
 
@@ -269,7 +328,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx: &Ctx, 
         KeyCode::Char('/') => app.start_search(),
         KeyCode::Char('S') => {
             app.list_state = ListState::Loading;
-            spawn_sync(ctx.clone(), tx);
+            spawn_sync(accounts.current().clone(), tx);
         }
         KeyCode::Char('c') => {
             app.status_message = None;
@@ -285,7 +344,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx: &Ctx, 
         KeyCode::Enter => {
             if let Some(uid) = app.selected_uid() {
                 app.body = BodyState::Loading;
-                spawn_fetch_body(ctx.clone(), uid, tx);
+                spawn_fetch_body(accounts.current().clone(), uid, tx);
             }
         }
         KeyCode::Char('[') => {
@@ -303,8 +362,39 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx: &Ctx, 
             }
         }
         KeyCode::Char('a') => start_download(app),
+        KeyCode::Tab if accounts.list.len() > 1 => {
+            switch_account(app, accounts, (accounts.current + 1) % accounts.list.len(), tx);
+        }
+        KeyCode::BackTab if accounts.list.len() > 1 => {
+            switch_account(
+                app,
+                accounts,
+                (accounts.current + accounts.list.len() - 1) % accounts.list.len(),
+                tx,
+            );
+        }
+        KeyCode::Char(c @ '1'..='9') => {
+            let idx = c as usize - '1' as usize;
+            if idx < accounts.list.len() && idx != accounts.current {
+                switch_account(app, accounts, idx, tx);
+            }
+        }
         _ => {}
     }
+}
+
+/// Switches the active account: updates the index, resets whatever was
+/// specific to the previous one, and kicks off both a cache read (fast,
+/// for the "instant" feel) and a fresh sync (in case it's gone stale
+/// since the startup sync).
+fn switch_account(app: &mut App, accounts: &mut Accounts, index: usize, tx: mpsc::Sender<BgMsg>) {
+    accounts.current = index;
+    app.current_account = index;
+    app.reset_for_account_switch();
+
+    let ctx = accounts.current().clone();
+    spawn_account_envelopes(ctx.clone(), tx.clone());
+    spawn_sync(ctx, tx);
 }
 
 fn start_download(app: &mut App) {
@@ -348,7 +438,7 @@ fn handle_search_key(app: &mut App, code: KeyCode) {
     }
 }
 
-fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx: &Ctx, tx: mpsc::Sender<BgMsg>) {
+fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ctx: &AccountCtx, tx: mpsc::Sender<BgMsg>) {
     let Some(compose) = &mut app.compose else { return };
     if compose.sending {
         return;
@@ -556,7 +646,7 @@ fn confirm_save(app: &mut App) {
     }
 }
 
-fn spawn_sync(ctx: Ctx, tx: mpsc::Sender<BgMsg>) {
+fn spawn_sync(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
     tokio::spawn(async move {
         let sync_result = mail_core::sync::sync_inbox(&ctx.account, &ctx.store).await;
         let result = match sync_result {
@@ -567,11 +657,22 @@ fn spawn_sync(ctx: Ctx, tx: mpsc::Sender<BgMsg>) {
                 .map_err(|e| e.to_string()),
             Err(e) => Err(e.to_string()),
         };
-        let _ = tx.send(BgMsg::SyncDone(result)).await;
+        let _ = tx.send(BgMsg::SyncDone { account_id: ctx.account_id, result }).await;
     });
 }
 
-fn spawn_fetch_body(ctx: Ctx, uid: u32, tx: mpsc::Sender<BgMsg>) {
+fn spawn_account_envelopes(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
+    tokio::spawn(async move {
+        let result = ctx
+            .store
+            .list_envelopes(ctx.folder_id, ctx.fetch_limit)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx.send(BgMsg::AccountEnvelopes { account_id: ctx.account_id, result }).await;
+    });
+}
+
+fn spawn_fetch_body(ctx: AccountCtx, uid: u32, tx: mpsc::Sender<BgMsg>) {
     tokio::spawn(async move {
         let result = mail_core::sync::fetch_body(
             &ctx.account,
@@ -582,11 +683,11 @@ fn spawn_fetch_body(ctx: Ctx, uid: u32, tx: mpsc::Sender<BgMsg>) {
         )
         .await
         .map_err(|e| e.to_string());
-        let _ = tx.send(BgMsg::Body(uid, result)).await;
+        let _ = tx.send(BgMsg::Body { account_id: ctx.account_id, uid, result }).await;
     });
 }
 
-fn spawn_send(ctx: Ctx, draft: mail_core::Draft, attachments: Vec<AttachmentEntry>, tx: mpsc::Sender<BgMsg>) {
+fn spawn_send(ctx: AccountCtx, draft: mail_core::Draft, attachments: Vec<AttachmentEntry>, tx: mpsc::Sender<BgMsg>) {
     tokio::spawn(async move {
         let result = send_with_attachments(&ctx, &draft, &attachments)
             .await
@@ -596,7 +697,7 @@ fn spawn_send(ctx: Ctx, draft: mail_core::Draft, attachments: Vec<AttachmentEntr
 }
 
 async fn send_with_attachments(
-    ctx: &Ctx,
+    ctx: &AccountCtx,
     draft: &mail_core::Draft,
     attachments: &[AttachmentEntry],
 ) -> mail_core::Result<SendOutcome> {
@@ -611,7 +712,7 @@ async fn send_with_attachments(
     mail_core::send::send_message(&ctx.account, &ctx.store, ctx.account_id, draft, &files).await
 }
 
-fn spawn_flush_outbox(ctx: Ctx) {
+fn spawn_flush_outbox(ctx: AccountCtx) {
     tokio::spawn(async move {
         match mail_core::send::flush_outbox(&ctx.account, &ctx.store, ctx.account_id).await {
             Ok(n) if n > 0 => tracing::info!("flushed {n} queued message(s) from the outbox"),
