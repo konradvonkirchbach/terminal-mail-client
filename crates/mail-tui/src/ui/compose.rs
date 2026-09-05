@@ -108,6 +108,23 @@ fn draw_header(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Th
     }
 }
 
+/// Computes the rect for a floating list popup anchored with its
+/// top-left corner at `(x, y)`, wide enough for `max_content_chars` of
+/// text (clamped to `min_width..=max_width`) and tall enough for
+/// `item_count` items, both clamped to fit on screen — shared by
+/// `draw_suggestions` and `draw_misspelling_suggestions` so a future fix
+/// to this clamping only has to happen once. `None` when there isn't
+/// enough room left to draw anything useful.
+fn popup_rect(frame_area: Rect, x: u16, y: u16, max_content_chars: u16, min_width: u16, max_width: u16, item_count: usize) -> Option<Rect> {
+    let content_width = max_content_chars.clamp(min_width, max_width);
+    let width = (content_width + 2).min(frame_area.width.saturating_sub(x));
+    let height = (item_count as u16 + 2).min(frame_area.height.saturating_sub(y));
+    if width < 3 || height < 3 {
+        return None; // no room to draw it without corrupting the layout
+    }
+    Some(Rect { x, y, width, height })
+}
+
 /// A fuzzy-matched sender dropdown, floating just under whichever
 /// recipient field is focused. Deliberately drawn over the body rather
 /// than shrinking it — this is a transient overlay, not part of the
@@ -122,21 +139,10 @@ fn draw_suggestions(frame: &mut Frame, header_area: Rect, compose: &ComposeState
     let x = inner.x + LABEL_WIDTH as u16;
     let y = inner.y + row + 1;
 
-    let frame_area = frame.area();
-    let content_width = compose
-        .suggestions
-        .items
-        .iter()
-        .map(|a| a.to_string().chars().count() as u16)
-        .max()
-        .unwrap_or(10)
-        .clamp(10, 50);
-    let width = (content_width + 2).min(frame_area.width.saturating_sub(x));
-    let height = (compose.suggestions.items.len() as u16 + 2).min(frame_area.height.saturating_sub(y));
-    if width < 3 || height < 3 {
-        return; // no room to draw it without corrupting the layout
-    }
-    let popup = Rect { x, y, width, height };
+    let max_content_chars = compose.suggestions.items.iter().map(|a| a.to_string().chars().count() as u16).max().unwrap_or(10);
+    let Some(popup) = popup_rect(frame.area(), x, y, max_content_chars, 10, 50, compose.suggestions.items.len()) else {
+        return;
+    };
 
     let items: Vec<ListItem> = compose
         .suggestions
@@ -234,19 +240,10 @@ fn draw_misspelling_suggestions(
     let x = body_inner.x + (compose.body.cursor_col as u16).min(body_inner.width.saturating_sub(1));
     let y = body_inner.y + cursor_screen_row + 1;
 
-    let frame_area = frame.area();
-    let content_width = suggestions
-        .iter()
-        .map(|s| s.chars().count() as u16)
-        .max()
-        .unwrap_or(10)
-        .clamp(10, 40);
-    let width = (content_width + 2).min(frame_area.width.saturating_sub(x));
-    let height = (suggestions.len() as u16 + 2).min(frame_area.height.saturating_sub(y));
-    if width < 3 || height < 3 {
-        return; // no room to draw it without corrupting the layout
-    }
-    let popup = Rect { x, y, width, height };
+    let max_content_chars = suggestions.iter().map(|s| s.chars().count() as u16).max().unwrap_or(10);
+    let Some(popup) = popup_rect(frame.area(), x, y, max_content_chars, 10, 40, suggestions.len()) else {
+        return;
+    };
 
     let items: Vec<ListItem> = suggestions.iter().map(|s| ListItem::new(s.clone())).collect();
     let list = List::new(items).block(

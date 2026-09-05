@@ -1,13 +1,12 @@
 //! Compose's spellcheck: drives the system `hunspell` binary in its pipe
-//! (`-a`) mode, loaded with every dictionary installed on the system at
-//! once, to flag misspelled words in the message body. Checking against
-//! every installed dictionary together (rather than picking just one for
-//! the detected system locale) means someone who writes mail in more
-//! than one language gets accurate results in each of them, as long as
-//! they've installed a dictionary package per language — no extra
-//! configuration needed. `detect_locale` still runs at startup so the
-//! "nothing installed" status message can name the language to install
-//! a dictionary for.
+//! (`-a`) mode to flag misspelled words in the message body, loaded with
+//! the single dictionary matching whichever language is actually being
+//! typed — `find_dictionary_for_active_language` prefers the active
+//! Hyprland keyboard layout, falling back to the system locale
+//! (`detect_locale`) when that can't be read or mapped. Re-detected on
+//! every compose open (see `spawn_spellchecker_reload` in `main.rs`), so
+//! switching keyboard layout before writing a new email picks up the
+//! right dictionary without restarting the app.
 //!
 //! Shells out to the system binary rather than linking libhunspell
 //! directly (no `hunspell-sys`/`pkg-config` build dependency, unlike
@@ -121,8 +120,8 @@ fn has_dictionary_pair(dir: &Path, stem: &str) -> bool {
 /// own region (`de_DE` over `de_AT`) when more than one is installed for
 /// that language, otherwise the alphabetically first match; falls back
 /// to `None` when nothing installed matches.
-pub fn find_dictionary_for_active_language(search_dirs: &[PathBuf]) -> Option<PathBuf> {
-    best_dictionary_for_language(&active_language(), &detect_locale(), search_dirs)
+pub async fn find_dictionary_for_active_language(search_dirs: &[PathBuf]) -> Option<PathBuf> {
+    best_dictionary_for_language(&active_language().await, &detect_locale(), search_dirs)
 }
 
 /// The language currently being typed in: Hyprland's active keyboard
@@ -133,8 +132,8 @@ pub fn find_dictionary_for_active_language(search_dirs: &[PathBuf]) -> Option<Pa
 /// separately from `find_dictionary_for_active_language` so a caller
 /// can name the language in a message (e.g. "no dictionary installed
 /// for German") without duplicating this fallback logic.
-pub fn active_language() -> String {
-    active_keyboard_language().unwrap_or_else(|| {
+pub async fn active_language() -> String {
+    active_keyboard_language().await.unwrap_or_else(|| {
         let locale = detect_locale();
         locale.split('_').next().unwrap_or(&locale).to_string()
     })
@@ -164,8 +163,18 @@ fn best_dictionary_for_language(lang_prefix: &str, preferred_locale: &str, searc
 /// filenames use as their prefix. `None` when `hyprctl` isn't available
 /// (not running under Hyprland), its output can't be parsed, or the
 /// active layout's language isn't in `language_name_to_code`'s table.
-fn active_keyboard_language() -> Option<String> {
-    let output = std::process::Command::new("hyprctl").args(["devices", "-j"]).output().ok()?;
+/// Runs the subprocess on a blocking-pool thread rather than directly on
+/// the async executor — unlike this module's local filesystem checks, an
+/// external process's runtime isn't bounded, and this is awaited from
+/// `run()`'s startup path before the event loop (and its terminal
+/// redraws) even begins.
+async fn active_keyboard_language() -> Option<String> {
+    let output = tokio::task::spawn_blocking(|| {
+        std::process::Command::new("hyprctl").args(["devices", "-j"]).output()
+    })
+    .await
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -349,15 +358,23 @@ impl Drop for SpellChecker {
 /// edit that changes the line count (Enter, or a line-joining
 /// Backspace), since that shifts every later line's index and a
 /// single-line patch could no longer land on the right one.
+/// `compose_id` on `Line`/`Full` is the requesting `ComposeState::id` —
+/// echoed back in the corresponding result so the caller can tell a
+/// result apart from one meant for a compose session that's since closed
+/// (and possibly been replaced by an unrelated new one).
 #[derive(Clone, Default)]
 pub enum SpellCheckRequest {
     #[default]
     None,
     Line {
+        compose_id: u64,
         index: usize,
         text: String,
     },
-    Full(String),
+    Full {
+        compose_id: u64,
+        text: String,
+    },
 }
 
 /// A handle to the background task that owns the running `SpellChecker`
@@ -374,15 +391,15 @@ impl SpellCheckHandle {
     /// Queues a recheck of just one body line. Cheap and non-blocking: a
     /// request that arrives before the previous one was even picked up
     /// simply replaces it — only the latest state is ever worth checking.
-    pub fn request_line(&self, index: usize, text: String) {
-        let _ = self.request_tx.send(SpellCheckRequest::Line { index, text });
+    pub fn request_line(&self, compose_id: u64, index: usize, text: String) {
+        let _ = self.request_tx.send(SpellCheckRequest::Line { compose_id, index, text });
     }
 
     /// Queues a recheck of the whole body, line by line — used when an
     /// edit changed the line count, so per-line indices from before it
     /// can no longer be trusted.
-    pub fn request_full(&self, text: String) {
-        let _ = self.request_tx.send(SpellCheckRequest::Full(text));
+    pub fn request_full(&self, compose_id: u64, text: String) {
+        let _ = self.request_tx.send(SpellCheckRequest::Full { compose_id, text });
     }
 }
 

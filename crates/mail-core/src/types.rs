@@ -42,7 +42,7 @@ pub struct Address {
 impl std::fmt::Display for Address {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.name {
-            Some(name) if !name.is_empty() => write!(f, "{name} <{}>", self.email),
+            Some(name) if !name.trim().is_empty() => write!(f, "{name} <{}>", self.email),
             _ => write!(f, "{}", self.email),
         }
     }
@@ -69,4 +69,29 @@ pub struct MessageAttachment {
     pub filename: String,
     pub size_bytes: u64,
     pub bytes: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_display_shows_the_name_and_email_when_a_real_name_is_present() {
+        let a = Address { name: Some("Alice".to_string()), email: "alice@example.com".to_string() };
+        assert_eq!(a.to_string(), "Alice <alice@example.com>");
+    }
+
+    #[test]
+    fn address_display_falls_back_to_the_bare_email_with_no_name() {
+        let a = Address { name: None, email: "alice@example.com".to_string() };
+        assert_eq!(a.to_string(), "alice@example.com");
+    }
+
+    #[test]
+    fn address_display_treats_a_whitespace_only_name_as_no_name() {
+        // A malformed `From:` header can leave `name` as `Some(" ")`
+        // rather than `None` — must not render as " <email>".
+        let a = Address { name: Some("   ".to_string()), email: "alice@example.com".to_string() };
+        assert_eq!(a.to_string(), "alice@example.com");
+    }
 }

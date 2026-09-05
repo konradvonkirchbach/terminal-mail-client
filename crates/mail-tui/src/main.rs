@@ -108,16 +108,18 @@ enum BgMsg {
     /// A spellcheck pass over a single body line finished — `line` is
     /// which one (patched in place, since most edits don't shift line
     /// indices), `words` maps each misspelled word found to Hunspell's
-    /// suggested corrections for it. Not tagged to a particular compose
-    /// session: if compose has since closed, or its line count has since
-    /// changed underneath this now-stale index, `set_line_misspellings`
-    /// just grows to fit or the message is silently dropped.
-    SpellCheckLine { line: usize, words: std::collections::HashMap<String, Vec<String>> },
+    /// suggested corrections for it. `compose_id` is checked against the
+    /// live compose's `ComposeState::id` before applying: if compose has
+    /// since closed and possibly been replaced by an unrelated new one,
+    /// this stale result is simply dropped instead of silently patching
+    /// text the user never typed in this session.
+    SpellCheckLine { compose_id: u64, line: usize, words: std::collections::HashMap<String, Vec<String>> },
     /// A spellcheck pass over the whole body finished — one entry per
     /// line, in order, wholesale-replacing the compose's per-line state.
     /// Sent instead of `SpellCheckLine` after an edit that changes the
     /// line count, since a single patched index could no longer line up.
-    SpellCheckFull(Vec<std::collections::HashMap<String, Vec<String>>>),
+    /// `compose_id` is checked the same way as `SpellCheckLine`'s.
+    SpellCheckFull { compose_id: u64, by_line: Vec<std::collections::HashMap<String, Vec<String>>> },
     /// A (re)detection of the dictionary matching the active keyboard
     /// layout finished — replaces whatever spellchecker was running.
     /// Fired at startup and again every time compose opens, so switching
@@ -255,7 +257,7 @@ async fn run(
     // before writing a new email picks up the matching dictionary.
     let spellcheck_handle = spawn_spellchecker(tx.clone()).await;
     if spellcheck_handle.is_none() {
-        let lang = spellcheck::active_language();
+        let lang = spellcheck::active_language().await;
         app.set_status(format!(
             "Spellcheck unavailable — install hunspell and a matching dictionary (e.g. hunspell-{lang}) to enable it."
         ));
@@ -420,14 +422,18 @@ async fn run(
                         app.known_senders = senders;
                     }
                     Some(BgMsg::KnownSenders { .. }) => {}
-                    Some(BgMsg::SpellCheckLine { line, words }) => {
+                    Some(BgMsg::SpellCheckLine { compose_id, line, words }) => {
                         if let Some(compose) = &mut app.compose {
-                            compose.set_line_misspellings(line, words);
+                            if compose.id == compose_id {
+                                compose.set_line_misspellings(line, words);
+                            }
                         }
                     }
-                    Some(BgMsg::SpellCheckFull(by_line)) => {
+                    Some(BgMsg::SpellCheckFull { compose_id, by_line }) => {
                         if let Some(compose) = &mut app.compose {
-                            compose.set_all_misspellings(by_line);
+                            if compose.id == compose_id {
+                                compose.set_all_misspellings(by_line);
+                            }
                         }
                     }
                     Some(BgMsg::SpellCheckerReady(handle)) => {
@@ -821,7 +827,14 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ses
         _ => {}
     }
 
-    compose.refresh_suggestions(&app.known_senders);
+    // Left/Right/Up/Down never change what's typed in a recipient field
+    // (they only move within it, or do nothing there) and never change
+    // focus — skip the refresh for those so an idle cursor move doesn't
+    // re-run the fuzzy match against the whole known-senders list for a
+    // query that hasn't actually changed.
+    if !matches!(code, KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down) {
+        compose.refresh_suggestions(&app.known_senders);
+    }
 
     // Most edits only touch one body line, so only that line needs a
     // recheck; an edit that changes the line count (Enter, or a
@@ -831,15 +844,15 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ses
         if let Some(handle) = &session.spellcheck {
             match code {
                 KeyCode::Char(_) => {
-                    handle.request_line(compose.body.cursor_row, compose.body.lines[compose.body.cursor_row].clone());
+                    handle.request_line(compose.id, compose.body.cursor_row, compose.body.lines[compose.body.cursor_row].clone());
                 }
                 KeyCode::Backspace if backspace_will_join_body_lines => {
-                    handle.request_full(compose.body.text());
+                    handle.request_full(compose.id, compose.body.text());
                 }
                 KeyCode::Backspace => {
-                    handle.request_line(compose.body.cursor_row, compose.body.lines[compose.body.cursor_row].clone());
+                    handle.request_line(compose.id, compose.body.cursor_row, compose.body.lines[compose.body.cursor_row].clone());
                 }
-                KeyCode::Enter => handle.request_full(compose.body.text()),
+                KeyCode::Enter => handle.request_full(compose.id, compose.body.text()),
                 _ => {}
             }
         }
@@ -1087,7 +1100,7 @@ fn spawn_known_senders(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
 /// `hunspell` binary or no dictionary installed for that language; see
 /// `spellcheck.rs`.
 async fn spawn_spellchecker(tx: mpsc::Sender<BgMsg>) -> Option<spellcheck::SpellCheckHandle> {
-    let dict = spellcheck::find_dictionary_for_active_language(&spellcheck::default_search_dirs())?;
+    let dict = spellcheck::find_dictionary_for_active_language(&spellcheck::default_search_dirs()).await?;
     let mut checker = spellcheck::SpellChecker::spawn(std::slice::from_ref(&dict)).await.ok()?;
 
     let (request_tx, mut request_rx) = tokio::sync::watch::channel(spellcheck::SpellCheckRequest::default());
@@ -1099,16 +1112,16 @@ async fn spawn_spellchecker(tx: mpsc::Sender<BgMsg>) -> Option<spellcheck::Spell
             let request = request_rx.borrow_and_update().clone();
             let msg = match request {
                 spellcheck::SpellCheckRequest::None => continue,
-                spellcheck::SpellCheckRequest::Line { index, text } => {
+                spellcheck::SpellCheckRequest::Line { compose_id, index, text } => {
                     match spellcheck::check_one_line(&mut checker, &text).await {
-                        Ok(words) => BgMsg::SpellCheckLine { line: index, words },
+                        Ok(words) => BgMsg::SpellCheckLine { compose_id, line: index, words },
                         Err(e) => {
                             tracing::warn!("spellcheck failed, disabling for the rest of the session: {e}");
                             return;
                         }
                     }
                 }
-                spellcheck::SpellCheckRequest::Full(text) => {
+                spellcheck::SpellCheckRequest::Full { compose_id, text } => {
                     // `split('\n')` rather than `.lines()`: it's the
                     // exact inverse of how `TextArea::text()` joins body
                     // lines, so an empty or trailing-blank line still
@@ -1126,7 +1139,7 @@ async fn spawn_spellchecker(tx: mpsc::Sender<BgMsg>) -> Option<spellcheck::Spell
                         }
                     }
                     match failed {
-                        None => BgMsg::SpellCheckFull(by_line),
+                        None => BgMsg::SpellCheckFull { compose_id, by_line },
                         Some(e) => {
                             tracing::warn!("spellcheck failed, disabling for the rest of the session: {e}");
                             return;

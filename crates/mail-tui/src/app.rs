@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mail_core::{Address, Draft, Envelope, Message};
@@ -6,6 +7,14 @@ use mail_core::{Address, Draft, Envelope, Message};
 use crate::attach::AttachmentEntry;
 use crate::editable::{TextArea, TextInput};
 use crate::filebrowser::FileBrowser;
+
+/// Source of `ComposeState::id` — a fresh, process-wide-unique id per
+/// compose session, so an async spellcheck result that outlives its
+/// compose session (closed and a new one opened before the check
+/// returned) can be told apart from the new one instead of silently
+/// landing on it. `Relaxed` is enough: this only needs uniqueness
+/// across calls, never ordering with anything else.
+static NEXT_COMPOSE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// How long a status message (e.g. "Sent.") stays in the status bar
 /// before it's cleared automatically, so the key hints underneath it
@@ -103,6 +112,11 @@ impl<T> Selectable<T> {
 }
 
 pub struct ComposeState {
+    /// A fresh id per compose session (see `NEXT_COMPOSE_ID`), tagged
+    /// onto every spellcheck request so a result that arrives after this
+    /// session closed and a new one opened gets recognized as stale
+    /// instead of silently applied to unrelated text.
+    pub id: u64,
     pub to: TextInput,
     pub cc: TextInput,
     pub bcc: TextInput,
@@ -131,6 +145,7 @@ pub struct ComposeState {
 impl ComposeState {
     pub fn blank() -> Self {
         Self {
+            id: NEXT_COMPOSE_ID.fetch_add(1, Ordering::Relaxed),
             to: TextInput::default(),
             cc: TextInput::default(),
             bcc: TextInput::default(),
@@ -203,9 +218,9 @@ impl ComposeState {
     }
 
     /// Recomputes `suggestions` against whatever's typed after the last
-    /// comma in the currently focused field — call after every edit or
-    /// focus change. Clears immediately outside To/Cc/Bcc, or when that
-    /// fragment is empty (nothing to suggest against yet).
+    /// recipient separator in the currently focused field — call after
+    /// every edit or focus change. Clears immediately outside To/Cc/Bcc,
+    /// or when that fragment is empty (nothing to suggest against yet).
     pub fn refresh_suggestions(&mut self, known_senders: &[Address]) {
         self.suggestions.selected = 0;
         let field_value = match self.focus {
@@ -217,7 +232,10 @@ impl ComposeState {
                 return;
             }
         };
-        let query = field_value.rsplit(',').next().unwrap_or("").trim();
+        let query = match last_recipient_separator(field_value) {
+            Some(idx) => field_value[idx + 1..].trim(),
+            None => field_value.trim(),
+        };
         self.suggestions.items = if query.is_empty() {
             Vec::new()
         } else {
@@ -226,9 +244,10 @@ impl ComposeState {
     }
 
     /// Accepts the highlighted suggestion into the focused recipient
-    /// field, replacing whatever was typed after the last comma and
-    /// leaving a trailing ", " ready for the next address. A no-op
-    /// outside To/Cc/Bcc, or when there's nothing selected to accept.
+    /// field, replacing whatever was typed after the last recipient
+    /// separator and leaving a trailing ", " ready for the next address.
+    /// A no-op outside To/Cc/Bcc, or when there's nothing selected to
+    /// accept.
     pub fn accept_suggestion(&mut self) {
         let Some(chosen) = self.suggestions.selected_item().cloned() else {
             return;
@@ -239,7 +258,7 @@ impl ComposeState {
             ComposeField::Bcc => &mut self.bcc,
             ComposeField::Subject | ComposeField::Attachments | ComposeField::Body => return,
         };
-        let prefix = match field.value.rfind(',') {
+        let prefix = match last_recipient_separator(&field.value) {
             Some(idx) => format!("{} ", field.value[..=idx].trim_end()),
             None => String::new(),
         };
@@ -501,6 +520,24 @@ impl App {
         self.search_editing = false;
         self.selected = 0;
     }
+}
+
+/// The byte index of the last comma in `s` that separates two recipients
+/// in a To/Cc/Bcc field, ignoring one inside a quoted display name
+/// (`"Doe, Jane" <jane@example.com>`). An odd number of `"` before a
+/// comma means it's still inside an (possibly unterminated, still being
+/// typed) quoted name, so that comma doesn't count as a separator either.
+fn last_recipient_separator(s: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut last = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => last = Some(i),
+            _ => {}
+        }
+    }
+    last
 }
 
 fn envelope_matches(e: &Envelope, needle: &str) -> bool {
@@ -796,6 +833,51 @@ mod tests {
         assert!(app.known_senders.is_empty());
     }
 
+    // -- ComposeState::id ---------------------------------------------------
+
+    #[test]
+    fn blank_compose_states_get_distinct_ids() {
+        let a = ComposeState::blank();
+        let b = ComposeState::blank();
+        assert_ne!(a.id, b.id, "each compose session must be individually identifiable");
+    }
+
+    #[test]
+    fn reply_compose_state_also_gets_a_fresh_id() {
+        let source = env(1, "Hi", "Alice", "alice@example.com");
+        let blank = ComposeState::blank();
+        let reply = ComposeState::reply(&source);
+        assert_ne!(blank.id, reply.id);
+    }
+
+    // -- last_recipient_separator ------------------------------------------
+
+    #[test]
+    fn last_recipient_separator_finds_the_last_plain_comma() {
+        assert_eq!(last_recipient_separator("a@x.com, b@x.com, c@x.com"), Some(16));
+    }
+
+    #[test]
+    fn last_recipient_separator_ignores_a_comma_inside_quotes() {
+        let s = "\"Doe, Jane\" <jane@example.com>, ali";
+        // The separator must be the comma after the closing quote's
+        // address, not the one inside "Doe, Jane".
+        assert_eq!(&s[last_recipient_separator(s).unwrap()..], ", ali");
+    }
+
+    #[test]
+    fn last_recipient_separator_treats_an_unterminated_quote_as_still_open() {
+        // Still typing the quoted name — the comma inside it must not
+        // count as a separator even though the closing quote hasn't
+        // been typed yet.
+        assert_eq!(last_recipient_separator("\"Doe, Jane"), None);
+    }
+
+    #[test]
+    fn last_recipient_separator_returns_none_with_no_comma_at_all() {
+        assert_eq!(last_recipient_separator("alice@example.com"), None);
+    }
+
     // -- compose recipient suggestions ------------------------------------
 
     fn senders() -> Vec<Address> {
@@ -864,6 +946,32 @@ mod tests {
         compose.accept_suggestion();
 
         assert_eq!(compose.to.value, "bob@example.com, Alice Doe <alice@example.com>, ");
+    }
+
+    #[test]
+    fn refresh_suggestions_ignores_a_comma_inside_a_quoted_display_name() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::To;
+        // A "Last, First" quoted display name — the comma inside the
+        // quotes must not be mistaken for the recipient separator.
+        compose.to = TextInput::with_value("\"Doe, Jane\" <jane@example.com>, ali".to_string());
+
+        compose.refresh_suggestions(&senders());
+
+        assert_eq!(compose.suggestions.items.len(), 1);
+        assert_eq!(compose.suggestions.items[0].email, "alice@example.com");
+    }
+
+    #[test]
+    fn accept_suggestion_preserves_a_quoted_recipient_containing_a_comma() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::To;
+        compose.to = TextInput::with_value("\"Doe, Jane\" <jane@example.com>, ali".to_string());
+        compose.refresh_suggestions(&senders());
+
+        compose.accept_suggestion();
+
+        assert_eq!(compose.to.value, "\"Doe, Jane\" <jane@example.com>, Alice Doe <alice@example.com>, ");
     }
 
     #[test]
