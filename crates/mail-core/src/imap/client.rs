@@ -21,6 +21,8 @@ pub(crate) struct MailboxInfo {
 }
 
 fn tls_connector() -> Result<TlsConnector> {
+    crate::ensure_crypto_provider();
+
     let mut root_store = rustls::RootCertStore::empty();
     let certs = rustls_native_certs::load_native_certs();
     for err in &certs.errors {

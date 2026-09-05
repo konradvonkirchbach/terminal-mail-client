@@ -17,3 +17,16 @@ pub use error::{Error, Result};
 pub use smtp::Draft;
 pub use store::Store;
 pub use types::{Envelope, Flag, Message};
+
+/// Both our own IMAP TLS setup and lettre's SMTP TLS setup use `rustls`,
+/// but pull in different crypto backends (`aws-lc-rs` for us, `ring`
+/// forced on by lettre's `rustls-tls` feature) — with both compiled in,
+/// rustls can't auto-select a process-wide default and panics on first
+/// use. Call this once before any network operation to pick one
+/// explicitly; safe to call more than once.
+pub(crate) fn ensure_crypto_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}

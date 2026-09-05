@@ -40,6 +40,23 @@ pub fn run() -> anyhow::Result<Account> {
     Ok(account)
 }
 
+/// `mailc --set-password`: updates the stored password/app-password for
+/// the already-configured account without touching anything else (host,
+/// port, etc.) or wiping the config file. Doesn't touch the TUI at all.
+pub fn set_password() -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let Some(account_config) = config.accounts.into_iter().next() else {
+        anyhow::bail!("no account configured yet — run `mailc` once to set one up first");
+    };
+
+    let account = Account::new(account_config);
+    println!("Updating password for {}", account.config.email);
+    let password = rpassword::prompt_password("New password (or app password): ")?;
+    account.set_password(&password)?;
+    println!("Saved to your OS keyring.");
+    Ok(())
+}
+
 fn prompt(label: &str) -> anyhow::Result<String> {
     print!("{label}: ");
     io::stdout().flush()?;

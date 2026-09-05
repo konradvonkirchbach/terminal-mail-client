@@ -64,6 +64,10 @@ fn load_or_setup_account() -> anyhow::Result<Account> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|a| a == "--set-password") {
+        return setup::set_password();
+    }
+
     init_tracing()?;
     let account = load_or_setup_account()?;
 

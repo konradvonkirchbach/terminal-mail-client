@@ -108,6 +108,8 @@ pub async fn send_raw(account: &Account, raw: &[u8], recipients: &[String]) -> R
 }
 
 async fn transport(account: &Account) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
+    crate::ensure_crypto_provider();
+
     let password = account.password()?;
     let cfg = &account.config;
     let creds = Credentials::new(cfg.email.clone(), password);
