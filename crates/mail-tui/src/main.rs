@@ -153,17 +153,25 @@ async fn run(
 
     let mut events = EventStream::new();
 
+    // ratatui re-queries the real terminal size on every draw call, so a
+    // resize corrects itself as soon as *something* triggers another
+    // redraw. Terminal emulators are expected to report that as a
+    // crossterm `Event::Resize` — but some WM/terminal-emulator
+    // combinations (a tiling WM resizing the window rather than the user
+    // dragging its edge) don't reliably deliver that, and without a key
+    // or background event in the meantime we'd otherwise sit on the old
+    // size indefinitely. Redrawing on an idle heartbeat instead of a long
+    // sleep makes that self-heal within a fraction of a second, at a
+    // negligible idle-CPU cost.
+    const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(500);
+
     loop {
         // Clear an expired status message *before* drawing — otherwise
         // the redraw that fires exactly when the tick elapses still
         // shows the stale message for one more frame, and (since the
-        // next tick then becomes the long idle sleep) it visually never
-        // clears until some other event happens to force a redraw.
-        //
-        // Only wake up early for the TTL when a message is actually
-        // showing — otherwise fall back to a long idle sleep so this
-        // branch doesn't spin the loop for no reason.
-        let tick = app.expire_status().unwrap_or(Duration::from_secs(3600));
+        // next tick then becomes the idle interval) it could show stale
+        // text for up to another heartbeat.
+        let tick = app.expire_status().unwrap_or(IDLE_REDRAW_INTERVAL);
 
         terminal.draw(|frame| ui::draw(frame, &app, &theme))?;
 

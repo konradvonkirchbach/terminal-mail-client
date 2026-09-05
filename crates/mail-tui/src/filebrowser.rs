@@ -69,6 +69,9 @@ impl FileBrowser {
         let mut files = Vec::new();
         for entry in read_dir.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue; // dotfiles hidden by default; ".." is added separately above
+            }
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
