@@ -114,6 +114,36 @@ pub fn outbox_dir(account_id: i64) -> Result<PathBuf> {
     Ok(data_dir()?.join(account_id.to_string()).join("outbox"))
 }
 
+/// Restricts a directory we created ourselves to owner-only access
+/// (`0700`). Our data directory holds the SQLite cache plus every
+/// account's raw `.eml`/outbox files — full message content, not just
+/// metadata — so relying on inherited/ambient umask (which on some
+/// systems leaves new directories group- or world-readable) isn't
+/// enough. A no-op on non-Unix targets, since this project doesn't
+/// target them anyway.
+pub fn restrict_dir(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+/// Same as `restrict_dir`, but `0600` (no execute bit — nothing here
+/// needs to be traversed as a directory) for individual cache files:
+/// the SQLite database itself, and each cached/queued `.eml`.
+pub fn restrict_file(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let _ = path;
+    Ok(())
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let path = config_path()?;

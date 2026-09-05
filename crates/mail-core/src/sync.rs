@@ -120,9 +120,7 @@ async fn incremental_sync(
     if !recent.is_empty() {
         let uid_set = uid_list(&recent);
         let flags = client::fetch_flags_by_uid(session, &uid_set).await?;
-        for (uid, flags) in flags {
-            store.update_message_flags(folder_id, uid, flags).await?;
-        }
+        store.update_message_flags_batch(folder_id, flags).await?;
     }
 
     Ok(new_envelopes)
@@ -188,8 +186,10 @@ async fn cache_raw_message(
 ) -> Result<()> {
     let dir = config::messages_dir(account_id)?;
     tokio::fs::create_dir_all(&dir).await?;
+    config::restrict_dir(&dir)?;
     let path = dir.join(format!("{uid}.eml"));
     tokio::fs::write(&path, raw).await?;
+    config::restrict_file(&path)?;
     store
         .set_message_raw_path(folder_id, uid, path.to_string_lossy().into_owned())
         .await?;

@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 
 use crate::error::{Error, Result};
 
-type Job = Box<dyn FnOnce(&Connection) + Send>;
+type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 
 /// A handle to the local SQLite cache. All actual database access happens
 /// on one dedicated OS thread (the "store actor") that owns the single
@@ -22,6 +22,7 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            crate::config::restrict_dir(parent)?;
         }
 
         let (tx, rx) = std_mpsc::channel::<Job>();
@@ -31,7 +32,7 @@ impl Store {
         std::thread::Builder::new()
             .name("mail-store".into())
             .spawn(move || {
-                let conn = match Connection::open(&path).map_err(Error::from) {
+                let mut conn = match Connection::open(&path).map_err(Error::from) {
                     Ok(conn) => conn,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -42,10 +43,16 @@ impl Store {
                     let _ = ready_tx.send(Err(e));
                     return;
                 }
+                // Best-effort: a mailbox's cached subjects/senders/bodies
+                // live in this file, so lock it down even though the
+                // parent directory (already 0700) is the primary defense.
+                if let Err(e) = crate::config::restrict_file(&path) {
+                    tracing::warn!("failed to restrict permissions on {path:?}: {e}");
+                }
                 let _ = ready_tx.send(Ok(()));
 
                 for job in rx {
-                    job(&conn);
+                    job(&mut conn);
                 }
             })
             .map_err(|e| Error::Config(format!("failed to spawn store thread: {e}")))?;
@@ -59,10 +66,14 @@ impl Store {
 
     /// Runs `f` against the store's connection on its dedicated thread and
     /// awaits the result. `f` must not block on anything other than SQLite
-    /// itself — it runs synchronously on the actor thread.
+    /// itself — it runs synchronously on the actor thread. Takes `&mut
+    /// Connection` (rather than `&Connection`) solely so callers doing
+    /// several writes can open a `Transaction` — existing closures that
+    /// only need shared access are unaffected, since `&mut Connection`
+    /// auto-reborrows to `&Connection` wherever that's all a callee needs.
     pub async fn run<F, T>(&self, f: F) -> Result<T>
     where
-        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -85,7 +96,15 @@ fn init_connection(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == 0 {
         conn.execute_batch(super::schema::SCHEMA_V1)?;
-        conn.pragma_update(None, "user_version", 1)?;
+        conn.pragma_update(None, "user_version", 2)?;
+    } else if version == 1 {
+        // messages_folder_date was never read by any query (all of them
+        // filter/sort by (folder_id, uid), already covered by the
+        // UNIQUE(folder_id, uid) constraint's own index) — just dead
+        // weight on every insert/update. Drop it for databases created
+        // before this was noticed; SCHEMA_V1 no longer creates it at all.
+        conn.execute_batch("DROP INDEX IF EXISTS messages_folder_date;")?;
+        conn.pragma_update(None, "user_version", 2)?;
     }
     Ok(())
 }

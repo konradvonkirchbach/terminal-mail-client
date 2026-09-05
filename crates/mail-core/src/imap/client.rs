@@ -193,6 +193,16 @@ pub(crate) async fn fetch_message_raw(account: &Account, uid: u32) -> Result<Vec
         .ok_or_else(|| Error::Imap(format!("no such message: uid {uid}")))
 }
 
+/// A message's raw bytes are already fully in memory by the time we parse
+/// it (fetched whole over IMAP, or read whole from the on-disk cache), so
+/// this doesn't bound total memory use — it bounds the *extra* copy each
+/// attachment gets when we pull its decoded bytes out into our own
+/// `MessageAttachment`. Generous relative to what any mainstream provider
+/// lets through in the first place (Gmail/Yahoo ~25MB, Outlook ~20MB
+/// total per message), so it should never trigger for real mail; it's a
+/// backstop against a pathological/oversized message, not a normal limit.
+const MAX_ATTACHMENT_LOAD_BYTES: u64 = 50 * 1024 * 1024;
+
 /// Parses raw RFC822 bytes (freshly fetched or read back from the on-disk
 /// cache) into our `Message` type.
 pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
@@ -208,11 +218,17 @@ pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
                 .attachment_name()
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("attachment-{}", i + 1));
-            MessageAttachment {
-                filename,
-                size_bytes: part.contents().len() as u64,
-                bytes: part.contents().to_vec(),
-            }
+            let size_bytes = part.contents().len() as u64;
+            let bytes = if size_bytes > MAX_ATTACHMENT_LOAD_BYTES {
+                tracing::warn!(
+                    "uid {uid}: attachment {filename:?} is {size_bytes} bytes, over the \
+                     {MAX_ATTACHMENT_LOAD_BYTES}-byte load cap — skipping its content"
+                );
+                Vec::new()
+            } else {
+                part.contents().to_vec()
+            };
+            MessageAttachment { filename, size_bytes, bytes }
         })
         .collect();
 

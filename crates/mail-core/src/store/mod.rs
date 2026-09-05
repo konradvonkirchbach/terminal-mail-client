@@ -38,11 +38,17 @@ impl Store {
             .await
     }
 
+    /// Wrapped in one transaction rather than N auto-committed statements
+    /// — for an initial sync (up to `fetch_limit` messages, potentially
+    /// in the hundreds) this turns N fsync-equivalent WAL commits into
+    /// one.
     pub async fn upsert_envelopes(&self, folder_id: i64, envelopes: Vec<Envelope>) -> Result<()> {
         self.run(move |conn| {
+            let tx = conn.transaction()?;
             for env in &envelopes {
-                queries::upsert_envelope(conn, folder_id, env)?;
+                queries::upsert_envelope(&tx, folder_id, env)?;
             }
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -51,6 +57,26 @@ impl Store {
     pub async fn update_message_flags(&self, folder_id: i64, uid: u32, flags: Flags) -> Result<()> {
         self.run(move |conn| queries::update_message_flags(conn, folder_id, uid, flags))
             .await
+    }
+
+    /// Same as calling `update_message_flags` once per entry, but as one
+    /// transaction instead of N separate round-trips through the actor
+    /// channel — the flag-refresh sweep calls this with up to
+    /// `FLAG_REFRESH_WINDOW` (200) entries on every sync.
+    pub async fn update_message_flags_batch(
+        &self,
+        folder_id: i64,
+        updates: Vec<(u32, Flags)>,
+    ) -> Result<()> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            for (uid, flags) in &updates {
+                queries::update_message_flags(&tx, folder_id, *uid, *flags)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn list_envelopes(&self, folder_id: i64, limit: u32) -> Result<Vec<Envelope>> {

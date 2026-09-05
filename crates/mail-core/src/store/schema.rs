@@ -36,7 +36,10 @@ CREATE TABLE messages (
     raw_path            TEXT,
     UNIQUE(folder_id, uid)
 );
-CREATE INDEX messages_folder_date ON messages(folder_id, date DESC);
+-- No separate index on (folder_id, date): every current query (list,
+-- max_uid, recent_uids) filters/sorts by (folder_id, uid), which the
+-- UNIQUE constraint above already indexes. An index nothing reads from
+-- would just add write overhead to every sync.
 
 CREATE TABLE attachments (
     id          INTEGER PRIMARY KEY,

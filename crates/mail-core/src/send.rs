@@ -49,8 +49,10 @@ async fn queue_outbox(
 ) -> Result<()> {
     let dir = config::outbox_dir(account_id)?;
     tokio::fs::create_dir_all(&dir).await?;
+    config::restrict_dir(&dir)?;
     let path = dir.join(format!("{}.eml", uuid_like()));
     tokio::fs::write(&path, raw).await?;
+    config::restrict_file(&path)?;
     store
         .insert_outbox(
             account_id,

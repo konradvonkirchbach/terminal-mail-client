@@ -469,6 +469,18 @@ fn start_download(app: &mut App) {
     let BodyState::Loaded(message) = &app.body else { return };
     let Some(attachment) = message.attachments.get(app.selected_attachment) else { return };
 
+    // mail-core skips loading the content of a pathologically large
+    // attachment (see MAX_ATTACHMENT_LOAD_BYTES) — bytes empty but a
+    // nonzero size means "too large," not "actually empty."
+    if attachment.bytes.is_empty() && attachment.size_bytes > 0 {
+        app.set_status(format!(
+            "{} is too large to download ({}).",
+            attachment.filename,
+            attach::human_size(attachment.size_bytes)
+        ));
+        return;
+    }
+
     let browser = FileBrowser::open_for_save(default_download_dir(), attachment.filename.clone());
     let purpose = BrowserPurpose::SaveAttachment {
         bytes: attachment.bytes.clone(),
