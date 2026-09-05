@@ -1,5 +1,6 @@
 mod omarchy;
 mod palette;
+pub mod watch;
 
 pub use palette::Theme;
 

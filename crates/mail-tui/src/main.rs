@@ -1,5 +1,6 @@
 mod app;
 mod attach;
+mod desktop_notify;
 mod editable;
 mod filebrowser;
 mod setup;
@@ -135,7 +136,8 @@ async fn run(
     accounts: Vec<Account>,
 ) -> anyhow::Result<()> {
     let config = mail_core::config::Config::load()?;
-    let theme = theme::resolve(&config.theme.mode);
+    let mut theme_rx = theme::watch::spawn(config.theme.mode.clone());
+    let mut theme = *theme_rx.borrow_and_update();
 
     let store = Store::open(&mail_core::config::db_path()?)?;
 
@@ -301,7 +303,7 @@ async fn run(
                     None => {}
                 }
             }
-            Some(AppEvent::NewMail { account_id, .. }) = app_events.recv() => {
+            Some(AppEvent::NewMail { account_id, new_envelopes, .. }) = app_events.recv() => {
                 // The IDLE loop already wrote the fresh data straight to
                 // the store; only re-read into the UI if this is the
                 // account currently being viewed. A background account's
@@ -310,6 +312,14 @@ async fn run(
                 if account_id == accounts.current().account_id {
                     spawn_account_envelopes(accounts.current().clone(), tx.clone());
                 }
+                // Notifications fire regardless of which account is being
+                // viewed — arguably more useful for one that isn't.
+                if let Some(account) = accounts.list.iter().find(|a| a.account_id == account_id) {
+                    desktop_notify::notify_new_mail(&account.account.config.email, &new_envelopes);
+                }
+            }
+            Ok(()) = theme_rx.changed() => {
+                theme = *theme_rx.borrow_and_update();
             }
             _ = tokio::time::sleep(tick) => {}
         }

@@ -7,7 +7,7 @@ use crate::config;
 use crate::error::Result;
 use crate::imap::client;
 use crate::store::Store;
-use crate::types::Message;
+use crate::types::{Envelope, Message};
 
 /// How many recently-cached messages to re-check flags for on every sync.
 /// Catches read/starred/deleted changes made from another client without
@@ -17,7 +17,12 @@ const FLAG_REFRESH_WINDOW: u32 = 200;
 pub struct SyncOutcome {
     pub account_id: i64,
     pub folder_id: i64,
-    pub new_count: usize,
+    /// Envelopes this call fetched for the first time — on an initial
+    /// sync (or after a `UIDVALIDITY` change) that's the whole backfilled
+    /// batch, so callers deciding whether to do something user-visible
+    /// with "new mail" (like a desktop notification) should generally
+    /// only act on this from an *incremental* sync, not a first one.
+    pub new_envelopes: Vec<Envelope>,
 }
 
 /// Syncs INBOX for `account` into the local cache. Safe to call repeatedly
@@ -40,7 +45,7 @@ pub async fn sync_inbox(account: &Account, store: &Store) -> Result<SyncOutcome>
     let uidvalidity_changed = folder.uidvalidity != Some(mailbox.uid_validity);
     let had_prior_sync = folder.uidvalidity.is_some();
 
-    let new_count = if uidvalidity_changed {
+    let new_envelopes = if uidvalidity_changed {
         if had_prior_sync {
             store.clear_folder_messages(folder.id).await?;
         }
@@ -64,7 +69,7 @@ pub async fn sync_inbox(account: &Account, store: &Store) -> Result<SyncOutcome>
     Ok(SyncOutcome {
         account_id,
         folder_id: folder.id,
-        new_count,
+        new_envelopes,
     })
 }
 
@@ -74,17 +79,16 @@ async fn initial_sync(
     folder_id: i64,
     fetch_limit: u32,
     exists: u32,
-) -> Result<usize> {
+) -> Result<Vec<Envelope>> {
     if exists == 0 {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let end = exists;
     let start = end.saturating_sub(fetch_limit.saturating_sub(1)).max(1);
 
     let envelopes = client::fetch_envelope_seq_range(session, start, end).await?;
-    let count = envelopes.len();
-    store.upsert_envelopes(folder_id, envelopes).await?;
-    Ok(count)
+    store.upsert_envelopes(folder_id, envelopes.clone()).await?;
+    Ok(envelopes)
 }
 
 async fn incremental_sync(
@@ -92,18 +96,17 @@ async fn incremental_sync(
     store: &Store,
     folder_id: i64,
     server_uid_next: u32,
-) -> Result<usize> {
+) -> Result<Vec<Envelope>> {
     let cached_max_uid = store.max_uid(folder_id).await?;
 
-    let new_count = match cached_max_uid {
+    let new_envelopes = match cached_max_uid {
         Some(cached_max) if server_uid_next > cached_max + 1 => {
             let uid_set = format!("{}:{}", cached_max + 1, server_uid_next.saturating_sub(1));
             let envelopes = client::fetch_envelopes_by_uid(session, &uid_set).await?;
-            let count = envelopes.len();
-            store.upsert_envelopes(folder_id, envelopes).await?;
-            count
+            store.upsert_envelopes(folder_id, envelopes.clone()).await?;
+            envelopes
         }
-        Some(_) => 0,
+        Some(_) => Vec::new(),
         // Folder row already matched the server's UIDVALIDITY but we have
         // no cached messages (e.g. a prior sync was interrupted) — treat
         // it like a first sync rather than diffing against nothing.
@@ -122,7 +125,7 @@ async fn incremental_sync(
         }
     }
 
-    Ok(new_count)
+    Ok(new_envelopes)
 }
 
 fn uid_list(uids: &[u32]) -> String {

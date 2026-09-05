@@ -48,6 +48,7 @@ async fn run_once(account: &Account, store: &Store, events: &UnboundedSender<App
         let _ = events.send(AppEvent::NewMail {
             account_id: outcome.account_id,
             folder_id: outcome.folder_id,
+            new_envelopes: outcome.new_envelopes,
         });
     }
 }
