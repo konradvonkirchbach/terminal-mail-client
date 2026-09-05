@@ -24,7 +24,8 @@ notifications for new mail.
   ever received mail from (automated no-reply senders excluded)
 - **Spellcheck** — underlines misspelled words in the compose body, checked
   against every Hunspell dictionary installed on your system at once (so it
-  works across languages with no configuration); off automatically if none
+  works across languages with no configuration); move the cursor onto a
+  flagged word to see its suggested corrections; off automatically if none
   is installed
 - **Attachment downloads** — same directory browser, in reverse
 - **Search** — live filter the inbox by sender or subject; if nothing
@@ -168,6 +169,10 @@ from and drops a suggestion list under the field:
 | `↑` / `↓` | Move the highlighted suggestion |
 | `Enter` / `Tab` | Accept the highlighted suggestion |
 | `Esc` | Dismiss the dropdown without accepting |
+
+In the body, moving the cursor onto a misspelled (underlined) word pops
+up its suggested corrections below the cursor — display-only, since the
+body already uses the arrow keys, `Enter`, and `Tab` for editing.
 
 **Directory browser** (attach a file / choose a save location):
 

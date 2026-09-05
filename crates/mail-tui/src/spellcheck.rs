@@ -17,7 +17,7 @@
 //! session" whenever the binary or a dictionary isn't there — see
 //! `spawn_spellchecker` in `main.rs`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -286,15 +286,49 @@ pub fn normalize_word(word: &str) -> String {
     word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
 }
 
-/// Checks one line, returning the normalized set of every word flagged
-/// as misspelled in it — the shape compose's rendering wants for a
-/// case-insensitive, punctuation-insensitive lookup.
-pub async fn check_one_line(checker: &mut SpellChecker, line: &str) -> io::Result<HashSet<String>> {
-    let mut words = HashSet::new();
+/// Checks one line, returning every word flagged as misspelled in it —
+/// normalized (case/punctuation-insensitive) so it can be looked up by
+/// whatever token compose's rendering finds at a given position — mapped
+/// to Hunspell's suggested corrections for it (its own ranking, verbatim
+/// and un-normalized: these are shown to the user as-is, not compared
+/// against anything).
+pub async fn check_one_line(checker: &mut SpellChecker, line: &str) -> io::Result<HashMap<String, Vec<String>>> {
+    let mut words = HashMap::new();
     for m in checker.check_line(line).await? {
-        words.insert(normalize_word(&m.word));
+        words.insert(normalize_word(&m.word), m.suggestions);
     }
     Ok(words)
+}
+
+/// Splits `line` into whitespace-delimited tokens, each paired with its
+/// byte offset into `line` — the unit both compose's misspelled-word
+/// highlighting and its cursor-word lookup (`word_at_cursor`) work in.
+/// Trailing punctuation stays attached to the token (e.g. `"wrold."`);
+/// `normalize_word` strips it before comparing against a misspelled-word
+/// key.
+pub fn tokens(line: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut idx = 0;
+    line.split_inclusive(char::is_whitespace).filter_map(move |piece| {
+        let start = idx;
+        idx += piece.len();
+        let trimmed = piece.trim_end();
+        (!trimmed.is_empty()).then_some((start, trimmed))
+    })
+}
+
+/// The token the cursor sits within, or immediately after — so the
+/// common case (the cursor right after the word you just typed) still
+/// finds it. `cursor_char_idx` is a *character* index, matching
+/// `TextArea::cursor_col`'s unit, not a byte offset.
+pub fn word_at_cursor(line: &str, cursor_char_idx: usize) -> Option<&str> {
+    let cursor_byte_idx = line
+        .char_indices()
+        .nth(cursor_char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(line.len());
+    tokens(line)
+        .find(|(start, token)| *start <= cursor_byte_idx && cursor_byte_idx <= start + token.len())
+        .map(|(_, token)| token)
 }
 
 #[cfg(test)]
@@ -450,6 +484,63 @@ mod tests {
         assert_eq!(normalize_word("\"Hello\""), "hello");
         assert_eq!(normalize_word("don't"), "don't", "an internal apostrophe must survive");
         assert_eq!(normalize_word("well-known"), "well-known", "an internal hyphen must survive");
+    }
+
+    // -- tokenization and cursor-word lookup -----------------------------------
+
+    #[test]
+    fn tokens_splits_on_whitespace_and_reports_correct_byte_offsets() {
+        let found: Vec<(usize, &str)> = tokens("hello  world").collect();
+        assert_eq!(found, vec![(0, "hello"), (7, "world")]);
+    }
+
+    #[test]
+    fn tokens_keeps_trailing_punctuation_attached() {
+        let found: Vec<(usize, &str)> = tokens("wrold. next").collect();
+        assert_eq!(found, vec![(0, "wrold."), (7, "next")]);
+    }
+
+    #[test]
+    fn tokens_handles_leading_and_trailing_whitespace_and_multibyte_text() {
+        // "Häuser" — multibyte UTF-8 (each ä/ü is 2 bytes) — the offsets
+        // must land on char boundaries or slicing later would panic.
+        let found: Vec<(usize, &str)> = tokens("  Häuser über").collect();
+        assert_eq!(found, vec![(2, "Häuser"), (10, "über")]);
+    }
+
+    #[test]
+    fn word_at_cursor_finds_the_word_the_cursor_is_inside() {
+        assert_eq!(word_at_cursor("hello world", 2), Some("hello"));
+        assert_eq!(word_at_cursor("hello world", 7), Some("world"));
+    }
+
+    #[test]
+    fn word_at_cursor_finds_the_word_just_typed_when_cursor_sits_right_after_it() {
+        // The common case: cursor at the end of the word you're typing,
+        // before any trailing space.
+        assert_eq!(word_at_cursor("hello world", 5), Some("hello"));
+    }
+
+    #[test]
+    fn word_at_cursor_finds_the_next_word_when_cursor_sits_right_before_it() {
+        assert_eq!(word_at_cursor("hello world", 6), Some("world"));
+    }
+
+    #[test]
+    fn word_at_cursor_returns_none_in_the_middle_of_a_multi_space_gap() {
+        // "hello" ends at char 5, "world" starts at char 7 — char 6 (the
+        // second space) touches neither token.
+        assert_eq!(word_at_cursor("hello  world", 6), None);
+    }
+
+    #[test]
+    fn word_at_cursor_returns_none_on_an_empty_line() {
+        assert_eq!(word_at_cursor("", 0), None);
+    }
+
+    #[test]
+    fn word_at_cursor_handles_a_multibyte_word() {
+        assert_eq!(word_at_cursor("häuser world", 3), Some("häuser"));
     }
 
     // -- Hunspell "-a" pipe response parsing -----------------------------------

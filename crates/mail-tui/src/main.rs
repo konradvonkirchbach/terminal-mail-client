@@ -107,16 +107,17 @@ enum BgMsg {
     KnownSenders { account_id: i64, result: Result<Vec<Address>, String> },
     /// A spellcheck pass over a single body line finished — `line` is
     /// which one (patched in place, since most edits don't shift line
-    /// indices). Not tagged to a particular compose session: if compose
-    /// has since closed, or its line count has since changed underneath
-    /// this now-stale index, `set_line_misspellings` just grows to fit
-    /// or the message is silently dropped.
-    SpellCheckLine { line: usize, words: std::collections::HashSet<String> },
+    /// indices), `words` maps each misspelled word found to Hunspell's
+    /// suggested corrections for it. Not tagged to a particular compose
+    /// session: if compose has since closed, or its line count has since
+    /// changed underneath this now-stale index, `set_line_misspellings`
+    /// just grows to fit or the message is silently dropped.
+    SpellCheckLine { line: usize, words: std::collections::HashMap<String, Vec<String>> },
     /// A spellcheck pass over the whole body finished — one entry per
     /// line, in order, wholesale-replacing the compose's per-line state.
     /// Sent instead of `SpellCheckLine` after an edit that changes the
     /// line count, since a single patched index could no longer line up.
-    SpellCheckFull(Vec<std::collections::HashSet<String>>),
+    SpellCheckFull(Vec<std::collections::HashMap<String, Vec<String>>>),
 }
 
 fn init_tracing() -> anyhow::Result<()> {

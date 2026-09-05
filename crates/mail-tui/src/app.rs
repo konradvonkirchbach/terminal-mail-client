@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use mail_core::{Address, Draft, Envelope, Message};
@@ -116,15 +116,16 @@ pub struct ComposeState {
     /// last comma in the currently focused recipient field (To/Cc/Bcc);
     /// empty hides the dropdown. Recomputed by `refresh_suggestions`.
     pub suggestions: Selectable<Address>,
-    /// Misspelled words per body line, index-aligned with `body.lines`.
-    /// Most edits patch just the edited line (see `main.rs`'s spellcheck
+    /// Misspelled words per body line, index-aligned with `body.lines`,
+    /// each mapped to Hunspell's suggested corrections for it. Most
+    /// edits patch just the edited line (see `main.rs`'s spellcheck
     /// wiring); an edit that changes the line count (Enter, or a
     /// line-joining Backspace) replaces the whole vec instead, since
     /// that shifts every later line's index. May be shorter than
     /// `body.lines` right after such an edit until the pending recheck
     /// result arrives — treated as "nothing flagged yet" rather than an
     /// error wherever it's read.
-    pub misspelled_by_line: Vec<HashSet<String>>,
+    pub misspelled_by_line: Vec<HashMap<String, Vec<String>>>,
 }
 
 impl ComposeState {
@@ -251,9 +252,9 @@ impl ComposeState {
     /// most edits (typing or backspacing within a line) don't change the
     /// line count. Grows the vec if needed rather than requiring it to
     /// already be exactly the right length.
-    pub fn set_line_misspellings(&mut self, line: usize, words: HashSet<String>) {
+    pub fn set_line_misspellings(&mut self, line: usize, words: HashMap<String, Vec<String>>) {
         if line >= self.misspelled_by_line.len() {
-            self.misspelled_by_line.resize_with(line + 1, HashSet::new);
+            self.misspelled_by_line.resize_with(line + 1, HashMap::new);
         }
         self.misspelled_by_line[line] = words;
     }
@@ -262,8 +263,25 @@ impl ComposeState {
     /// after an edit that changes the line count (Enter, or a
     /// line-joining Backspace), since that shifts every later line's
     /// index and a single-line patch could land on the wrong line.
-    pub fn set_all_misspellings(&mut self, by_line: Vec<HashSet<String>>) {
+    pub fn set_all_misspellings(&mut self, by_line: Vec<HashMap<String, Vec<String>>>) {
         self.misspelled_by_line = by_line;
+    }
+
+    /// The misspelled word the cursor is currently on or just after in
+    /// the body, if any, paired with Hunspell's suggested corrections for
+    /// it — what the "did you mean?" popup (see `ui/compose.rs`) needs to
+    /// know whether to show and what to list. `None` when the body isn't
+    /// focused (stale cursor position), the cursor isn't on a word, or
+    /// that word isn't flagged.
+    pub fn misspelled_word_at_cursor(&self) -> Option<(&str, &[String])> {
+        if self.focus != ComposeField::Body {
+            return None;
+        }
+        let line = self.body.lines.get(self.body.cursor_row)?;
+        let word = crate::spellcheck::word_at_cursor(line, self.body.cursor_col)?;
+        let key = crate::spellcheck::normalize_word(word);
+        let suggestions = self.misspelled_by_line.get(self.body.cursor_row)?.get(&key)?;
+        Some((word, suggestions.as_slice()))
     }
 }
 
@@ -918,14 +936,20 @@ mod tests {
 
     // -- compose spellcheck per-line state --------------------------------
 
+    /// A one-entry misspelling map, as `set_line_misspellings`/
+    /// `set_all_misspellings` take — `word` mapped to `suggestions`.
+    fn misspelling(word: &str, suggestions: &[&str]) -> HashMap<String, Vec<String>> {
+        HashMap::from([(word.to_string(), suggestions.iter().map(|s| s.to_string()).collect())])
+    }
+
     #[test]
     fn set_line_misspellings_patches_only_the_targeted_line() {
         let mut compose = ComposeState::blank();
-        compose.set_line_misspellings(0, ["wrold".to_string()].into_iter().collect());
-        compose.set_line_misspellings(1, ["tset".to_string()].into_iter().collect());
+        compose.set_line_misspellings(0, misspelling("wrold", &["world"]));
+        compose.set_line_misspellings(1, misspelling("tset", &["test"]));
 
-        assert_eq!(compose.misspelled_by_line[0], ["wrold".to_string()].into_iter().collect());
-        assert_eq!(compose.misspelled_by_line[1], ["tset".to_string()].into_iter().collect());
+        assert_eq!(compose.misspelled_by_line[0], misspelling("wrold", &["world"]));
+        assert_eq!(compose.misspelled_by_line[1], misspelling("tset", &["test"]));
     }
 
     #[test]
@@ -933,23 +957,62 @@ mod tests {
         let mut compose = ComposeState::blank();
         assert!(compose.misspelled_by_line.is_empty());
 
-        compose.set_line_misspellings(2, ["oops".to_string()].into_iter().collect());
+        compose.set_line_misspellings(2, misspelling("oops", &[]));
 
         assert_eq!(compose.misspelled_by_line.len(), 3, "earlier lines must be backfilled empty");
         assert!(compose.misspelled_by_line[0].is_empty());
         assert!(compose.misspelled_by_line[1].is_empty());
-        assert_eq!(compose.misspelled_by_line[2], ["oops".to_string()].into_iter().collect());
+        assert_eq!(compose.misspelled_by_line[2], misspelling("oops", &[]));
     }
 
     #[test]
     fn set_all_misspellings_replaces_the_whole_vec_wholesale() {
         let mut compose = ComposeState::blank();
-        compose.set_line_misspellings(0, ["stale".to_string()].into_iter().collect());
+        compose.set_line_misspellings(0, misspelling("stale", &[]));
 
-        compose.set_all_misspellings(vec![HashSet::new(), ["fresh".to_string()].into_iter().collect()]);
+        compose.set_all_misspellings(vec![HashMap::new(), misspelling("fresh", &["fresher"])]);
 
         assert_eq!(compose.misspelled_by_line.len(), 2);
         assert!(compose.misspelled_by_line[0].is_empty(), "the stale single-line entry must be gone");
-        assert_eq!(compose.misspelled_by_line[1], ["fresh".to_string()].into_iter().collect());
+        assert_eq!(compose.misspelled_by_line[1], misspelling("fresh", &["fresher"]));
+    }
+
+    // -- misspelled_word_at_cursor ------------------------------------------
+
+    #[test]
+    fn misspelled_word_at_cursor_finds_suggestions_for_the_flagged_word_the_cursor_is_on() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::Body;
+        for c in "hello wrold".chars() {
+            compose.body.insert(c);
+        }
+        compose.set_line_misspellings(0, misspelling("wrold", &["world", "wold"]));
+
+        let (word, suggestions) = compose.misspelled_word_at_cursor().unwrap();
+        assert_eq!(word, "wrold");
+        assert_eq!(suggestions, ["world".to_string(), "wold".to_string()]);
+    }
+
+    #[test]
+    fn misspelled_word_at_cursor_is_none_when_the_cursor_is_on_a_correctly_spelled_word() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::Body;
+        for c in "hello world".chars() {
+            compose.body.insert(c);
+        }
+        compose.set_line_misspellings(0, misspelling("wrold", &["world"]));
+
+        assert_eq!(compose.misspelled_word_at_cursor(), None);
+    }
+
+    #[test]
+    fn misspelled_word_at_cursor_is_none_outside_the_body_field() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::Subject;
+        compose.body.lines = vec!["wrold".to_string()];
+        compose.body.cursor_col = 5;
+        compose.set_line_misspellings(0, misspelling("wrold", &["world"]));
+
+        assert_eq!(compose.misspelled_word_at_cursor(), None, "a non-Body focus means a stale cursor position");
     }
 }
