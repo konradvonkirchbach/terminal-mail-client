@@ -32,6 +32,11 @@ CREATE TABLE messages (
     flagged             INTEGER NOT NULL DEFAULT 0,
     deleted             INTEGER NOT NULL DEFAULT 0,
     draft               INTEGER NOT NULL DEFAULT 0,
+    -- No longer written or read by the app (it could only ever be false —
+    -- envelope sync fetches headers only, never BODYSTRUCTURE — so real
+    -- attachment detection would be a fetch-shape change, not a rename).
+    -- Left in place rather than migrated away: an unused DEFAULT 0 column
+    -- costs nothing, and dropping it isn't worth a schema migration.
     has_attachments     INTEGER NOT NULL DEFAULT 0,
     raw_path            TEXT,
     UNIQUE(folder_id, uid)

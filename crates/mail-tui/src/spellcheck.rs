@@ -230,22 +230,47 @@ impl Drop for SpellChecker {
     }
 }
 
+/// What compose is asking to have (re)checked next. A single line is the
+/// common case — most edits (typing, backspacing within a line) touch
+/// exactly one — cheap enough to run on every keystroke since it's one
+/// line rather than the whole message. `Full` is used instead after an
+/// edit that changes the line count (Enter, or a line-joining
+/// Backspace), since that shifts every later line's index and a
+/// single-line patch could no longer land on the right one.
+#[derive(Clone, Default)]
+pub enum SpellCheckRequest {
+    #[default]
+    None,
+    Line {
+        index: usize,
+        text: String,
+    },
+    Full(String),
+}
+
 /// A handle to the background task that owns the running `SpellChecker`
 /// and feeds it text — cheap to hold onto and send requests through.
 pub struct SpellCheckHandle {
-    request_tx: watch::Sender<String>,
+    request_tx: watch::Sender<SpellCheckRequest>,
 }
 
 impl SpellCheckHandle {
-    pub fn new(request_tx: watch::Sender<String>) -> Self {
+    pub fn new(request_tx: watch::Sender<SpellCheckRequest>) -> Self {
         Self { request_tx }
     }
 
-    /// Queues `text` to be checked. Cheap and non-blocking: a request
-    /// that arrives before the previous one was even picked up simply
-    /// replaces it — only the latest body text is ever worth checking.
-    pub fn request(&self, text: String) {
-        let _ = self.request_tx.send(text);
+    /// Queues a recheck of just one body line. Cheap and non-blocking: a
+    /// request that arrives before the previous one was even picked up
+    /// simply replaces it — only the latest state is ever worth checking.
+    pub fn request_line(&self, index: usize, text: String) {
+        let _ = self.request_tx.send(SpellCheckRequest::Line { index, text });
+    }
+
+    /// Queues a recheck of the whole body, line by line — used when an
+    /// edit changed the line count, so per-line indices from before it
+    /// can no longer be trusted.
+    pub fn request_full(&self, text: String) {
+        let _ = self.request_tx.send(SpellCheckRequest::Full(text));
     }
 }
 
@@ -261,16 +286,13 @@ pub fn normalize_word(word: &str) -> String {
     word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
 }
 
-/// Checks every line of `text`, returning the normalized set of every
-/// word flagged as misspelled anywhere in it — the shape compose's
-/// rendering wants for a case-insensitive, punctuation-insensitive
-/// lookup.
-pub async fn check_text(checker: &mut SpellChecker, text: &str) -> io::Result<HashSet<String>> {
+/// Checks one line, returning the normalized set of every word flagged
+/// as misspelled in it — the shape compose's rendering wants for a
+/// case-insensitive, punctuation-insensitive lookup.
+pub async fn check_one_line(checker: &mut SpellChecker, line: &str) -> io::Result<HashSet<String>> {
     let mut words = HashSet::new();
-    for line in text.lines() {
-        for m in checker.check_line(line).await? {
-            words.insert(normalize_word(&m.word));
-        }
+    for m in checker.check_line(line).await? {
+        words.insert(normalize_word(&m.word));
     }
     Ok(words)
 }

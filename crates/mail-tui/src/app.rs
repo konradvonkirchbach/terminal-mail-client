@@ -52,6 +52,56 @@ pub enum ComposeField {
     Body,
 }
 
+/// A list paired with which entry is currently highlighted — the shape
+/// shared by compose's attachment list and its recipient-suggestion
+/// dropdown. Grouping it once here keeps `ComposeState` from
+/// re-deriving "list + selected index" bookkeeping (clamping on
+/// removal, moving up/down) for each new feature that needs it.
+pub struct Selectable<T> {
+    pub items: Vec<T>,
+    pub selected: usize,
+}
+
+impl<T> Default for Selectable<T> {
+    fn default() -> Self {
+        Self { items: Vec::new(), selected: 0 }
+    }
+}
+
+impl<T> Selectable<T> {
+    pub fn selected_item(&self) -> Option<&T> {
+        self.items.get(self.selected)
+    }
+
+    /// Removes the highlighted item, clamping the selection back onto
+    /// the last remaining one if it just fell out of bounds. A no-op on
+    /// an empty list.
+    pub fn remove_selected(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.items.remove(self.selected);
+        if self.selected >= self.items.len() {
+            self.selected = self.items.len().saturating_sub(1);
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn move_down(&mut self) {
+        if !self.items.is_empty() {
+            self.selected = (self.selected + 1).min(self.items.len() - 1);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.selected = 0;
+    }
+}
+
 pub struct ComposeState {
     pub to: TextInput,
     pub cc: TextInput,
@@ -59,20 +109,22 @@ pub struct ComposeState {
     pub subject: TextInput,
     pub body: TextArea,
     pub focus: ComposeField,
-    pub attachments: Vec<AttachmentEntry>,
-    pub attachment_selected: usize,
+    pub attachments: Selectable<AttachmentEntry>,
     pub sending: bool,
     pub error: Option<String>,
     /// Fuzzy-matched sender suggestions for whatever's typed after the
     /// last comma in the currently focused recipient field (To/Cc/Bcc);
     /// empty hides the dropdown. Recomputed by `refresh_suggestions`.
-    pub suggestions: Vec<Address>,
-    pub suggestion_selected: usize,
-    /// Lowercased words the spellchecker flagged anywhere in the body,
-    /// refreshed asynchronously after each edit — checked against on
-    /// render to underline them. Always empty when spellcheck is
-    /// disabled (no matching dictionary found for this session).
-    pub misspelled: HashSet<String>,
+    pub suggestions: Selectable<Address>,
+    /// Misspelled words per body line, index-aligned with `body.lines`.
+    /// Most edits patch just the edited line (see `main.rs`'s spellcheck
+    /// wiring); an edit that changes the line count (Enter, or a
+    /// line-joining Backspace) replaces the whole vec instead, since
+    /// that shifts every later line's index. May be shorter than
+    /// `body.lines` right after such an edit until the pending recheck
+    /// result arrives — treated as "nothing flagged yet" rather than an
+    /// error wherever it's read.
+    pub misspelled_by_line: Vec<HashSet<String>>,
 }
 
 impl ComposeState {
@@ -84,13 +136,11 @@ impl ComposeState {
             subject: TextInput::default(),
             body: TextArea::default(),
             focus: ComposeField::To,
-            attachments: Vec::new(),
-            attachment_selected: 0,
+            attachments: Selectable::default(),
             sending: false,
             error: None,
-            suggestions: Vec::new(),
-            suggestion_selected: 0,
-            misspelled: HashSet::new(),
+            suggestions: Selectable::default(),
+            misspelled_by_line: Vec::new(),
         }
     }
 
@@ -148,17 +198,7 @@ impl ComposeState {
     }
 
     pub fn attachments_total_bytes(&self) -> u64 {
-        self.attachments.iter().map(|a| a.size_bytes).sum()
-    }
-
-    pub fn remove_selected_attachment(&mut self) {
-        if self.attachments.is_empty() {
-            return;
-        }
-        self.attachments.remove(self.attachment_selected);
-        if self.attachment_selected >= self.attachments.len() {
-            self.attachment_selected = self.attachments.len().saturating_sub(1);
-        }
+        self.attachments.items.iter().map(|a| a.size_bytes).sum()
     }
 
     /// Recomputes `suggestions` against whatever's typed after the last
@@ -166,18 +206,18 @@ impl ComposeState {
     /// focus change. Clears immediately outside To/Cc/Bcc, or when that
     /// fragment is empty (nothing to suggest against yet).
     pub fn refresh_suggestions(&mut self, known_senders: &[Address]) {
-        self.suggestion_selected = 0;
+        self.suggestions.selected = 0;
         let field_value = match self.focus {
             ComposeField::To => &self.to.value,
             ComposeField::Cc => &self.cc.value,
             ComposeField::Bcc => &self.bcc.value,
             ComposeField::Subject | ComposeField::Attachments | ComposeField::Body => {
-                self.suggestions.clear();
+                self.suggestions.items.clear();
                 return;
             }
         };
         let query = field_value.rsplit(',').next().unwrap_or("").trim();
-        self.suggestions = if query.is_empty() {
+        self.suggestions.items = if query.is_empty() {
             Vec::new()
         } else {
             crate::fuzzy::best_matches(query, known_senders, MAX_RECIPIENT_SUGGESTIONS)
@@ -189,7 +229,7 @@ impl ComposeState {
     /// leaving a trailing ", " ready for the next address. A no-op
     /// outside To/Cc/Bcc, or when there's nothing selected to accept.
     pub fn accept_suggestion(&mut self) {
-        let Some(chosen) = self.suggestions.get(self.suggestion_selected).cloned() else {
+        let Some(chosen) = self.suggestions.selected_item().cloned() else {
             return;
         };
         let field = match self.focus {
@@ -205,7 +245,25 @@ impl ComposeState {
         field.value = format!("{prefix}{chosen}, ");
         field.cursor = field.value.chars().count();
         self.suggestions.clear();
-        self.suggestion_selected = 0;
+    }
+
+    /// Replaces one body line's flagged words — the common case, since
+    /// most edits (typing or backspacing within a line) don't change the
+    /// line count. Grows the vec if needed rather than requiring it to
+    /// already be exactly the right length.
+    pub fn set_line_misspellings(&mut self, line: usize, words: HashSet<String>) {
+        if line >= self.misspelled_by_line.len() {
+            self.misspelled_by_line.resize_with(line + 1, HashSet::new);
+        }
+        self.misspelled_by_line[line] = words;
+    }
+
+    /// Replaces every line's flagged words at once, in line order — used
+    /// after an edit that changes the line count (Enter, or a
+    /// line-joining Backspace), since that shifts every later line's
+    /// index and a single-line patch could land on the wrong line.
+    pub fn set_all_misspellings(&mut self, by_line: Vec<HashSet<String>>) {
+        self.misspelled_by_line = by_line;
     }
 }
 
@@ -448,7 +506,6 @@ mod tests {
             to: Vec::new(),
             date: None,
             flags: Flags::default(),
-            has_attachments: false,
         }
     }
 
@@ -738,8 +795,8 @@ mod tests {
 
         compose.refresh_suggestions(&senders());
 
-        assert_eq!(compose.suggestions.len(), 1);
-        assert_eq!(compose.suggestions[0].email, "alice@example.com");
+        assert_eq!(compose.suggestions.items.len(), 1);
+        assert_eq!(compose.suggestions.items[0].email, "alice@example.com");
     }
 
     #[test]
@@ -750,7 +807,7 @@ mod tests {
 
         compose.refresh_suggestions(&senders());
 
-        assert!(compose.suggestions.is_empty());
+        assert!(compose.suggestions.items.is_empty());
     }
 
     #[test]
@@ -761,7 +818,7 @@ mod tests {
 
         compose.refresh_suggestions(&senders());
 
-        assert!(compose.suggestions.is_empty());
+        assert!(compose.suggestions.items.is_empty());
     }
 
     #[test]
@@ -770,13 +827,13 @@ mod tests {
         compose.focus = ComposeField::To;
         compose.to = TextInput::with_value("ali".to_string());
         compose.refresh_suggestions(&senders());
-        assert_eq!(compose.suggestions.len(), 1);
+        assert_eq!(compose.suggestions.items.len(), 1);
 
         compose.accept_suggestion();
 
         assert_eq!(compose.to.value, "Alice Doe <alice@example.com>, ");
         assert_eq!(compose.to.cursor, compose.to.value.chars().count());
-        assert!(compose.suggestions.is_empty());
+        assert!(compose.suggestions.items.is_empty());
     }
 
     #[test]
@@ -797,10 +854,102 @@ mod tests {
         compose.focus = ComposeField::To;
         compose.to = TextInput::with_value("zzz_no_match".to_string());
         compose.refresh_suggestions(&senders());
-        assert!(compose.suggestions.is_empty());
+        assert!(compose.suggestions.items.is_empty());
 
         compose.accept_suggestion();
 
         assert_eq!(compose.to.value, "zzz_no_match");
+    }
+
+    // -- Selectable<T> ---------------------------------------------------
+
+    #[test]
+    fn selectable_move_up_and_down_clamp_at_the_list_bounds() {
+        let mut s = Selectable { items: vec!['a', 'b', 'c'], selected: 0 };
+        s.move_up();
+        assert_eq!(s.selected, 0, "move_up must not go below 0");
+
+        s.move_down();
+        s.move_down();
+        s.move_down();
+        assert_eq!(s.selected, 2, "move_down must clamp at the last item");
+    }
+
+    #[test]
+    fn selectable_move_up_and_down_on_an_empty_list_do_nothing() {
+        let mut s: Selectable<char> = Selectable::default();
+        s.move_down();
+        assert_eq!(s.selected, 0);
+        s.move_up();
+        assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn selectable_remove_selected_clamps_onto_the_new_last_item() {
+        let mut s = Selectable { items: vec!['a', 'b', 'c'], selected: 2 };
+        s.remove_selected();
+        assert_eq!(s.items, vec!['a', 'b']);
+        assert_eq!(s.selected, 1, "selection must move back onto the new last item");
+    }
+
+    #[test]
+    fn selectable_remove_selected_on_an_empty_list_is_a_no_op() {
+        let mut s: Selectable<char> = Selectable::default();
+        s.remove_selected();
+        assert!(s.items.is_empty());
+    }
+
+    #[test]
+    fn selectable_selected_item_reflects_the_current_index() {
+        let s = Selectable { items: vec!['a', 'b', 'c'], selected: 1 };
+        assert_eq!(s.selected_item(), Some(&'b'));
+
+        let empty: Selectable<char> = Selectable::default();
+        assert_eq!(empty.selected_item(), None);
+    }
+
+    #[test]
+    fn selectable_clear_empties_the_list_and_resets_the_selection() {
+        let mut s = Selectable { items: vec!['a', 'b'], selected: 1 };
+        s.clear();
+        assert!(s.items.is_empty());
+        assert_eq!(s.selected, 0);
+    }
+
+    // -- compose spellcheck per-line state --------------------------------
+
+    #[test]
+    fn set_line_misspellings_patches_only_the_targeted_line() {
+        let mut compose = ComposeState::blank();
+        compose.set_line_misspellings(0, ["wrold".to_string()].into_iter().collect());
+        compose.set_line_misspellings(1, ["tset".to_string()].into_iter().collect());
+
+        assert_eq!(compose.misspelled_by_line[0], ["wrold".to_string()].into_iter().collect());
+        assert_eq!(compose.misspelled_by_line[1], ["tset".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn set_line_misspellings_grows_the_vec_to_fit_a_later_line() {
+        let mut compose = ComposeState::blank();
+        assert!(compose.misspelled_by_line.is_empty());
+
+        compose.set_line_misspellings(2, ["oops".to_string()].into_iter().collect());
+
+        assert_eq!(compose.misspelled_by_line.len(), 3, "earlier lines must be backfilled empty");
+        assert!(compose.misspelled_by_line[0].is_empty());
+        assert!(compose.misspelled_by_line[1].is_empty());
+        assert_eq!(compose.misspelled_by_line[2], ["oops".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn set_all_misspellings_replaces_the_whole_vec_wholesale() {
+        let mut compose = ComposeState::blank();
+        compose.set_line_misspellings(0, ["stale".to_string()].into_iter().collect());
+
+        compose.set_all_misspellings(vec![HashSet::new(), ["fresh".to_string()].into_iter().collect()]);
+
+        assert_eq!(compose.misspelled_by_line.len(), 2);
+        assert!(compose.misspelled_by_line[0].is_empty(), "the stale single-line entry must be gone");
+        assert_eq!(compose.misspelled_by_line[1], ["fresh".to_string()].into_iter().collect());
     }
 }

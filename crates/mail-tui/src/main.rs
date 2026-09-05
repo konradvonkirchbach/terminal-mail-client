@@ -9,6 +9,7 @@ mod spellcheck;
 mod theme;
 mod ui;
 
+use std::future::Future;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -63,6 +64,18 @@ impl Accounts {
     }
 }
 
+/// Everything key-handling needs beyond the specific key itself and the
+/// mutable `App` UI state: the account list, the channel back to this
+/// event loop, and whichever optional session-scoped background
+/// capabilities (like spellcheck) happen to be available. Grouped here
+/// instead of as separate parameters so the next such capability doesn't
+/// grow every key-handling function's signature again.
+struct Session {
+    accounts: Accounts,
+    tx: mpsc::Sender<BgMsg>,
+    spellcheck: Option<spellcheck::SpellCheckHandle>,
+}
+
 enum BgMsg {
     /// A sync finished (or failed) for some account — carries the
     /// freshly re-read cached envelope list so the UI never has to
@@ -92,11 +105,18 @@ enum BgMsg {
     /// compose's recipient autocomplete. A failure is silently dropped —
     /// suggestions are a nice-to-have, not worth a status-bar error.
     KnownSenders { account_id: i64, result: Result<Vec<Address>, String> },
-    /// A spellcheck pass over the compose body finished — carries every
-    /// misspelled word found (lowercased), replacing whatever was
-    /// flagged before. Not tagged to a particular compose session: if
-    /// compose has since closed, this is simply dropped.
-    SpellCheckDone(std::collections::HashSet<String>),
+    /// A spellcheck pass over a single body line finished — `line` is
+    /// which one (patched in place, since most edits don't shift line
+    /// indices). Not tagged to a particular compose session: if compose
+    /// has since closed, or its line count has since changed underneath
+    /// this now-stale index, `set_line_misspellings` just grows to fit
+    /// or the message is silently dropped.
+    SpellCheckLine { line: usize, words: std::collections::HashSet<String> },
+    /// A spellcheck pass over the whole body finished — one entry per
+    /// line, in order, wholesale-replacing the compose's per-line state.
+    /// Sent instead of `SpellCheckLine` after an edit that changes the
+    /// line count, since a single patched index could no longer line up.
+    SpellCheckFull(Vec<std::collections::HashSet<String>>),
 }
 
 fn init_tracing() -> anyhow::Result<()> {
@@ -193,7 +213,7 @@ async fn run(
         .as_deref()
         .and_then(|email| list.iter().position(|a| a.account.config.email == email))
         .unwrap_or(0);
-    let mut accounts = Accounts { list, current };
+    let accounts = Accounts { list, current };
 
     let mut app = App::new(accounts.list.iter().map(|a| a.account.config.email.clone()).collect());
     app.current_account = accounts.current;
@@ -232,14 +252,16 @@ async fn run(
         ));
     }
 
+    let mut session = Session { accounts, tx, spellcheck: spellcheck_handle };
+
     // Every account gets synced (and its outbox flushed) concurrently at
     // startup, not just whichever is currently shown — so switching to
     // one later is likely to already have fresh data waiting in the
     // cache instead of starting cold. Each also gets its own persistent
     // IDLE connection so new mail shows up as it arrives rather than only
     // on the next manual/account-switch sync.
-    for account in &accounts.list {
-        spawn_sync(account.clone(), tx.clone());
+    for account in &session.accounts.list {
+        spawn_sync(account.clone(), session.tx.clone());
         spawn_flush_outbox(account.clone());
         tokio::spawn(mail_core::idle::run(
             account.account.clone(),
@@ -280,7 +302,7 @@ async fn run(
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        handle_key(&mut app, key.code, key.modifiers, &mut accounts, tx.clone(), &spellcheck_handle);
+                        handle_key(&mut app, key.code, key.modifiers, &mut session);
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
@@ -292,7 +314,7 @@ async fn run(
             msg = rx.recv() => {
                 match msg {
                     Some(BgMsg::SyncDone { account_id, result }) => {
-                        if account_id != accounts.current().account_id {
+                        if account_id != session.accounts.current().account_id {
                             // Synced quietly in the background; the cache
                             // is updated either way, so switching to this
                             // account later will pick it up fresh.
@@ -310,7 +332,7 @@ async fn run(
                                         .unwrap_or(0);
                                     // A sync can introduce new senders —
                                     // keep compose's autocomplete current.
-                                    spawn_known_senders(accounts.current().clone(), tx.clone());
+                                    spawn_known_senders(session.accounts.current().clone(), session.tx.clone());
                                 }
                                 Err(e) => {
                                     tracing::error!("sync failed: {e}");
@@ -319,7 +341,7 @@ async fn run(
                             }
                         }
                     }
-                    Some(BgMsg::AccountEnvelopes { account_id, result }) if account_id == accounts.current().account_id => {
+                    Some(BgMsg::AccountEnvelopes { account_id, result }) if account_id == session.accounts.current().account_id => {
                         match result {
                             Ok(envelopes) => {
                                 app.list_state = if envelopes.is_empty() { ListState::Loading } else { ListState::Loaded };
@@ -330,13 +352,13 @@ async fn run(
                     }
                     Some(BgMsg::AccountEnvelopes { .. }) => {}
                     Some(BgMsg::Body { account_id, uid, result: Ok(message) })
-                        if account_id == accounts.current().account_id && app.selected_uid() == Some(uid) =>
+                        if account_id == session.accounts.current().account_id && app.selected_uid() == Some(uid) =>
                     {
                         app.selected_attachment = 0;
                         app.body = BodyState::Loaded(message);
                     }
                     Some(BgMsg::Body { account_id, uid, result: Err(e) })
-                        if account_id == accounts.current().account_id && app.selected_uid() == Some(uid) =>
+                        if account_id == session.accounts.current().account_id && app.selected_uid() == Some(uid) =>
                     {
                         tracing::error!("fetching body for uid {uid} failed: {e}");
                         app.body = BodyState::Error(e);
@@ -356,7 +378,7 @@ async fn run(
                             compose.error = Some(e);
                         }
                     }
-                    Some(BgMsg::MessageDeleted { account_id, uid, result }) if account_id == accounts.current().account_id => {
+                    Some(BgMsg::MessageDeleted { account_id, uid, result }) if account_id == session.accounts.current().account_id => {
                         match result {
                             Ok(()) => {
                                 app.remove_envelope(uid);
@@ -370,12 +392,12 @@ async fn run(
                     }
                     Some(BgMsg::MessageDeleted { .. }) => {}
                     Some(BgMsg::FetchedOlder { account_id, result })
-                        if account_id == accounts.current().account_id =>
+                        if account_id == session.accounts.current().account_id =>
                     {
                         app.loading_more = false;
                         match result {
                             Ok(0) => app.has_more_older = false,
-                            Ok(_) => spawn_account_envelopes(accounts.current().clone(), tx.clone()),
+                            Ok(_) => spawn_account_envelopes(session.accounts.current().clone(), session.tx.clone()),
                             Err(e) => {
                                 tracing::error!("fetch older failed: {e}");
                                 app.set_status(format!("Couldn't load more mail: {e}"));
@@ -384,18 +406,23 @@ async fn run(
                     }
                     Some(BgMsg::FetchedOlder { .. }) => {}
                     Some(BgMsg::KnownSenders { account_id, result: Ok(senders) })
-                        if account_id == accounts.current().account_id =>
+                        if account_id == session.accounts.current().account_id =>
                     {
                         app.known_senders = senders;
                     }
                     Some(BgMsg::KnownSenders { .. }) => {}
-                    Some(BgMsg::SpellCheckDone(words)) => {
+                    Some(BgMsg::SpellCheckLine { line, words }) => {
                         if let Some(compose) = &mut app.compose {
-                            compose.misspelled = words;
+                            compose.set_line_misspellings(line, words);
+                        }
+                    }
+                    Some(BgMsg::SpellCheckFull(by_line)) => {
+                        if let Some(compose) = &mut app.compose {
+                            compose.set_all_misspellings(by_line);
                         }
                     }
                     Some(BgMsg::RemoteSearchDone { account_id, query, result }) => {
-                        let still_relevant = account_id == accounts.current().account_id
+                        let still_relevant = account_id == session.accounts.current().account_id
                             && app.search.as_ref().is_some_and(|s| s.value.trim() == query);
                         if still_relevant {
                             match result {
@@ -435,13 +462,13 @@ async fn run(
                 // account currently being viewed. A background account's
                 // cache is still updated either way, ready for whenever
                 // the user switches to it.
-                if account_id == accounts.current().account_id {
-                    spawn_account_envelopes(accounts.current().clone(), tx.clone());
-                    spawn_known_senders(accounts.current().clone(), tx.clone());
+                if account_id == session.accounts.current().account_id {
+                    spawn_account_envelopes(session.accounts.current().clone(), session.tx.clone());
+                    spawn_known_senders(session.accounts.current().clone(), session.tx.clone());
                 }
                 // Notifications fire regardless of which account is being
                 // viewed — arguably more useful for one that isn't.
-                if let Some(account) = accounts.list.iter().find(|a| a.account_id == account_id) {
+                if let Some(account) = session.accounts.list.iter().find(|a| a.account_id == account_id) {
                     desktop_notify::notify_new_mail(&account.account.config.email, &new_envelopes);
                 }
             }
@@ -453,33 +480,26 @@ async fn run(
     }
 }
 
-fn handle_key(
-    app: &mut App,
-    code: KeyCode,
-    modifiers: KeyModifiers,
-    accounts: &mut Accounts,
-    tx: mpsc::Sender<BgMsg>,
-    spellcheck_handle: &Option<spellcheck::SpellCheckHandle>,
-) {
+fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session: &mut Session) {
     if app.file_browser.is_some() {
         handle_browser_key(app, code);
         return;
     }
 
     if app.compose.is_some() {
-        handle_compose_key(app, code, modifiers, accounts.current(), tx, spellcheck_handle);
+        handle_compose_key(app, code, modifiers, session);
         return;
     }
 
     if app.search_editing {
-        handle_search_key(app, code, accounts, tx);
+        handle_search_key(app, code, session);
         return;
     }
 
     if let Some(uid) = app.confirm_delete.take() {
         if matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
             app.set_status("Deleting...".to_string());
-            spawn_delete_message(accounts.current().clone(), uid, tx);
+            spawn_delete_message(session.accounts.current().clone(), uid, session.tx.clone());
         }
         return;
     }
@@ -501,7 +521,7 @@ fn handle_key(
         }
         KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('n') => {
             app.select_next();
-            maybe_load_more(app, accounts, &tx);
+            maybe_load_more(app, session);
         }
         KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('N') => app.select_prev(),
         KeyCode::Char('g') => {
@@ -514,17 +534,17 @@ fn handle_key(
         }
         KeyCode::Char('G') => {
             app.select_bottom();
-            maybe_load_more(app, accounts, &tx);
+            maybe_load_more(app, session);
         }
         KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.select_page_down();
-            maybe_load_more(app, accounts, &tx);
+            maybe_load_more(app, session);
         }
         KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.select_page_up(),
         KeyCode::Char('/') => app.start_search(),
         KeyCode::Char('S') => {
             app.list_state = ListState::Loading;
-            spawn_sync(accounts.current().clone(), tx);
+            spawn_sync(session.accounts.current().clone(), session.tx.clone());
         }
         KeyCode::Char('c') => {
             app.status_message = None;
@@ -540,7 +560,7 @@ fn handle_key(
         KeyCode::Enter => {
             if let Some(uid) = app.selected_uid() {
                 app.body = BodyState::Loading;
-                spawn_fetch_body(accounts.current().clone(), uid, tx);
+                spawn_fetch_body(session.accounts.current().clone(), uid, session.tx.clone());
             }
         }
         KeyCode::Char('[') => {
@@ -563,22 +583,21 @@ fn handle_key(
                 app.confirm_delete = Some(uid);
             }
         }
-        KeyCode::Char('D') => set_default_account(app, accounts),
-        KeyCode::Tab if accounts.list.len() > 1 => {
-            switch_account(app, accounts, (accounts.current + 1) % accounts.list.len(), tx);
+        KeyCode::Char('D') => set_default_account(app, session),
+        KeyCode::Tab if session.accounts.list.len() > 1 => {
+            switch_account(app, session, (session.accounts.current + 1) % session.accounts.list.len());
         }
-        KeyCode::BackTab if accounts.list.len() > 1 => {
+        KeyCode::BackTab if session.accounts.list.len() > 1 => {
             switch_account(
                 app,
-                accounts,
-                (accounts.current + accounts.list.len() - 1) % accounts.list.len(),
-                tx,
+                session,
+                (session.accounts.current + session.accounts.list.len() - 1) % session.accounts.list.len(),
             );
         }
         KeyCode::Char(c @ '1'..='9') => {
             let idx = c as usize - '1' as usize;
-            if idx < accounts.list.len() && idx != accounts.current {
-                switch_account(app, accounts, idx, tx);
+            if idx < session.accounts.list.len() && idx != session.accounts.current {
+                switch_account(app, session, idx);
             }
         }
         _ => {}
@@ -589,15 +608,15 @@ fn handle_key(
 /// specific to the previous one, and kicks off both a cache read (fast,
 /// for the "instant" feel) and a fresh sync (in case it's gone stale
 /// since the startup sync).
-fn switch_account(app: &mut App, accounts: &mut Accounts, index: usize, tx: mpsc::Sender<BgMsg>) {
-    accounts.current = index;
+fn switch_account(app: &mut App, session: &mut Session, index: usize) {
+    session.accounts.current = index;
     app.current_account = index;
     app.reset_for_account_switch();
 
-    let ctx = accounts.current().clone();
-    spawn_account_envelopes(ctx.clone(), tx.clone());
-    spawn_known_senders(ctx.clone(), tx.clone());
-    spawn_sync(ctx, tx);
+    let ctx = session.accounts.current().clone();
+    spawn_account_envelopes(ctx.clone(), session.tx.clone());
+    spawn_known_senders(ctx.clone(), session.tx.clone());
+    spawn_sync(ctx, session.tx.clone());
 }
 
 /// Checks whether the selection just landed on the last visible row with
@@ -605,10 +624,10 @@ fn switch_account(app: &mut App, accounts: &mut Accounts, index: usize, tx: mpsc
 /// used by every key that can reach the end of the list (`j`, `G`,
 /// `Ctrl-d`). Only fires against the real, unfiltered list: reaching the
 /// end of a search's matches doesn't mean the cache itself is exhausted.
-fn maybe_load_more(app: &mut App, accounts: &Accounts, tx: &mpsc::Sender<BgMsg>) {
+fn maybe_load_more(app: &mut App, session: &Session) {
     if app.search.is_none() && app.has_more_older && !app.loading_more && app.is_at_end_of_list() {
         app.loading_more = true;
-        spawn_fetch_older(accounts.current().clone(), tx.clone());
+        spawn_fetch_older(session.accounts.current().clone(), session.tx.clone());
     }
 }
 
@@ -639,8 +658,8 @@ fn start_download(app: &mut App) {
 /// on the next launch, persisted straight to config.toml. Local/sync file
 /// I/O, so this stays synchronous rather than round-tripping through a
 /// background task.
-fn set_default_account(app: &mut App, accounts: &Accounts) {
-    let email = accounts.current().account.config.email.clone();
+fn set_default_account(app: &mut App, session: &Session) {
+    let email = session.accounts.current().account.config.email.clone();
     let result = mail_core::config::Config::load().and_then(|mut config| {
         config.default_account = Some(email.clone());
         config.save()
@@ -651,7 +670,7 @@ fn set_default_account(app: &mut App, accounts: &Accounts) {
     }
 }
 
-fn handle_search_key(app: &mut App, code: KeyCode, accounts: &Accounts, tx: mpsc::Sender<BgMsg>) {
+fn handle_search_key(app: &mut App, code: KeyCode, session: &Session) {
     match code {
         KeyCode::Esc => app.clear_search(),
         KeyCode::Enter => {
@@ -662,7 +681,7 @@ fn handle_search_key(app: &mut App, code: KeyCode, accounts: &Accounts, tx: mpsc
             let query = app.search.as_ref().map(|s| s.value.trim().to_string()).unwrap_or_default();
             if !query.is_empty() && app.visible_indices().is_empty() {
                 app.set_status(format!("Searching server for \"{query}\"..."));
-                spawn_remote_search(accounts.current().clone(), query, tx);
+                spawn_remote_search(session.accounts.current().clone(), query, session.tx.clone());
             }
         }
         KeyCode::Char(c) => {
@@ -691,14 +710,7 @@ fn handle_search_key(app: &mut App, code: KeyCode, accounts: &Accounts, tx: mpsc
     }
 }
 
-fn handle_compose_key(
-    app: &mut App,
-    code: KeyCode,
-    modifiers: KeyModifiers,
-    ctx: &AccountCtx,
-    tx: mpsc::Sender<BgMsg>,
-    spellcheck_handle: &Option<spellcheck::SpellCheckHandle>,
-) {
+fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session: &Session) {
     let Some(compose) = &mut app.compose else { return };
     if compose.sending {
         return;
@@ -710,8 +722,8 @@ fn handle_compose_key(
                 compose.sending = true;
                 compose.error = None;
                 let draft = compose.to_draft();
-                let attachments = compose.attachments.clone();
-                spawn_send(ctx.clone(), draft, attachments, tx);
+                let attachments = compose.attachments.items.clone();
+                spawn_send(session.accounts.current().clone(), draft, attachments, session.tx.clone());
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 app.file_browser = Some((FileBrowser::open(default_browse_dir()), BrowserPurpose::AttachToCompose));
@@ -726,16 +738,15 @@ fn handle_compose_key(
     // else (typing, Backspace, Left/Right, …) falls through unchanged so
     // the fragment being matched keeps updating live.
     let showing_suggestions = matches!(compose.focus, ComposeField::To | ComposeField::Cc | ComposeField::Bcc)
-        && !compose.suggestions.is_empty();
+        && !compose.suggestions.items.is_empty();
     if showing_suggestions {
         match code {
             KeyCode::Up => {
-                compose.suggestion_selected = compose.suggestion_selected.saturating_sub(1);
+                compose.suggestions.move_up();
                 return;
             }
             KeyCode::Down => {
-                compose.suggestion_selected =
-                    (compose.suggestion_selected + 1).min(compose.suggestions.len() - 1);
+                compose.suggestions.move_down();
                 return;
             }
             KeyCode::Enter | KeyCode::Tab => {
@@ -750,6 +761,15 @@ fn handle_compose_key(
         }
     }
 
+    // A Backspace at the very start of a body line joins it with the
+    // previous one, shrinking the line count — captured before the edit
+    // runs so the spellcheck trigger below knows to fall back to a full
+    // recheck instead of patching a single (now wrong) line index.
+    let backspace_will_join_body_lines = compose.focus == ComposeField::Body
+        && code == KeyCode::Backspace
+        && compose.body.cursor_col == 0
+        && compose.body.cursor_row > 0;
+
     match code {
         // Returns immediately rather than falling through to the shared
         // `refresh_suggestions` call below — `compose` no longer points
@@ -763,7 +783,7 @@ fn handle_compose_key(
         KeyCode::Char(c) => edit_field(compose, |f| f.insert(c), |a| a.insert(c)),
         KeyCode::Backspace => {
             if compose.focus == ComposeField::Attachments {
-                compose.remove_selected_attachment();
+                compose.attachments.remove_selected();
             } else {
                 edit_field(compose, TextInput::backspace, TextArea::backspace);
             }
@@ -772,17 +792,12 @@ fn handle_compose_key(
         KeyCode::Right => edit_field(compose, TextInput::right, TextArea::right),
         KeyCode::Up => match compose.focus {
             ComposeField::Body => compose.body.up(),
-            ComposeField::Attachments => {
-                compose.attachment_selected = compose.attachment_selected.saturating_sub(1);
-            }
+            ComposeField::Attachments => compose.attachments.move_up(),
             _ => {}
         },
         KeyCode::Down => match compose.focus {
             ComposeField::Body => compose.body.down(),
-            ComposeField::Attachments if !compose.attachments.is_empty() => {
-                compose.attachment_selected =
-                    (compose.attachment_selected + 1).min(compose.attachments.len() - 1);
-            }
+            ComposeField::Attachments => compose.attachments.move_down(),
             _ => {}
         },
         KeyCode::Enter => match compose.focus {
@@ -794,14 +809,25 @@ fn handle_compose_key(
 
     compose.refresh_suggestions(&app.known_senders);
 
-    // Only the keys that actually change the body's text are worth a
-    // recheck — Left/Right/Up/Down and edits to other fields would just
-    // ask Hunspell to re-scan identical text.
-    let body_mutated = compose.focus == ComposeField::Body
-        && matches!(code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Enter);
-    if body_mutated {
-        if let Some(handle) = spellcheck_handle {
-            handle.request(compose.body.text());
+    // Most edits only touch one body line, so only that line needs a
+    // recheck; an edit that changes the line count (Enter, or a
+    // line-joining Backspace) shifts every later line's index, so that
+    // case rechecks the whole body instead of patching a single line.
+    if compose.focus == ComposeField::Body {
+        if let Some(handle) = &session.spellcheck {
+            match code {
+                KeyCode::Char(_) => {
+                    handle.request_line(compose.body.cursor_row, compose.body.lines[compose.body.cursor_row].clone());
+                }
+                KeyCode::Backspace if backspace_will_join_body_lines => {
+                    handle.request_full(compose.body.text());
+                }
+                KeyCode::Backspace => {
+                    handle.request_line(compose.body.cursor_row, compose.body.lines[compose.body.cursor_row].clone());
+                }
+                KeyCode::Enter => handle.request_full(compose.body.text()),
+                _ => {}
+            }
         }
     }
 }
@@ -923,8 +949,8 @@ fn finish_attach(app: &mut App, path: PathBuf) {
 
     match attach::validate(&path, existing_total) {
         Ok(entry) => {
-            compose.attachments.push(entry);
-            compose.attachment_selected = compose.attachments.len() - 1;
+            compose.attachments.items.push(entry);
+            compose.attachments.selected = compose.attachments.items.len() - 1;
             app.file_browser = None;
         }
         Err(e) => {
@@ -954,45 +980,53 @@ fn confirm_save(app: &mut App) {
     }
 }
 
-fn spawn_sync(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
+/// Spawns `fut` and, once it resolves, hands its `Result` (with the `Err`
+/// reduced to its `Display` string — the shape every `BgMsg` variant's
+/// `result` field uses) to `to_msg` to build the message sent back over
+/// `tx`. Nearly every "kick off some mail-core work in the background,
+/// report one `BgMsg` when it's done" spawn shares exactly this shape;
+/// factoring it out here means the next one is a short call instead of a
+/// copy-pasted `tokio::spawn` block.
+fn spawn_bg<T, E, Fut>(tx: mpsc::Sender<BgMsg>, fut: Fut, to_msg: impl FnOnce(Result<T, String>) -> BgMsg + Send + 'static)
+where
+    Fut: Future<Output = Result<T, E>> + Send + 'static,
+    E: std::fmt::Display,
+    T: Send + 'static,
+{
     tokio::spawn(async move {
-        let sync_result = mail_core::sync::sync_inbox(&ctx.account, &ctx.store).await;
-        let result = match sync_result {
-            Ok(_) => ctx
-                .store
-                .list_envelopes(ctx.folder_id, DISPLAY_LIMIT)
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        let _ = tx.send(BgMsg::SyncDone { account_id: ctx.account_id, result }).await;
+        let result = fut.await.map_err(|e| e.to_string());
+        let _ = tx.send(to_msg(result)).await;
     });
+}
+
+fn spawn_sync(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
+    let account_id = ctx.account_id;
+    spawn_bg(
+        tx,
+        async move {
+            mail_core::sync::sync_inbox(&ctx.account, &ctx.store).await?;
+            ctx.store.list_envelopes(ctx.folder_id, DISPLAY_LIMIT).await
+        },
+        move |result| BgMsg::SyncDone { account_id, result },
+    );
 }
 
 fn spawn_account_envelopes(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
-    tokio::spawn(async move {
-        let result = ctx
-            .store
-            .list_envelopes(ctx.folder_id, DISPLAY_LIMIT)
-            .await
-            .map_err(|e| e.to_string());
-        let _ = tx.send(BgMsg::AccountEnvelopes { account_id: ctx.account_id, result }).await;
-    });
+    let account_id = ctx.account_id;
+    spawn_bg(
+        tx,
+        async move { ctx.store.list_envelopes(ctx.folder_id, DISPLAY_LIMIT).await },
+        move |result| BgMsg::AccountEnvelopes { account_id, result },
+    );
 }
 
 fn spawn_fetch_body(ctx: AccountCtx, uid: u32, tx: mpsc::Sender<BgMsg>) {
-    tokio::spawn(async move {
-        let result = mail_core::sync::fetch_body(
-            &ctx.account,
-            &ctx.store,
-            ctx.account_id,
-            ctx.folder_id,
-            uid,
-        )
-        .await
-        .map_err(|e| e.to_string());
-        let _ = tx.send(BgMsg::Body { account_id: ctx.account_id, uid, result }).await;
-    });
+    let account_id = ctx.account_id;
+    spawn_bg(
+        tx,
+        async move { mail_core::sync::fetch_body(&ctx.account, &ctx.store, ctx.account_id, ctx.folder_id, uid).await },
+        move |result| BgMsg::Body { account_id, uid, result },
+    );
 }
 
 /// How many older messages to backfill per "scrolled to the bottom"
@@ -1000,12 +1034,12 @@ fn spawn_fetch_body(ctx: AccountCtx, uid: u32, tx: mpsc::Sender<BgMsg>) {
 const LOAD_MORE_BATCH: u32 = 50;
 
 fn spawn_fetch_older(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
-    tokio::spawn(async move {
-        let result = mail_core::sync::fetch_older(&ctx.account, &ctx.store, ctx.folder_id, LOAD_MORE_BATCH)
-            .await
-            .map_err(|e| e.to_string());
-        let _ = tx.send(BgMsg::FetchedOlder { account_id: ctx.account_id, result }).await;
-    });
+    let account_id = ctx.account_id;
+    spawn_bg(
+        tx,
+        async move { mail_core::sync::fetch_older(&ctx.account, &ctx.store, ctx.folder_id, LOAD_MORE_BATCH).await },
+        move |result| BgMsg::FetchedOlder { account_id, result },
+    );
 }
 
 /// How many server-side search matches to pull back and cache, newest
@@ -1014,21 +1048,22 @@ fn spawn_fetch_older(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
 const REMOTE_SEARCH_LIMIT: usize = 200;
 
 fn spawn_remote_search(ctx: AccountCtx, query: String, tx: mpsc::Sender<BgMsg>) {
-    tokio::spawn(async move {
-        let result = mail_core::sync::search_remote(&ctx.account, &ctx.store, ctx.folder_id, &query, REMOTE_SEARCH_LIMIT)
-            .await
-            .map_err(|e| e.to_string());
-        let _ = tx
-            .send(BgMsg::RemoteSearchDone { account_id: ctx.account_id, query, result })
-            .await;
-    });
+    let account_id = ctx.account_id;
+    let query_for_msg = query.clone();
+    spawn_bg(
+        tx,
+        async move { mail_core::sync::search_remote(&ctx.account, &ctx.store, ctx.folder_id, &query, REMOTE_SEARCH_LIMIT).await },
+        move |result| BgMsg::RemoteSearchDone { account_id, query: query_for_msg, result },
+    );
 }
 
 fn spawn_known_senders(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
-    tokio::spawn(async move {
-        let result = ctx.store.known_senders(ctx.account_id).await.map_err(|e| e.to_string());
-        let _ = tx.send(BgMsg::KnownSenders { account_id: ctx.account_id, result }).await;
-    });
+    let account_id = ctx.account_id;
+    spawn_bg(
+        tx,
+        async move { ctx.store.known_senders(ctx.account_id).await },
+        move |result| BgMsg::KnownSenders { account_id, result },
+    );
 }
 
 /// Spawns the Hunspell process for the detected system locale (if a
@@ -1043,22 +1078,51 @@ async fn spawn_spellchecker(tx: mpsc::Sender<BgMsg>) -> Option<spellcheck::Spell
     }
     let mut checker = spellcheck::SpellChecker::spawn(&dicts).await.ok()?;
 
-    let (request_tx, mut request_rx) = tokio::sync::watch::channel(String::new());
+    let (request_tx, mut request_rx) = tokio::sync::watch::channel(spellcheck::SpellCheckRequest::default());
     tokio::spawn(async move {
         loop {
             if request_rx.changed().await.is_err() {
                 return; // every SpellCheckHandle was dropped
             }
-            let text = request_rx.borrow_and_update().clone();
-            match spellcheck::check_text(&mut checker, &text).await {
-                Ok(words) => {
-                    let _ = tx.send(BgMsg::SpellCheckDone(words)).await;
+            let request = request_rx.borrow_and_update().clone();
+            let msg = match request {
+                spellcheck::SpellCheckRequest::None => continue,
+                spellcheck::SpellCheckRequest::Line { index, text } => {
+                    match spellcheck::check_one_line(&mut checker, &text).await {
+                        Ok(words) => BgMsg::SpellCheckLine { line: index, words },
+                        Err(e) => {
+                            tracing::warn!("spellcheck failed, disabling for the rest of the session: {e}");
+                            return;
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("spellcheck failed, disabling for the rest of the session: {e}");
-                    return;
+                spellcheck::SpellCheckRequest::Full(text) => {
+                    // `split('\n')` rather than `.lines()`: it's the
+                    // exact inverse of how `TextArea::text()` joins body
+                    // lines, so an empty or trailing-blank line still
+                    // produces the right number of entries to stay
+                    // index-aligned with `body.lines`.
+                    let mut by_line = Vec::new();
+                    let mut failed = None;
+                    for line in text.split('\n') {
+                        match spellcheck::check_one_line(&mut checker, line).await {
+                            Ok(words) => by_line.push(words),
+                            Err(e) => {
+                                failed = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    match failed {
+                        None => BgMsg::SpellCheckFull(by_line),
+                        Some(e) => {
+                            tracing::warn!("spellcheck failed, disabling for the rest of the session: {e}");
+                            return;
+                        }
+                    }
                 }
-            }
+            };
+            let _ = tx.send(msg).await;
         }
     });
 
@@ -1066,12 +1130,12 @@ async fn spawn_spellchecker(tx: mpsc::Sender<BgMsg>) -> Option<spellcheck::Spell
 }
 
 fn spawn_delete_message(ctx: AccountCtx, uid: u32, tx: mpsc::Sender<BgMsg>) {
-    tokio::spawn(async move {
-        let result = mail_core::sync::delete_message(&ctx.account, &ctx.store, ctx.folder_id, uid)
-            .await
-            .map_err(|e| e.to_string());
-        let _ = tx.send(BgMsg::MessageDeleted { account_id: ctx.account_id, uid, result }).await;
-    });
+    let account_id = ctx.account_id;
+    spawn_bg(
+        tx,
+        async move { mail_core::sync::delete_message(&ctx.account, &ctx.store, ctx.folder_id, uid).await },
+        move |result| BgMsg::MessageDeleted { account_id, uid, result },
+    );
 }
 
 fn spawn_send(ctx: AccountCtx, draft: mail_core::Draft, attachments: Vec<AttachmentEntry>, tx: mpsc::Sender<BgMsg>) {

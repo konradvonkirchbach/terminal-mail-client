@@ -186,7 +186,6 @@ fn envelope_from_fetch(f: &Fetch) -> Option<Envelope> {
         to,
         date,
         flags,
-        has_attachments: false,
     })
 }
 

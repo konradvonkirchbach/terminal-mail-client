@@ -83,8 +83,8 @@ pub fn upsert_envelope(conn: &Connection, folder_id: i64, env: &Envelope) -> Res
 
     conn.execute(
         "INSERT INTO messages
-            (folder_id, uid, subject, from_addrs, to_addrs, date, seen, answered, flagged, deleted, draft, has_attachments)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            (folder_id, uid, subject, from_addrs, to_addrs, date, seen, answered, flagged, deleted, draft)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(folder_id, uid) DO UPDATE SET
             subject = excluded.subject,
             from_addrs = excluded.from_addrs,
@@ -94,8 +94,7 @@ pub fn upsert_envelope(conn: &Connection, folder_id: i64, env: &Envelope) -> Res
             answered = excluded.answered,
             flagged = excluded.flagged,
             deleted = excluded.deleted,
-            draft = excluded.draft,
-            has_attachments = excluded.has_attachments",
+            draft = excluded.draft",
         params![
             folder_id,
             env.uid,
@@ -108,7 +107,6 @@ pub fn upsert_envelope(conn: &Connection, folder_id: i64, env: &Envelope) -> Res
             env.flags.flagged,
             env.flags.deleted,
             env.flags.draft,
-            env.has_attachments,
         ],
     )?;
     Ok(())
@@ -133,7 +131,7 @@ pub fn update_message_flags(conn: &Connection, folder_id: i64, uid: u32, flags: 
 
 pub fn list_envelopes(conn: &Connection, folder_id: i64, limit: u32) -> Result<Vec<Envelope>> {
     let mut stmt = conn.prepare(
-        "SELECT uid, subject, from_addrs, to_addrs, date, seen, answered, flagged, deleted, draft, has_attachments
+        "SELECT uid, subject, from_addrs, to_addrs, date, seen, answered, flagged, deleted, draft
          FROM messages WHERE folder_id = ?1 ORDER BY uid DESC LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![folder_id, limit], |row| {
@@ -153,7 +151,6 @@ pub fn list_envelopes(conn: &Connection, folder_id: i64, limit: u32) -> Result<V
                 deleted: row.get(8)?,
                 draft: row.get(9)?,
             },
-            has_attachments: row.get(10)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -360,7 +357,6 @@ mod tests {
             to: vec![Address { name: None, email: "bob@example.com".into() }],
             date: Utc.timestamp_opt(1_700_000_000, 0).single(),
             flags: Flags::default(),
-            has_attachments: false,
         }
     }
 

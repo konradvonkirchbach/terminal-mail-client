@@ -31,7 +31,6 @@ pub struct Envelope {
     pub to: Vec<Address>,
     pub date: Option<DateTime<Utc>>,
     pub flags: Flags,
-    pub has_attachments: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

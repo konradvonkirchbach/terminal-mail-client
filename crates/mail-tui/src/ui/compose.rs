@@ -55,18 +55,18 @@ fn attachments_line(compose: &ComposeState, theme: &Theme) -> Line<'static> {
         label_style,
     )];
 
-    if compose.attachments.is_empty() {
+    if compose.attachments.items.is_empty() {
         spans.push(Span::styled(
             "(none — Ctrl+A to attach)",
             Style::new().fg(theme.muted),
         ));
     } else {
-        for (i, a) in compose.attachments.iter().enumerate() {
+        for (i, a) in compose.attachments.items.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::raw("  "));
             }
             let text = format!("{} ({})", a.filename, attach::human_size(a.size_bytes));
-            let style = if focused && i == compose.attachment_selected {
+            let style = if focused && i == compose.attachments.selected {
                 Style::new().bg(theme.selection).fg(theme.bright_foreground)
             } else {
                 Style::new().fg(theme.foreground)
@@ -113,7 +113,7 @@ fn draw_header(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Th
 /// than shrinking it — this is a transient overlay, not part of the
 /// layout.
 fn draw_suggestions(frame: &mut Frame, header_area: Rect, compose: &ComposeState, theme: &Theme) {
-    if compose.suggestions.is_empty() {
+    if compose.suggestions.items.is_empty() {
         return;
     }
     let Some((row, _)) = focused_input_row(compose) else { return };
@@ -125,13 +125,14 @@ fn draw_suggestions(frame: &mut Frame, header_area: Rect, compose: &ComposeState
     let frame_area = frame.area();
     let content_width = compose
         .suggestions
+        .items
         .iter()
         .map(|a| a.to_string().chars().count() as u16)
         .max()
         .unwrap_or(10)
         .clamp(10, 50);
     let width = (content_width + 2).min(frame_area.width.saturating_sub(x));
-    let height = (compose.suggestions.len() as u16 + 2).min(frame_area.height.saturating_sub(y));
+    let height = (compose.suggestions.items.len() as u16 + 2).min(frame_area.height.saturating_sub(y));
     if width < 3 || height < 3 {
         return; // no room to draw it without corrupting the layout
     }
@@ -139,10 +140,11 @@ fn draw_suggestions(frame: &mut Frame, header_area: Rect, compose: &ComposeState
 
     let items: Vec<ListItem> = compose
         .suggestions
+        .items
         .iter()
         .enumerate()
         .map(|(i, addr)| {
-            let style = if i == compose.suggestion_selected {
+            let style = if i == compose.suggestions.selected {
                 Style::new().bg(theme.selection).fg(theme.bright_foreground)
             } else {
                 Style::new().fg(theme.foreground)
@@ -188,12 +190,17 @@ fn draw_body(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Them
     let scroll_y = (compose.body.cursor_row as u16).saturating_sub(visible_height - 1);
 
     let flagged_style = Style::new().fg(theme.red).add_modifier(Modifier::UNDERLINED);
+    let no_misspellings = HashSet::new();
     let text = Text::from(
         compose
             .body
             .lines
             .iter()
-            .map(|l| spellcheck_line(l, &compose.misspelled, flagged_style))
+            .enumerate()
+            .map(|(i, l)| {
+                let misspelled = compose.misspelled_by_line.get(i).unwrap_or(&no_misspellings);
+                spellcheck_line(l, misspelled, flagged_style)
+            })
             .collect::<Vec<_>>(),
     );
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false }).scroll((scroll_y, 0));
@@ -210,14 +217,14 @@ fn draw_help(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Them
         Line::from(Span::styled("Sending...", Style::new().fg(theme.accent)))
     } else if let Some(err) = &compose.error {
         Line::from(Span::styled(format!("Send failed: {err}"), Style::new().fg(theme.red)))
-    } else if !compose.suggestions.is_empty() {
+    } else if !compose.suggestions.items.is_empty() {
         Line::from(Span::styled(
             "\u{2191}/\u{2193} choose suggestion   Enter/Tab accept   Esc dismiss",
             Style::new().fg(theme.muted),
         ))
     } else {
         let hint = match compose.focus {
-            ComposeField::Attachments if !compose.attachments.is_empty() => {
+            ComposeField::Attachments if !compose.attachments.items.is_empty() => {
                 "Ctrl+A attach   Backspace remove   Tab/Shift+Tab move field   Ctrl+S send   Esc cancel"
             }
             _ => "Tab/Shift+Tab move field   Ctrl+A attach   Ctrl+S send   Esc cancel",
