@@ -123,12 +123,23 @@ impl TextArea {
         }
     }
 
+    pub fn home(&mut self) {
+        self.cursor_col = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.cursor_col = self.lines[self.cursor_row].chars().count();
+    }
+
     pub fn text(&self) -> String {
         self.lines.join("\n")
     }
 }
 
-fn byte_index(s: &str, char_idx: usize) -> usize {
+/// The byte offset of char index `char_idx` in `s`, or `s.len()` when
+/// it's past the end — the conversion every char-indexed cursor in this
+/// crate needs before touching the underlying `String`.
+pub(crate) fn byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
         .map(|(i, _)| i)
@@ -285,5 +296,17 @@ mod tests {
 
         assert_eq!(area.cursor_row, 1);
         assert_eq!(area.cursor_col, 0);
+    }
+
+    #[test]
+    fn home_and_end_jump_to_the_line_bounds_in_chars() {
+        let mut area = TextArea::default();
+        for c in "grüße".chars() {
+            area.insert(c);
+        }
+        area.home();
+        assert_eq!(area.cursor_col, 0);
+        area.end();
+        assert_eq!(area.cursor_col, 5, "end is measured in chars, not bytes");
     }
 }

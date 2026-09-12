@@ -7,6 +7,7 @@ use mail_core::{Address, Draft, Envelope, Message};
 use crate::attach::AttachmentEntry;
 use crate::editable::{TextArea, TextInput};
 use crate::filebrowser::FileBrowser;
+use crate::vim::Vim;
 
 /// Source of `ComposeState::id` — a fresh, process-wide-unique id per
 /// compose session, so an async spellcheck result that outlives its
@@ -51,7 +52,7 @@ pub enum ListState {
     Error(String),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposeField {
     To,
     Cc,
@@ -132,14 +133,21 @@ pub struct ComposeState {
     pub suggestions: Selectable<Address>,
     /// Misspelled words per body line, index-aligned with `body.lines`,
     /// each mapped to Hunspell's suggested corrections for it. Most
-    /// edits patch just the edited line (see `main.rs`'s spellcheck
-    /// wiring); an edit that changes the line count (Enter, or a
-    /// line-joining Backspace) replaces the whole vec instead, since
-    /// that shifts every later line's index. May be shorter than
+    /// edits patch just the edited line (see `body_change` and
+    /// `main.rs`'s spellcheck wiring); an edit that changes the line
+    /// count or touches several lines (`dd`, `J`, `p`, undo, ...)
+    /// replaces the whole vec instead, since that can shift every later
+    /// line's index. May be shorter than
     /// `body.lines` right after such an edit until the pending recheck
     /// result arrives — treated as "nothing flagged yet" rather than an
     /// error wherever it's read.
     pub misspelled_by_line: Vec<HashMap<String, Vec<String>>>,
+    /// The body's modal (vim-style) editor state. Only consulted while the
+    /// body has focus; entering the body starts it in Insert mode.
+    pub vim: Vim,
+    /// A one-shot message for the status line (vim errors, `:q` refusing
+    /// to discard an unsent draft), cleared by the next key.
+    pub notice: Option<String>,
 }
 
 impl ComposeState {
@@ -157,6 +165,8 @@ impl ComposeState {
             error: None,
             suggestions: Selectable::default(),
             misspelled_by_line: Vec::new(),
+            vim: Vim::new(),
+            notice: None,
         }
     }
 
@@ -173,15 +183,18 @@ impl ComposeState {
         } else {
             format!("Re: {}", source.subject)
         };
-        Self {
+        let mut compose = Self {
             to: TextInput::with_value(to),
             subject: TextInput::with_value(subject),
             focus: ComposeField::Body,
             ..Self::blank()
-        }
+        };
+        compose.vim.enter_insert(&compose.body);
+        compose
     }
 
     pub fn next_field(&mut self) {
+        let from = self.focus;
         self.focus = match self.focus {
             ComposeField::To => ComposeField::Cc,
             ComposeField::Cc => ComposeField::Bcc,
@@ -190,9 +203,11 @@ impl ComposeState {
             ComposeField::Attachments => ComposeField::Body,
             ComposeField::Body => ComposeField::To,
         };
+        self.focus_changed_from(from);
     }
 
     pub fn prev_field(&mut self) {
+        let from = self.focus;
         self.focus = match self.focus {
             ComposeField::To => ComposeField::Body,
             ComposeField::Cc => ComposeField::To,
@@ -201,6 +216,34 @@ impl ComposeState {
             ComposeField::Attachments => ComposeField::Subject,
             ComposeField::Body => ComposeField::Attachments,
         };
+        self.focus_changed_from(from);
+    }
+
+    /// Esc from a header field: jump to the body in Normal mode, so `:q`
+    /// / `:wq` are always one keystroke away and Esc never discards.
+    pub fn focus_body_normal(&mut self) {
+        self.focus = ComposeField::Body;
+        self.vim.enter_normal(&mut self.body);
+    }
+
+    /// Keeps the editor's mode in step with focus: arriving in the body
+    /// starts an Insert session (typing just works), leaving it finishes
+    /// whatever was in progress so it lands in the undo history.
+    fn focus_changed_from(&mut self, from: ComposeField) {
+        let body = ComposeField::Body;
+        if from == body && self.focus != body {
+            self.vim.leave(&self.body);
+        } else if from != body && self.focus == body {
+            self.vim.enter_insert(&self.body);
+        }
+    }
+
+    /// Whether there's nothing in this compose worth keeping — `:q` only
+    /// closes a blank one (`:q!` closes anything).
+    pub fn is_blank(&self) -> bool {
+        [&self.to, &self.cc, &self.bcc, &self.subject].iter().all(|f| f.value.trim().is_empty())
+            && self.body.lines.iter().all(|l| l.trim().is_empty())
+            && self.attachments.items.is_empty()
     }
 
     pub fn to_draft(&self) -> Draft {
@@ -519,6 +562,31 @@ impl App {
         self.search = None;
         self.search_editing = false;
         self.selected = 0;
+    }
+}
+
+/// Which body lines an edit touched, as far as spellcheck cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyChange {
+    None,
+    /// Exactly one line changed and the line count didn't: recheck just it.
+    Line(usize),
+    /// The line count changed or several lines did: recheck everything,
+    /// since per-line indices may have shifted.
+    Full,
+}
+
+/// Diffs the body before and after a key, so spellcheck rechecks exactly
+/// what an edit touched — whatever vim command made it (or undid it).
+pub fn body_change(before: &[String], after: &[String]) -> BodyChange {
+    if before.len() != after.len() {
+        return BodyChange::Full;
+    }
+    let mut changed = before.iter().zip(after).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i);
+    match (changed.next(), changed.next()) {
+        (None, _) => BodyChange::None,
+        (Some(row), None) => BodyChange::Line(row),
+        _ => BodyChange::Full,
     }
 }
 
@@ -1122,5 +1190,90 @@ mod tests {
         compose.set_line_misspellings(0, misspelling("wrold", &["world"]));
 
         assert_eq!(compose.misspelled_word_at_cursor(), None, "a non-Body focus means a stale cursor position");
+    }
+
+    // -- body_change ----------------------------------------------------------
+
+    fn lines(text: &str) -> Vec<String> {
+        text.split('\n').map(str::to_string).collect()
+    }
+
+    #[test]
+    fn body_change_reports_no_change_one_line_or_a_full_recheck() {
+        assert_eq!(body_change(&lines("a\nb"), &lines("a\nb")), BodyChange::None);
+        assert_eq!(body_change(&lines("a\nb"), &lines("a\nbx")), BodyChange::Line(1));
+        assert_eq!(body_change(&lines("a\nb"), &lines("ax\nbx")), BodyChange::Full, "two lines changed");
+        assert_eq!(body_change(&lines("a\nb"), &lines("a")), BodyChange::Full, "line count changed");
+        assert_eq!(body_change(&lines("a"), &lines("a\n")), BodyChange::Full);
+    }
+
+    // -- compose + vim integration -------------------------------------------
+
+    use crate::vim::Mode as VimMode;
+
+    #[test]
+    fn tabbing_into_the_body_starts_insert_mode() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::Attachments;
+        compose.next_field();
+        assert_eq!(compose.focus, ComposeField::Body);
+        assert_eq!(compose.vim.mode, VimMode::Insert);
+
+        let mut compose = ComposeState::blank();
+        compose.prev_field(); // To -> Body
+        assert_eq!(compose.vim.mode, VimMode::Insert);
+    }
+
+    #[test]
+    fn a_reply_opens_in_insert_mode_in_the_body() {
+        let compose = ComposeState::reply(&env(1, "Hi", "Alice", "alice@example.com"));
+        assert_eq!(compose.focus, ComposeField::Body);
+        assert_eq!(compose.vim.mode, VimMode::Insert);
+    }
+
+    #[test]
+    fn leaving_the_body_resets_the_editor_to_normal_mode() {
+        let mut compose = ComposeState::blank();
+        compose.prev_field(); // into the body
+        compose.next_field(); // back out to To
+        assert_eq!(compose.focus, ComposeField::To);
+        assert_eq!(compose.vim.mode, VimMode::Normal);
+    }
+
+    #[test]
+    fn focus_body_normal_lands_in_normal_mode_with_the_cursor_on_a_char() {
+        let mut compose = ComposeState::blank();
+        compose.body.lines = vec!["abc".to_string()];
+        compose.body.cursor_col = 3;
+        compose.focus_body_normal();
+        assert_eq!(compose.focus, ComposeField::Body);
+        assert_eq!(compose.vim.mode, VimMode::Normal);
+        assert_eq!(compose.body.cursor_col, 2);
+    }
+
+    #[test]
+    fn is_blank_considers_every_field_and_attachments() {
+        assert!(ComposeState::blank().is_blank());
+
+        let mut compose = ComposeState::blank();
+        compose.body.lines = vec!["  ".to_string(), String::new()];
+        assert!(compose.is_blank(), "whitespace-only body still counts as blank");
+
+        for set in [
+            |c: &mut ComposeState| c.to = TextInput::with_value("a@example.com"),
+            |c: &mut ComposeState| c.subject = TextInput::with_value("Hi"),
+            |c: &mut ComposeState| c.body.lines = vec!["text".to_string()],
+            |c: &mut ComposeState| {
+                c.attachments.items.push(AttachmentEntry {
+                    path: std::path::PathBuf::from("/tmp/x"),
+                    filename: "x".to_string(),
+                    size_bytes: 1,
+                })
+            },
+        ] {
+            let mut compose = ComposeState::blank();
+            set(&mut compose);
+            assert!(!compose.is_blank());
+        }
     }
 }

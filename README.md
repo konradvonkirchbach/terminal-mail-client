@@ -20,6 +20,9 @@ notifications for new mail.
   new mail shows up on its own, no polling
 - **Full compose flow** — reply, attachments (with a keyboard-driven
   directory browser, not blind path typing), a 20MB size cap
+- **Vim editing in the compose body** — Normal/Insert/Visual modes, motions,
+  operators and text objects, counts, undo/redo, `.` repeat, `/` search,
+  and `:wq` / `:q!`
 - **Recipient autocomplete** — fuzzy-find To/Cc/Bcc against everyone you've
   ever received mail from (automated no-reply senders excluded)
 - **Spellcheck** — underlines misspelled words in the compose body, checked
@@ -161,11 +164,45 @@ mailc --set-default-account
 
 | Key | Action |
 |---|---|
-| `Tab` / `Shift+Tab` | Move between To/Cc/Bcc/Subject/Files/Body |
+| `Tab` / `Shift+Tab` | Move between To/Cc/Bcc/Subject/Files/Body (from any vim mode) |
 | `Ctrl+A` | Attach a file (opens a directory browser) |
 | `Ctrl+S` | Send |
 | `Backspace` (on Files field) | Remove selected attachment |
-| `Esc` | Cancel (or dismiss the recipient-suggestion dropdown first, if one's open) |
+| `Esc` (in a header field) | Jump to the body in Normal mode (dismisses an open suggestion dropdown first) |
+
+Esc never discards a draft. To leave compose, use the body's command line:
+`:wq` / `:x` sends, `:q` closes an empty compose (and refuses with a
+reminder if there's anything in it), `:q!` discards whatever's there.
+
+**Compose body (vim modes):** the body is a modal editor. Moving into it
+starts in **Insert** mode, so you can just type; `Esc` switches to
+**Normal** mode, where a count can prefix most commands (`3w`, `2dd`).
+The status line shows the mode (`-- INSERT --`, `-- VISUAL --`) or the
+command you're typing, and the cursor is a bar in Insert and a block
+elsewhere.
+
+| Keys | Action |
+|---|---|
+| `h j k l`, arrows | Move by character / line |
+| `w b e`, `W B E` | Next word start / previous word start / word end (`W B E`: whitespace-delimited) |
+| `0 ^ $` | Line start / first non-blank / line end |
+| `gg G`, `{n}G` | First / last line, line n |
+| `f F t T {c}`, `;` `,` | Jump to / before a char on the line, repeat forward / backward |
+| `{ }`, `%` | Previous / next blank line, matching bracket |
+| `Ctrl-d` / `Ctrl-u` | Down / up 10 lines |
+| `/text` `?text`, `n N`, `* #` | Search forward / backward (smartcase, wraps), next / previous match, word under cursor |
+| `i a I A o O` | Insert before / after cursor, at line start / end, on a new line below / above |
+| `x X`, `r{c}`, `~`, `J` | Delete char under / before cursor, replace char, toggle case, join lines |
+| `d{motion}` `c{motion}` `y{motion}` | Delete / change / yank over any motion or text object; doubled (`dd` `cc` `yy`) for whole lines |
+| `D C Y`, `s S` | Delete / change to end of line, yank line; substitute char / line |
+| `iw aw iW aW ip ap`, `i" a" i' a'`, `i( a( i[ a[ i{ a{ i< a<` | Text objects (word, paragraph, quotes, brackets), after an operator or in Visual mode |
+| `p P` | Put after / before the cursor |
+| `u`, `Ctrl-r`, `.` | Undo, redo, repeat the last change |
+| `v`, `V`, then `d y c ~ u U J o` | Visual (char / line) selection and what you can do to it |
+| `:{n}`, `:wq` `:x`, `:q` `:q!`, `:w` | Go to line n, send, close / discard (`:w` explains drafts aren't saved yet) |
+
+In Insert mode: `Ctrl-w` deletes the word before the cursor, `Ctrl-u`
+deletes to the start of the line, `Home`/`End`/`Del` work as usual.
 
 On To/Cc/Bcc, typing fuzzy-matches against everyone you've received mail
 from and drops a suggestion list under the field:
@@ -177,8 +214,8 @@ from and drops a suggestion list under the field:
 | `Esc` | Dismiss the dropdown without accepting |
 
 In the body, moving the cursor onto a misspelled (underlined) word pops
-up its suggested corrections below the cursor — display-only, since the
-body already uses the arrow keys, `Enter`, and `Tab` for editing.
+up its suggested corrections below the cursor (in Normal and Insert
+mode) — display-only; fix the word with the usual vim commands (`ciw`, ...).
 
 **Directory browser** (attach a file / choose a save location):
 

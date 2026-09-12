@@ -8,6 +8,7 @@ mod setup;
 mod spellcheck;
 mod theme;
 mod ui;
+mod vim;
 
 use std::future::Future;
 use std::io::stdout;
@@ -15,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -25,10 +27,11 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 
-use app::{App, BodyState, BrowserPurpose, ComposeField, ComposeState, ListState};
+use app::{body_change, App, BodyChange, BodyState, BrowserPurpose, ComposeField, ComposeState, ListState};
 use attach::AttachmentEntry;
-use editable::{TextArea, TextInput};
+use editable::TextInput;
 use filebrowser::FileBrowser;
+use vim::{Mode as VimMode, Outcome};
 
 /// Ceiling on how many cached envelopes we'll ever read back from the
 /// store for display in one go. Deliberately not the same as
@@ -189,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
     let result = run(&mut terminal, accounts).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), SetCursorStyle::DefaultUserShape, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
@@ -295,6 +298,8 @@ async fn run(
     // negligible idle-CPU cost.
     const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(500);
 
+    let mut cursor_shape = None;
+
     loop {
         // Clear an expired status message *before* drawing — otherwise
         // the redraw that fires exactly when the tick elapses still
@@ -304,6 +309,14 @@ async fn run(
         let tick = app.expire_status().unwrap_or(IDLE_REDRAW_INTERVAL);
 
         terminal.draw(|frame| ui::draw(frame, &app, &theme))?;
+
+        // Only written when it changes — it's an escape sequence to the
+        // terminal, not something worth re-sending every frame.
+        let wanted = cursor_shape_for(&app);
+        if cursor_shape != Some(wanted) {
+            let _ = execute!(terminal.backend_mut(), wanted.style());
+            cursor_shape = Some(wanted);
+        }
 
         if app.should_quit {
             return Ok(());
@@ -735,23 +748,122 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ses
     if compose.sending {
         return;
     }
+    // Like vim's message line: whatever the last key reported goes away
+    // on the next one.
+    compose.notice = None;
 
     if modifiers.contains(KeyModifiers::CONTROL) {
         match code {
             KeyCode::Char('s') | KeyCode::Char('S') => {
-                compose.sending = true;
-                compose.error = None;
-                let draft = compose.to_draft();
-                let attachments = compose.attachments.items.clone();
-                spawn_send(session.accounts.current().clone(), draft, attachments, session.tx.clone());
+                start_send(compose, session);
+                return;
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 app.file_browser = Some((FileBrowser::open(default_browse_dir()), BrowserPurpose::AttachToCompose));
+                return;
             }
-            _ => {} // swallow unrecognized ctrl-chords rather than typing them literally
+            // The body's editor has Ctrl chords of its own (Ctrl-r redo,
+            // Ctrl-w/Ctrl-u in Insert mode, ...); the header fields have
+            // none, so swallow them there rather than typing them.
+            _ if compose.focus != ComposeField::Body => return,
+            _ => {}
         }
-        return;
     }
+
+    if compose.focus == ComposeField::Body {
+        handle_body_key(app, code, modifiers, session);
+    } else {
+        handle_header_key(app, code);
+    }
+}
+
+/// The terminal cursor's shape, following the vim convention: a bar where
+/// typing inserts text, a block over the character Normal/Visual commands
+/// act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorShape {
+    Default,
+    Bar,
+    Block,
+}
+
+impl CursorShape {
+    fn style(self) -> SetCursorStyle {
+        match self {
+            Self::Default => SetCursorStyle::DefaultUserShape,
+            Self::Bar => SetCursorStyle::SteadyBar,
+            Self::Block => SetCursorStyle::SteadyBlock,
+        }
+    }
+}
+
+fn cursor_shape_for(app: &App) -> CursorShape {
+    match &app.compose {
+        Some(compose) if compose.focus == ComposeField::Body => match compose.vim.mode {
+            VimMode::Insert | VimMode::Command(_) => CursorShape::Bar,
+            VimMode::Normal | VimMode::Visual | VimMode::VisualLine => CursorShape::Block,
+        },
+        Some(_) => CursorShape::Bar,
+        None => CursorShape::Default,
+    }
+}
+
+/// Kicks off sending the current compose — shared by Ctrl+S and `:wq`/`:x`.
+fn start_send(compose: &mut ComposeState, session: &Session) {
+    compose.sending = true;
+    compose.error = None;
+    let draft = compose.to_draft();
+    let attachments = compose.attachments.items.clone();
+    spawn_send(session.accounts.current().clone(), draft, attachments, session.tx.clone());
+}
+
+/// Body keys go to the vim engine, except Tab/Shift-Tab, which still move
+/// between compose fields whatever mode the editor is in.
+fn handle_body_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session: &Session) {
+    let Some(compose) = &mut app.compose else { return };
+    match code {
+        KeyCode::Tab => {
+            compose.next_field();
+            compose.refresh_suggestions(&app.known_senders);
+            return;
+        }
+        KeyCode::BackTab => {
+            compose.prev_field();
+            compose.refresh_suggestions(&app.known_senders);
+            return;
+        }
+        _ => {}
+    }
+
+    let before = compose.body.lines.clone();
+    match compose.vim.handle_key(&mut compose.body, code, modifiers) {
+        Outcome::None => {}
+        Outcome::Notice(message) => compose.notice = Some(message),
+        Outcome::Send => start_send(compose, session),
+        Outcome::Quit { force } => {
+            if force || compose.is_blank() {
+                app.compose = None;
+                return;
+            }
+            compose.notice = Some("Unsent draft — :wq to send, :q! to discard".to_string());
+        }
+    }
+
+    // Recheck exactly what this key changed — whichever vim command (or
+    // undo) did it — rather than guessing from the key itself.
+    if let Some(handle) = &session.spellcheck {
+        match body_change(&before, &compose.body.lines) {
+            BodyChange::None => {}
+            BodyChange::Line(row) => handle.request_line(compose.id, row, compose.body.lines[row].clone()),
+            BodyChange::Full => handle.request_full(compose.id, compose.body.text()),
+        }
+    }
+}
+
+/// Keys for To/Cc/Bcc/Subject/Files: plain typing fields, with recipient
+/// autocomplete on the address ones.
+fn handle_header_key(app: &mut App, code: KeyCode) {
+    let Some(compose) = &mut app.compose else { return };
 
     // While the recipient-suggestion dropdown is showing, a handful of
     // keys drive it instead of their usual field-editing meaning; anything
@@ -781,49 +893,25 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ses
         }
     }
 
-    // A Backspace at the very start of a body line joins it with the
-    // previous one, shrinking the line count — captured before the edit
-    // runs so the spellcheck trigger below knows to fall back to a full
-    // recheck instead of patching a single (now wrong) line index.
-    let backspace_will_join_body_lines = compose.focus == ComposeField::Body
-        && code == KeyCode::Backspace
-        && compose.body.cursor_col == 0
-        && compose.body.cursor_row > 0;
-
     match code {
-        // Returns immediately rather than falling through to the shared
-        // `refresh_suggestions` call below — `compose` no longer points
-        // at anything live once `app.compose` is cleared.
-        KeyCode::Esc => {
-            app.compose = None;
-            return;
-        }
+        // Esc never discards a draft: it drops into the body in Normal
+        // mode, where `:q!`/`:wq` live.
+        KeyCode::Esc => compose.focus_body_normal(),
         KeyCode::Tab => compose.next_field(),
         KeyCode::BackTab => compose.prev_field(),
-        KeyCode::Char(c) => edit_field(compose, |f| f.insert(c), |a| a.insert(c)),
+        KeyCode::Char(c) => edit_input(compose, |f| f.insert(c)),
         KeyCode::Backspace => {
             if compose.focus == ComposeField::Attachments {
                 compose.attachments.remove_selected();
             } else {
-                edit_field(compose, TextInput::backspace, TextArea::backspace);
+                edit_input(compose, TextInput::backspace);
             }
         }
-        KeyCode::Left => edit_field(compose, TextInput::left, TextArea::left),
-        KeyCode::Right => edit_field(compose, TextInput::right, TextArea::right),
-        KeyCode::Up => match compose.focus {
-            ComposeField::Body => compose.body.up(),
-            ComposeField::Attachments => compose.attachments.move_up(),
-            _ => {}
-        },
-        KeyCode::Down => match compose.focus {
-            ComposeField::Body => compose.body.down(),
-            ComposeField::Attachments => compose.attachments.move_down(),
-            _ => {}
-        },
-        KeyCode::Enter => match compose.focus {
-            ComposeField::Body => compose.body.newline(),
-            _ => compose.next_field(),
-        },
+        KeyCode::Left => edit_input(compose, TextInput::left),
+        KeyCode::Right => edit_input(compose, TextInput::right),
+        KeyCode::Up if compose.focus == ComposeField::Attachments => compose.attachments.move_up(),
+        KeyCode::Down if compose.focus == ComposeField::Attachments => compose.attachments.move_down(),
+        KeyCode::Enter => compose.next_field(),
         _ => {}
     }
 
@@ -835,45 +923,16 @@ fn handle_compose_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, ses
     if !matches!(code, KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down) {
         compose.refresh_suggestions(&app.known_senders);
     }
-
-    // Most edits only touch one body line, so only that line needs a
-    // recheck; an edit that changes the line count (Enter, or a
-    // line-joining Backspace) shifts every later line's index, so that
-    // case rechecks the whole body instead of patching a single line.
-    if compose.focus == ComposeField::Body {
-        if let Some(handle) = &session.spellcheck {
-            match code {
-                KeyCode::Char(_) => {
-                    handle.request_line(compose.id, compose.body.cursor_row, compose.body.lines[compose.body.cursor_row].clone());
-                }
-                KeyCode::Backspace if backspace_will_join_body_lines => {
-                    handle.request_full(compose.id, compose.body.text());
-                }
-                KeyCode::Backspace => {
-                    handle.request_line(compose.id, compose.body.cursor_row, compose.body.lines[compose.body.cursor_row].clone());
-                }
-                KeyCode::Enter => handle.request_full(compose.id, compose.body.text()),
-                _ => {}
-            }
-        }
-    }
 }
 
-/// Dispatches an edit to whichever field is focused — the single-line
-/// fields share one `TextInput` op, the body uses the matching `TextArea`
-/// op. Attachments has no text of its own (handled separately above).
-fn edit_field(
-    compose: &mut ComposeState,
-    input_op: impl Fn(&mut TextInput),
-    area_op: impl Fn(&mut TextArea),
-) {
+/// Applies a text edit to whichever single-line header field is focused.
+fn edit_input(compose: &mut ComposeState, op: impl Fn(&mut TextInput)) {
     match compose.focus {
-        ComposeField::To => input_op(&mut compose.to),
-        ComposeField::Cc => input_op(&mut compose.cc),
-        ComposeField::Bcc => input_op(&mut compose.bcc),
-        ComposeField::Subject => input_op(&mut compose.subject),
-        ComposeField::Attachments => {}
-        ComposeField::Body => area_op(&mut compose.body),
+        ComposeField::To => op(&mut compose.to),
+        ComposeField::Cc => op(&mut compose.cc),
+        ComposeField::Bcc => op(&mut compose.bcc),
+        ComposeField::Subject => op(&mut compose.subject),
+        ComposeField::Attachments | ComposeField::Body => {}
     }
 }
 
