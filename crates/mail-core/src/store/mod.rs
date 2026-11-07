@@ -23,12 +23,7 @@ impl Store {
             .await
     }
 
-    pub async fn update_folder_uid_state(
-        &self,
-        folder_id: i64,
-        uidvalidity: u32,
-        uidnext: u32,
-    ) -> Result<()> {
+    pub async fn update_folder_uid_state(&self, folder_id: i64, uidvalidity: u32, uidnext: u32) -> Result<()> {
         self.run(move |conn| queries::update_folder_uid_state(conn, folder_id, uidvalidity, uidnext))
             .await
     }
@@ -63,11 +58,7 @@ impl Store {
     /// transaction instead of N separate round-trips through the actor
     /// channel — the flag-refresh sweep calls this with up to
     /// `FLAG_REFRESH_WINDOW` (200) entries on every sync.
-    pub async fn update_message_flags_batch(
-        &self,
-        folder_id: i64,
-        updates: Vec<(u32, Flags)>,
-    ) -> Result<()> {
+    pub async fn update_message_flags_batch(&self, folder_id: i64, updates: Vec<(u32, Flags)>) -> Result<()> {
         self.run(move |conn| {
             let tx = conn.transaction()?;
             for (uid, flags) in &updates {
@@ -93,8 +84,7 @@ impl Store {
     }
 
     pub async fn recent_uids(&self, folder_id: i64, limit: u32) -> Result<Vec<u32>> {
-        self.run(move |conn| queries::recent_uids(conn, folder_id, limit))
-            .await
+        self.run(move |conn| queries::recent_uids(conn, folder_id, limit)).await
     }
 
     pub async fn set_message_raw_path(&self, folder_id: i64, uid: u32, path: String) -> Result<()> {
@@ -112,19 +102,13 @@ impl Store {
             .await
     }
 
-    pub async fn insert_outbox(
-        &self,
-        account_id: i64,
-        raw_mime_path: String,
-        recipients: Vec<String>,
-    ) -> Result<i64> {
+    pub async fn insert_outbox(&self, account_id: i64, raw_mime_path: String, recipients: Vec<String>) -> Result<i64> {
         self.run(move |conn| queries::insert_outbox(conn, account_id, &raw_mime_path, &recipients))
             .await
     }
 
     pub async fn list_outbox(&self, account_id: i64) -> Result<Vec<OutboxItem>> {
-        self.run(move |conn| queries::list_outbox(conn, account_id))
-            .await
+        self.run(move |conn| queries::list_outbox(conn, account_id)).await
     }
 
     pub async fn delete_outbox(&self, id: i64) -> Result<()> {
@@ -140,7 +124,6 @@ impl Store {
     /// sender this account has received mail from, minus automated
     /// "no-reply" senders. See `queries::known_senders`.
     pub async fn known_senders(&self, account_id: i64) -> Result<Vec<Address>> {
-        self.run(move |conn| queries::known_senders(conn, account_id))
-            .await
+        self.run(move |conn| queries::known_senders(conn, account_id)).await
     }
 }

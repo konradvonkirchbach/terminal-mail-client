@@ -26,7 +26,11 @@ fn normalize(area: &TextArea, r: &Range) -> Range {
     };
     let (a, b) = (clamp(r.start), clamp(r.end));
     let (start, end) = if a <= b { (a, b) } else { (b, a) };
-    Range { start, end, linewise: r.linewise }
+    Range {
+        start,
+        end,
+        linewise: r.linewise,
+    }
 }
 
 /// The text `range` covers. Charwise ranges put `\n` between rows;
@@ -136,7 +140,11 @@ pub fn put(area: &mut TextArea, text: &str, linewise: bool, after: bool, count: 
         return;
     }
     let len = line_len(area, area.cursor_row);
-    let col = if after && len > 0 { (area.cursor_col + 1).min(len) } else { area.cursor_col.min(len) };
+    let col = if after && len > 0 {
+        (area.cursor_col + 1).min(len)
+    } else {
+        area.cursor_col.min(len)
+    };
     let at = Pos::new(area.cursor_row, col);
     let end = insert_text(area, at, &text.repeat(count));
     if text.contains('\n') {
@@ -288,7 +296,11 @@ mod tests {
     use super::*;
 
     fn area(text: &str) -> TextArea {
-        TextArea { lines: text.split('\n').map(str::to_string).collect(), cursor_row: 0, cursor_col: 0 }
+        TextArea {
+            lines: text.split('\n').map(str::to_string).collect(),
+            cursor_row: 0,
+            cursor_col: 0,
+        }
     }
 
     fn p(row: usize, col: usize) -> Pos {
@@ -306,8 +318,16 @@ mod tests {
     #[test]
     fn range_text_orders_and_clamps_its_endpoints() {
         let a = area("abc");
-        assert_eq!(range_text(&a, &Range::chars(p(0, 2), p(0, 0))), "ab", "reversed endpoints");
-        assert_eq!(range_text(&a, &Range::chars(p(0, 1), p(0, 99))), "bc", "end past the line");
+        assert_eq!(
+            range_text(&a, &Range::chars(p(0, 2), p(0, 0))),
+            "ab",
+            "reversed endpoints"
+        );
+        assert_eq!(
+            range_text(&a, &Range::chars(p(0, 1), p(0, 99))),
+            "bc",
+            "end past the line"
+        );
     }
 
     #[test]
@@ -391,7 +411,11 @@ mod tests {
         let mut a = area("ad");
         put(&mut a, "b\nc", false, true, 1);
         assert_eq!(a.lines, vec!["ab", "cd"]);
-        assert_eq!((a.cursor_row, a.cursor_col), (0, 1), "multi-line paste leaves the cursor at its start");
+        assert_eq!(
+            (a.cursor_row, a.cursor_col),
+            (0, 1),
+            "multi-line paste leaves the cursor at its start"
+        );
     }
 
     #[test]
@@ -404,7 +428,11 @@ mod tests {
         let mut a = area("b");
         put(&mut a, "  a", true, false, 2);
         assert_eq!(a.lines, vec!["  a", "  a", "b"]);
-        assert_eq!((a.cursor_row, a.cursor_col), (0, 2), "first non-blank of the first pasted line");
+        assert_eq!(
+            (a.cursor_row, a.cursor_col),
+            (0, 2),
+            "first non-blank of the first pasted line"
+        );
     }
 
     #[test]

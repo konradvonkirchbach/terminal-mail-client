@@ -78,11 +78,19 @@ pub struct Range {
 
 impl Range {
     pub fn chars(start: Pos, end: Pos) -> Self {
-        Self { start, end, linewise: false }
+        Self {
+            start,
+            end,
+            linewise: false,
+        }
     }
 
     pub fn lines(first: usize, last: usize) -> Self {
-        Self { start: Pos::new(first, 0), end: Pos::new(last, 0), linewise: true }
+        Self {
+            start: Pos::new(first, 0),
+            end: Pos::new(last, 0),
+            linewise: true,
+        }
     }
 }
 
@@ -177,7 +185,10 @@ fn cls(b: &Chars, p: Pos, big: bool) -> Cls {
 /// Index of the first non-blank char in `row`, or the row's length if it
 /// has none.
 pub fn first_non_blank(b: &Chars, row: usize) -> usize {
-    b.line(row).iter().position(|c| !c.is_whitespace()).unwrap_or_else(|| b.len(row))
+    b.line(row)
+        .iter()
+        .position(|c| !c.is_whitespace())
+        .unwrap_or_else(|| b.len(row))
 }
 
 /// `w` / `W`: start of the `count`-th next word. Empty lines count as
@@ -457,7 +468,12 @@ fn all_matches(b: &Chars, pattern: &[char], whole_word: bool) -> Vec<Pos> {
 pub fn search(b: &Chars, from: Pos, pattern: &[char], backward: bool, whole_word: bool) -> Option<Pos> {
     let matches = all_matches(b, pattern, whole_word);
     if backward {
-        matches.iter().rev().find(|&&m| m < from).or_else(|| matches.last()).copied()
+        matches
+            .iter()
+            .rev()
+            .find(|&&m| m < from)
+            .or_else(|| matches.last())
+            .copied()
     } else {
         matches.iter().find(|&&m| m > from).or_else(|| matches.first()).copied()
     }
@@ -571,7 +587,12 @@ fn paragraph_object(b: &Chars, p: Pos, inner: bool) -> Range {
 
 fn quote_object(b: &Chars, p: Pos, q: char, inner: bool) -> Option<Range> {
     let line = b.line(p.row);
-    let quotes: Vec<usize> = line.iter().enumerate().filter(|(_, &c)| c == q).map(|(i, _)| i).collect();
+    let quotes: Vec<usize> = line
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c == q)
+        .map(|(i, _)| i)
+        .collect();
     let pairs: Vec<(usize, usize)> = quotes.chunks_exact(2).map(|w| (w[0], w[1])).collect();
     let (open, close) = pairs
         .iter()
@@ -641,7 +662,11 @@ mod tests {
     #[test]
     fn word_forward_crosses_lines_and_stops_on_empty_lines() {
         let b = buf("one\n\ntwo");
-        assert_eq!(word_forward(&b, p(0, 0), false, 1), p(1, 0), "an empty line counts as a word");
+        assert_eq!(
+            word_forward(&b, p(0, 0), false, 1),
+            p(1, 0),
+            "an empty line counts as a word"
+        );
         assert_eq!(word_forward(&b, p(1, 0), false, 1), p(2, 0));
     }
 
@@ -649,7 +674,11 @@ mod tests {
     fn word_forward_honours_the_count_and_stops_at_the_buffer_end() {
         let b = buf("a b c");
         assert_eq!(word_forward(&b, p(0, 0), false, 2), p(0, 4));
-        assert_eq!(word_forward(&b, p(0, 0), false, 9), p(0, 5), "runs off the end onto the newline slot");
+        assert_eq!(
+            word_forward(&b, p(0, 0), false, 9),
+            p(0, 5),
+            "runs off the end onto the newline slot"
+        );
     }
 
     #[test]
@@ -673,7 +702,11 @@ mod tests {
     fn word_end_moves_to_the_last_char_of_the_next_word_end() {
         let b = buf("foo bar\nbaz");
         assert_eq!(word_end(&b, p(0, 0), false, 1), p(0, 2));
-        assert_eq!(word_end(&b, p(0, 2), false, 1), p(0, 6), "from a word's end, jumps to the next one's");
+        assert_eq!(
+            word_end(&b, p(0, 2), false, 1),
+            p(0, 6),
+            "from a word's end, jumps to the next one's"
+        );
         assert_eq!(word_end(&b, p(0, 6), false, 1), p(1, 2), "crosses lines");
     }
 
@@ -707,9 +740,15 @@ mod tests {
     fn find_char_supports_all_four_kinds_and_counts() {
         let b = buf("a-b-c-d");
         assert_eq!(find_char(&b, p(0, 0), FindKind::Forward, '-', 2, false), Some(p(0, 3)));
-        assert_eq!(find_char(&b, p(0, 0), FindKind::TillForward, 'c', 1, false), Some(p(0, 3)));
+        assert_eq!(
+            find_char(&b, p(0, 0), FindKind::TillForward, 'c', 1, false),
+            Some(p(0, 3))
+        );
         assert_eq!(find_char(&b, p(0, 6), FindKind::Backward, '-', 1, false), Some(p(0, 5)));
-        assert_eq!(find_char(&b, p(0, 6), FindKind::TillBackward, 'b', 1, false), Some(p(0, 3)));
+        assert_eq!(
+            find_char(&b, p(0, 6), FindKind::TillBackward, 'b', 1, false),
+            Some(p(0, 3))
+        );
         assert_eq!(find_char(&b, p(0, 0), FindKind::Forward, 'z', 1, false), None);
     }
 
@@ -718,7 +757,10 @@ mod tests {
         let b = buf("a,b,c");
         // Cursor right before the first ',' (as after `t,`): a plain `t,`
         // wouldn't move, but a repeat (`;`) goes on to the next one.
-        assert_eq!(find_char(&b, p(0, 0), FindKind::TillForward, ',', 1, true), Some(p(0, 2)));
+        assert_eq!(
+            find_char(&b, p(0, 0), FindKind::TillForward, ',', 1, true),
+            Some(p(0, 2))
+        );
     }
 
     #[test]
@@ -736,7 +778,11 @@ mod tests {
         let b = buf("a\nb\n\nc\n\nd");
         assert_eq!(paragraph_forward(&b, p(0, 0), 1), p(2, 0));
         assert_eq!(paragraph_forward(&b, p(0, 0), 2), p(4, 0));
-        assert_eq!(paragraph_forward(&b, p(5, 0), 1), p(5, 1), "no blank line after: buffer end");
+        assert_eq!(
+            paragraph_forward(&b, p(5, 0), 1),
+            p(5, 1),
+            "no blank line after: buffer end"
+        );
         assert_eq!(paragraph_backward(&b, p(5, 0), 1), p(4, 0));
         assert_eq!(paragraph_backward(&b, p(3, 0), 2), p(0, 0));
     }
@@ -744,7 +790,11 @@ mod tests {
     #[test]
     fn match_bracket_respects_nesting_and_crosses_lines() {
         let b = buf("f(a(b)c)\n{\n}");
-        assert_eq!(match_bracket(&b, p(0, 0)), Some(p(0, 7)), "searches forward to the first bracket");
+        assert_eq!(
+            match_bracket(&b, p(0, 0)),
+            Some(p(0, 7)),
+            "searches forward to the first bracket"
+        );
         assert_eq!(match_bracket(&b, p(0, 7)), Some(p(0, 1)));
         assert_eq!(match_bracket(&b, p(0, 3)), Some(p(0, 5)));
         assert_eq!(match_bracket(&b, p(1, 0)), Some(p(2, 0)));
@@ -758,8 +808,16 @@ mod tests {
         let b = buf("cat dog\ncat");
         let pat: Vec<char> = "cat".chars().collect();
         assert_eq!(search(&b, p(0, 0), &pat, false, false), Some(p(1, 0)));
-        assert_eq!(search(&b, p(1, 0), &pat, false, false), Some(p(0, 0)), "wraps to the top");
-        assert_eq!(search(&b, p(0, 0), &pat, true, false), Some(p(1, 0)), "wraps to the bottom");
+        assert_eq!(
+            search(&b, p(1, 0), &pat, false, false),
+            Some(p(0, 0)),
+            "wraps to the top"
+        );
+        assert_eq!(
+            search(&b, p(0, 0), &pat, true, false),
+            Some(p(1, 0)),
+            "wraps to the bottom"
+        );
     }
 
     #[test]
@@ -768,8 +826,16 @@ mod tests {
         let lower: Vec<char> = "hello".chars().collect();
         let upper: Vec<char> = "Hello".chars().collect();
         assert_eq!(search(&b, p(0, 1), &lower, false, false), Some(p(0, 6)));
-        assert_eq!(search(&b, p(0, 6), &lower, false, false), Some(p(0, 0)), "lowercase pattern matches either case");
-        assert_eq!(search(&b, p(0, 1), &upper, false, false), Some(p(0, 0)), "uppercase pattern is case-sensitive");
+        assert_eq!(
+            search(&b, p(0, 6), &lower, false, false),
+            Some(p(0, 0)),
+            "lowercase pattern matches either case"
+        );
+        assert_eq!(
+            search(&b, p(0, 1), &upper, false, false),
+            Some(p(0, 0)),
+            "uppercase pattern is case-sensitive"
+        );
     }
 
     #[test]
@@ -797,7 +863,11 @@ mod tests {
     fn inner_and_around_word() {
         let b = buf("say hello there");
         assert_eq!(span(text_object(&b, p(0, 5), 'w', true).unwrap()), (p(0, 4), p(0, 9)));
-        assert_eq!(span(text_object(&b, p(0, 5), 'w', false).unwrap()), (p(0, 4), p(0, 10)), "aw takes trailing space");
+        assert_eq!(
+            span(text_object(&b, p(0, 5), 'w', false).unwrap()),
+            (p(0, 4), p(0, 10)),
+            "aw takes trailing space"
+        );
         let last = text_object(&b, p(0, 12), 'w', false).unwrap();
         assert_eq!(span(last), (p(0, 9), p(0, 15)), "last word takes leading space instead");
         assert_eq!(text_object(&buf(""), p(0, 0), 'w', true), None);
@@ -816,9 +886,17 @@ mod tests {
         assert!(ip.linewise);
         assert_eq!((ip.start.row, ip.end.row), (0, 1));
         let ap = text_object(&b, p(0, 0), 'p', false).unwrap();
-        assert_eq!((ap.start.row, ap.end.row), (0, 2), "ap includes the following blank line");
+        assert_eq!(
+            (ap.start.row, ap.end.row),
+            (0, 2),
+            "ap includes the following blank line"
+        );
         let last = text_object(&b, p(3, 0), 'p', false).unwrap();
-        assert_eq!((last.start.row, last.end.row), (2, 3), "nothing after: takes the blank line before");
+        assert_eq!(
+            (last.start.row, last.end.row),
+            (2, 3),
+            "nothing after: takes the blank line before"
+        );
     }
 
     #[test]
@@ -826,7 +904,11 @@ mod tests {
         let b = buf(r#"say "hi there" now"#);
         assert_eq!(span(text_object(&b, p(0, 6), '"', true).unwrap()), (p(0, 5), p(0, 13)));
         assert_eq!(span(text_object(&b, p(0, 6), '"', false).unwrap()), (p(0, 4), p(0, 15)));
-        assert_eq!(span(text_object(&b, p(0, 0), '"', true).unwrap()), (p(0, 5), p(0, 13)), "cursor before: next pair");
+        assert_eq!(
+            span(text_object(&b, p(0, 0), '"', true).unwrap()),
+            (p(0, 5), p(0, 13)),
+            "cursor before: next pair"
+        );
         assert_eq!(text_object(&buf("no quotes"), p(0, 0), '"', true), None);
     }
 
@@ -835,11 +917,28 @@ mod tests {
         let b = buf("f(a, (b), c)");
         assert_eq!(span(text_object(&b, p(0, 3), '(', true).unwrap()), (p(0, 2), p(0, 11)));
         assert_eq!(span(text_object(&b, p(0, 3), 'b', false).unwrap()), (p(0, 1), p(0, 12)));
-        assert_eq!(span(text_object(&b, p(0, 6), ')', true).unwrap()), (p(0, 6), p(0, 7)), "innermost pair wins");
-        assert_eq!(span(text_object(&b, p(0, 11), '(', true).unwrap()), (p(0, 2), p(0, 11)), "cursor on the closer");
-        assert_eq!(span(text_object(&buf("[x]"), p(0, 1), '[', true).unwrap()), (p(0, 1), p(0, 2)));
-        assert_eq!(span(text_object(&buf("{x}"), p(0, 1), 'B', false).unwrap()), (p(0, 0), p(0, 3)));
-        assert_eq!(span(text_object(&buf("<x>"), p(0, 1), '<', true).unwrap()), (p(0, 1), p(0, 2)));
+        assert_eq!(
+            span(text_object(&b, p(0, 6), ')', true).unwrap()),
+            (p(0, 6), p(0, 7)),
+            "innermost pair wins"
+        );
+        assert_eq!(
+            span(text_object(&b, p(0, 11), '(', true).unwrap()),
+            (p(0, 2), p(0, 11)),
+            "cursor on the closer"
+        );
+        assert_eq!(
+            span(text_object(&buf("[x]"), p(0, 1), '[', true).unwrap()),
+            (p(0, 1), p(0, 2))
+        );
+        assert_eq!(
+            span(text_object(&buf("{x}"), p(0, 1), 'B', false).unwrap()),
+            (p(0, 0), p(0, 3))
+        );
+        assert_eq!(
+            span(text_object(&buf("<x>"), p(0, 1), '<', true).unwrap()),
+            (p(0, 1), p(0, 2))
+        );
         assert_eq!(text_object(&buf("no brackets"), p(0, 0), '(', true), None);
     }
 

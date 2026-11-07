@@ -66,7 +66,9 @@ pub enum Mode {
 pub enum Outcome {
     None,
     /// `:q` (`force: false`) or `:q!`.
-    Quit { force: bool },
+    Quit {
+        force: bool,
+    },
     /// `:wq` / `:x`.
     Send,
     /// A one-line message for the status line (errors like "Pattern not
@@ -104,7 +106,10 @@ struct Snapshot {
 
 impl Snapshot {
     fn of(area: &TextArea) -> Self {
-        Self { lines: area.lines.clone(), cursor: Pos::new(area.cursor_row, area.cursor_col) }
+        Self {
+            lines: area.lines.clone(),
+            cursor: Pos::new(area.cursor_row, area.cursor_col),
+        }
     }
 
     fn restore(self, area: &mut TextArea) {
@@ -312,7 +317,10 @@ impl Vim {
 
     /// Feeds one key to the editor.
     pub fn handle_key(&mut self, area: &mut TextArea, code: KeyCode, modifiers: KeyModifiers) -> Outcome {
-        let key = Key { code, ctrl: modifiers.contains(KeyModifiers::CONTROL) };
+        let key = Key {
+            code,
+            ctrl: modifiers.contains(KeyModifiers::CONTROL),
+        };
         if self.pending_undo.is_none() {
             self.pending_undo = Some(Snapshot::of(area));
         }
@@ -448,8 +456,17 @@ impl Vim {
 
     fn push_count_digit(&mut self, c: char) {
         let digit = c.to_digit(10).unwrap_or(0) as usize;
-        let slot = if self.pending.op.is_some() { &mut self.pending.op_count } else { &mut self.pending.count };
-        *slot = Some(slot.unwrap_or(0).saturating_mul(10).saturating_add(digit).min(MAX_COUNT));
+        let slot = if self.pending.op.is_some() {
+            &mut self.pending.op_count
+        } else {
+            &mut self.pending.count
+        };
+        *slot = Some(
+            slot.unwrap_or(0)
+                .saturating_mul(10)
+                .saturating_add(digit)
+                .min(MAX_COUNT),
+        );
         self.pending.keys.push(c);
     }
 
@@ -458,7 +475,10 @@ impl Vim {
         let a = self.pending.count.take();
         let b = self.pending.op_count.take();
         let explicit = a.is_some() || b.is_some();
-        (a.unwrap_or(1).saturating_mul(b.unwrap_or(1)).clamp(1, MAX_COUNT), explicit)
+        (
+            a.unwrap_or(1).saturating_mul(b.unwrap_or(1)).clamp(1, MAX_COUNT),
+            explicit,
+        )
     }
 
     fn reset_pending(&mut self) {
@@ -585,7 +605,13 @@ impl Vim {
         self.reset_pending();
     }
 
-    fn eval_motion(&mut self, area: &TextArea, motion: Motion, count: usize, explicit: bool) -> Option<(Pos, MotionKind)> {
+    fn eval_motion(
+        &mut self,
+        area: &TextArea,
+        motion: Motion,
+        count: usize,
+        explicit: bool,
+    ) -> Option<(Pos, MotionKind)> {
         let b = Chars::new(&area.lines);
         let cur = cursor(area);
         let rows = b.rows();
@@ -599,11 +625,17 @@ impl Vim {
         }
         let vertical = |row: usize| {
             let len = b.len(row);
-            let col = if want == usize::MAX { len.saturating_sub(1) } else { want.min(len) };
+            let col = if want == usize::MAX {
+                len.saturating_sub(1)
+            } else {
+                want.min(len)
+            };
             (Pos::new(row, col), MotionKind::Linewise)
         };
         match motion {
-            Motion::Left => (cur.col > 0).then(|| (Pos::new(cur.row, cur.col.saturating_sub(count)), MotionKind::Exclusive)),
+            Motion::Left => {
+                (cur.col > 0).then(|| (Pos::new(cur.row, cur.col.saturating_sub(count)), MotionKind::Exclusive))
+            }
             Motion::Right => {
                 let target = (cur.col + count).min(b.len(cur.row));
                 (target != cur.col).then_some((Pos::new(cur.row, target), MotionKind::Exclusive))
@@ -616,7 +648,10 @@ impl Vim {
             Motion::WordBackward(big) => Some((motion::word_backward(&b, cur, big, count), MotionKind::Exclusive)),
             Motion::WordEnd(big) => Some((motion::word_end(&b, cur, big, count), MotionKind::Inclusive)),
             Motion::LineStart => Some((Pos::new(cur.row, 0), MotionKind::Exclusive)),
-            Motion::FirstNonBlank => Some((Pos::new(cur.row, motion::first_non_blank(&b, cur.row)), MotionKind::Exclusive)),
+            Motion::FirstNonBlank => Some((
+                Pos::new(cur.row, motion::first_non_blank(&b, cur.row)),
+                MotionKind::Exclusive,
+            )),
             Motion::LineEnd => {
                 let row = (cur.row + count - 1).min(rows - 1);
                 self.curswant = Some(usize::MAX);
@@ -702,9 +737,15 @@ impl Vim {
                 self.mode = Mode::VisualLine;
             }
             self.visual_anchor = range.start;
-            let end = if range.linewise || range.end.col == 0 { range.end } else { Pos::new(range.end.row, range.end.col - 1) };
+            let end = if range.linewise || range.end.col == 0 {
+                range.end
+            } else {
+                Pos::new(range.end.row, range.end.col - 1)
+            };
             area.cursor_row = end.row;
-            area.cursor_col = end.col.max(if end.row == range.start.row { range.start.col } else { 0 });
+            area.cursor_col = end
+                .col
+                .max(if end.row == range.start.row { range.start.col } else { 0 });
         }
         self.reset_pending();
     }
@@ -717,7 +758,10 @@ impl Vim {
         self.keep_curswant = false;
         match op {
             Op::Yank => {
-                self.register = Register { text: buffer::range_text(area, &range), linewise: range.linewise };
+                self.register = Register {
+                    text: buffer::range_text(area, &range),
+                    linewise: range.linewise,
+                };
                 let (start, _) = ordered(range.start, range.end);
                 area.cursor_row = start.row;
                 if !range.linewise {
@@ -877,14 +921,16 @@ impl Vim {
     fn search_word_under_cursor(&mut self, area: &mut TextArea, backward: bool) -> Outcome {
         let b = Chars::new(&area.lines);
         let at = cursor(area);
-        let word = motion::text_object(&b, at, 'w', true).filter(|r| {
-            b.at(r.start).is_some_and(motion::is_word_char)
-        });
+        let word = motion::text_object(&b, at, 'w', true).filter(|r| b.at(r.start).is_some_and(motion::is_word_char));
         let Some(word) = word else {
             return Outcome::Notice("No string under cursor".to_string());
         };
         let pattern: Vec<char> = b.line(word.start.row)[word.start.col..word.end.col].to_vec();
-        self.last_search = Some(Search { pattern: pattern.clone(), backward, whole_word: true });
+        self.last_search = Some(Search {
+            pattern: pattern.clone(),
+            backward,
+            whole_word: true,
+        });
         // `#` starts from the word's beginning, or it would just find the
         // word the cursor is already on.
         let from = if backward { word.start } else { at };
@@ -900,7 +946,11 @@ impl Vim {
         self.pending_undo = None;
         for i in 0..count {
             let Some(snapshot) = self.undo.pop() else {
-                return if i == 0 { Outcome::Notice("Already at oldest change".to_string()) } else { Outcome::None };
+                return if i == 0 {
+                    Outcome::Notice("Already at oldest change".to_string())
+                } else {
+                    Outcome::None
+                };
             };
             self.redo.push(Snapshot::of(area));
             snapshot.restore(area);
@@ -912,7 +962,11 @@ impl Vim {
         self.pending_undo = None;
         for i in 0..count {
             let Some(snapshot) = self.redo.pop() else {
-                return if i == 0 { Outcome::Notice("Already at newest change".to_string()) } else { Outcome::None };
+                return if i == 0 {
+                    Outcome::Notice("Already at newest change".to_string())
+                } else {
+                    Outcome::None
+                };
             };
             self.undo.push(Snapshot::of(area));
             snapshot.restore(area);
@@ -934,7 +988,13 @@ impl Vim {
                 self.dispatch(area, key);
             }
             if self.mode == Mode::Insert {
-                self.dispatch(area, Key { code: KeyCode::Esc, ctrl: false });
+                self.dispatch(
+                    area,
+                    Key {
+                        code: KeyCode::Esc,
+                        ctrl: false,
+                    },
+                );
             }
         }
         self.replaying = false;
@@ -966,8 +1026,20 @@ impl Vim {
                 area.cursor_row = anchor.row;
                 area.cursor_col = anchor.col;
             }
-            'v' => self.mode = if self.mode == Mode::Visual { Mode::Normal } else { Mode::Visual },
-            'V' => self.mode = if self.mode == Mode::VisualLine { Mode::Normal } else { Mode::VisualLine },
+            'v' => {
+                self.mode = if self.mode == Mode::Visual {
+                    Mode::Normal
+                } else {
+                    Mode::Visual
+                }
+            }
+            'V' => {
+                self.mode = if self.mode == Mode::VisualLine {
+                    Mode::Normal
+                } else {
+                    Mode::VisualLine
+                }
+            }
             'd' | 'x' => {
                 self.mode = Mode::Normal;
                 self.apply_op(area, Op::Delete, range);
@@ -1072,7 +1144,11 @@ impl Vim {
         } else {
             pattern.chars().collect()
         };
-        self.last_search = Some(Search { pattern: pattern.clone(), backward, whole_word: false });
+        self.last_search = Some(Search {
+            pattern: pattern.clone(),
+            backward,
+            whole_word: false,
+        });
         let b = Chars::new(&area.lines);
         match motion::search(&b, cursor(area), &pattern, backward, false) {
             Some(p) => {
@@ -1122,7 +1198,10 @@ fn operator_range(area: &TextArea, start: Pos, target: Pos, kind: MotionKind, wo
         MotionKind::Inclusive => Range::chars(s, Pos::new(e.row, e.col + 1)),
         MotionKind::Exclusive => {
             let b = Chars::new(&area.lines);
-            let starts_its_line = e.row > s.row && b.line(e.row)[..e.col.min(b.len(e.row))].iter().all(|c| c.is_whitespace());
+            let starts_its_line = e.row > s.row
+                && b.line(e.row)[..e.col.min(b.len(e.row))]
+                    .iter()
+                    .all(|c| c.is_whitespace());
             if word_motion && starts_its_line {
                 return Range::chars(s, Pos::new(e.row - 1, b.len(e.row - 1)));
             }

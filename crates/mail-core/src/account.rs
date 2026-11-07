@@ -24,12 +24,10 @@ impl Account {
     /// stored yet.
     pub fn password(&self) -> Result<String> {
         let entry = self.keyring_entry()?;
-        entry
-            .get_password()
-            .map_err(|e| match e {
-                keyring::Error::NoEntry => Error::MissingSecret(self.config.email.clone()),
-                other => Error::Keyring(other),
-            })
+        entry.get_password().map_err(|e| match e {
+            keyring::Error::NoEntry => Error::MissingSecret(self.config.email.clone()),
+            other => Error::Keyring(other),
+        })
     }
 
     pub fn set_password(&self, password: &str) -> Result<()> {

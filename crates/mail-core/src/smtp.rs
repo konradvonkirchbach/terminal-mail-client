@@ -44,9 +44,7 @@ pub fn build(account: &Account, draft: &Draft, attachments: &[AttachmentFile]) -
         .parse()
         .map_err(|e| Error::Config(format!("invalid account address: {e}")))?;
 
-    let mut builder = LettreMessage::builder()
-        .from(from)
-        .subject(draft.subject.clone());
+    let mut builder = LettreMessage::builder().from(from).subject(draft.subject.clone());
 
     let mut any_recipient = false;
     for mbox in parse_mailboxes(&draft.to)? {
@@ -72,13 +70,11 @@ pub fn build(account: &Account, draft: &Draft, attachments: &[AttachmentFile]) -
     } else {
         let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(draft.body.clone()));
         for att in attachments {
-            let content_type = ContentType::parse(
-                mime_guess::from_path(&att.filename)
-                    .first_or_octet_stream()
-                    .as_ref(),
-            )
-            .map_err(|e| Error::Config(format!("invalid attachment content type: {e}")))?;
-            multipart = multipart.singlepart(Attachment::new(att.filename.clone()).body(att.bytes.clone(), content_type));
+            let content_type =
+                ContentType::parse(mime_guess::from_path(&att.filename).first_or_octet_stream().as_ref())
+                    .map_err(|e| Error::Config(format!("invalid attachment content type: {e}")))?;
+            multipart =
+                multipart.singlepart(Attachment::new(att.filename.clone()).body(att.bytes.clone(), content_type));
         }
         builder
             .multipart(multipart)
@@ -86,12 +82,7 @@ pub fn build(account: &Account, draft: &Draft, attachments: &[AttachmentFile]) -
     };
 
     let raw = message.formatted();
-    let recipients = message
-        .envelope()
-        .to()
-        .iter()
-        .map(|a| a.to_string())
-        .collect();
+    let recipients = message.envelope().to().iter().map(|a| a.to_string()).collect();
 
     Ok(BuiltMessage {
         raw,
@@ -122,8 +113,8 @@ pub async fn send_raw(account: &Account, raw: &[u8], recipients: &[String]) -> R
         .map(|r| r.parse::<lettre::Address>())
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::Config(format!("invalid saved recipient: {e}")))?;
-    let envelope = lettre::address::Envelope::new(Some(from), to)
-        .map_err(|e| Error::Config(format!("invalid envelope: {e}")))?;
+    let envelope =
+        lettre::address::Envelope::new(Some(from), to).map_err(|e| Error::Config(format!("invalid envelope: {e}")))?;
 
     let transport = transport(account).await?;
     transport
@@ -234,11 +225,18 @@ mod tests {
         recipients.sort();
         assert_eq!(
             recipients,
-            vec!["bcc@example.com".to_string(), "cc@example.com".to_string(), "to@example.com".to_string()]
+            vec![
+                "bcc@example.com".to_string(),
+                "cc@example.com".to_string(),
+                "to@example.com".to_string()
+            ]
         );
 
         let raw = String::from_utf8_lossy(&built.raw);
-        assert!(raw.contains("cc@example.com"), "Cc header should survive into the raw message");
+        assert!(
+            raw.contains("cc@example.com"),
+            "Cc header should survive into the raw message"
+        );
         assert!(
             !raw.contains("bcc@example.com"),
             "Bcc must never appear in the transmitted/cached raw bytes"

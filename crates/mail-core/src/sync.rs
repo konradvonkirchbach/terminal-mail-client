@@ -30,14 +30,9 @@ pub struct SyncOutcome {
 /// or after a `UIDVALIDITY` change, and a cheap incremental fetch otherwise.
 pub async fn sync_inbox(account: &Account, store: &Store) -> Result<SyncOutcome> {
     let account_id = store
-        .upsert_account(
-            account.config.email.clone(),
-            account.config.display_name.clone(),
-        )
+        .upsert_account(account.config.email.clone(), account.config.display_name.clone())
         .await?;
-    let folder = store
-        .get_or_create_folder(account_id, "INBOX".to_string())
-        .await?;
+    let folder = store.get_or_create_folder(account_id, "INBOX".to_string()).await?;
 
     let mut session = client::open_session(account).await?;
     let mailbox = client::select_inbox(&mut session).await?;
@@ -127,10 +122,7 @@ async fn incremental_sync(
 }
 
 fn uid_list(uids: &[u32]) -> String {
-    uids.iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
+    uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
 }
 
 /// Backfills up to `batch_size` messages older than whatever's currently
@@ -139,12 +131,7 @@ fn uid_list(uids: &[u32]) -> String {
 /// more" calls on demand instead of eagerly fetching a whole mailbox's
 /// history up front. Returns how many were actually found and fetched;
 /// `0` means there's nothing older left on the server.
-pub async fn fetch_older(
-    account: &Account,
-    store: &Store,
-    folder_id: i64,
-    batch_size: u32,
-) -> Result<usize> {
+pub async fn fetch_older(account: &Account, store: &Store, folder_id: i64, batch_size: u32) -> Result<usize> {
     let Some(min_uid) = store.min_uid(folder_id).await? else {
         return Ok(0); // nothing cached yet at all — a plain sync should run first
     };
@@ -256,13 +243,7 @@ pub async fn delete_message(account: &Account, store: &Store, folder_id: i64, ui
     Ok(())
 }
 
-async fn cache_raw_message(
-    store: &Store,
-    account_id: i64,
-    folder_id: i64,
-    uid: u32,
-    raw: &[u8],
-) -> Result<()> {
+async fn cache_raw_message(store: &Store, account_id: i64, folder_id: i64, uid: u32, raw: &[u8]) -> Result<()> {
     let dir = config::messages_dir(account_id)?;
     tokio::fs::create_dir_all(&dir).await?;
     config::restrict_dir(&dir)?;

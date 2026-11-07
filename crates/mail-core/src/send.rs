@@ -41,12 +41,7 @@ pub async fn send_message(
     }
 }
 
-async fn queue_outbox(
-    store: &Store,
-    account_id: i64,
-    raw: &[u8],
-    recipients: &[String],
-) -> Result<()> {
+async fn queue_outbox(store: &Store, account_id: i64, raw: &[u8], recipients: &[String]) -> Result<()> {
     let dir = config::outbox_dir(account_id)?;
     tokio::fs::create_dir_all(&dir).await?;
     config::restrict_dir(&dir)?;
@@ -54,11 +49,7 @@ async fn queue_outbox(
     tokio::fs::write(&path, raw).await?;
     config::restrict_file(&path)?;
     store
-        .insert_outbox(
-            account_id,
-            path.to_string_lossy().into_owned(),
-            recipients.to_vec(),
-        )
+        .insert_outbox(account_id, path.to_string_lossy().into_owned(), recipients.to_vec())
         .await?;
     Ok(())
 }

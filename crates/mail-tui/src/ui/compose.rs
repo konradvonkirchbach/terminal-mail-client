@@ -52,16 +52,10 @@ fn attachments_line(compose: &ComposeState, theme: &Theme) -> Line<'static> {
     } else {
         Style::new().fg(theme.muted)
     };
-    let mut spans = vec![Span::styled(
-        format!("{:<LABEL_WIDTH$}", "Files:"),
-        label_style,
-    )];
+    let mut spans = vec![Span::styled(format!("{:<LABEL_WIDTH$}", "Files:"), label_style)];
 
     if compose.attachments.items.is_empty() {
-        spans.push(Span::styled(
-            "(none — Ctrl+A to attach)",
-            Style::new().fg(theme.muted),
-        ));
+        spans.push(Span::styled("(none — Ctrl+A to attach)", Style::new().fg(theme.muted)));
     } else {
         for (i, a) in compose.attachments.items.iter().enumerate() {
             if i > 0 {
@@ -117,7 +111,15 @@ fn draw_header(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Th
 /// `draw_suggestions` and `draw_misspelling_suggestions` so a future fix
 /// to this clamping only has to happen once. `None` when there isn't
 /// enough room left to draw anything useful.
-fn popup_rect(frame_area: Rect, x: u16, y: u16, max_content_chars: u16, min_width: u16, max_width: u16, item_count: usize) -> Option<Rect> {
+fn popup_rect(
+    frame_area: Rect,
+    x: u16,
+    y: u16,
+    max_content_chars: u16,
+    min_width: u16,
+    max_width: u16,
+    item_count: usize,
+) -> Option<Rect> {
     let content_width = max_content_chars.clamp(min_width, max_width);
     let width = (content_width + 2).min(frame_area.width.saturating_sub(x));
     let height = (item_count as u16 + 2).min(frame_area.height.saturating_sub(y));
@@ -135,14 +137,30 @@ fn draw_suggestions(frame: &mut Frame, header_area: Rect, compose: &ComposeState
     if compose.suggestions.items.is_empty() {
         return;
     }
-    let Some((row, _)) = focused_input_row(compose) else { return };
+    let Some((row, _)) = focused_input_row(compose) else {
+        return;
+    };
 
     let inner = Block::new().borders(Borders::ALL).inner(header_area);
     let x = inner.x + LABEL_WIDTH as u16;
     let y = inner.y + row + 1;
 
-    let max_content_chars = compose.suggestions.items.iter().map(|a| a.to_string().chars().count() as u16).max().unwrap_or(10);
-    let Some(popup) = popup_rect(frame.area(), x, y, max_content_chars, 10, 50, compose.suggestions.items.len()) else {
+    let max_content_chars = compose
+        .suggestions
+        .items
+        .iter()
+        .map(|a| a.to_string().chars().count() as u16)
+        .max()
+        .unwrap_or(10);
+    let Some(popup) = popup_rect(
+        frame.area(),
+        x,
+        y,
+        max_content_chars,
+        10,
+        50,
+        compose.suggestions.items.len(),
+    ) else {
         return;
     };
 
@@ -276,7 +294,9 @@ fn draw_misspelling_suggestions(
     compose: &ComposeState,
     theme: &Theme,
 ) {
-    let Some((word, suggestions)) = compose.misspelled_word_at_cursor() else { return };
+    let Some((word, suggestions)) = compose.misspelled_word_at_cursor() else {
+        return;
+    };
     if suggestions.is_empty() {
         return;
     }
@@ -296,7 +316,10 @@ fn draw_misspelling_suggestions(
             .border_type(BorderType::Plain)
             .border_style(Style::new().fg(theme.red))
             .style(Style::new().bg(theme.background).fg(theme.foreground))
-            .title(Span::styled(format!(" {word}? "), Style::new().fg(theme.bright_foreground))),
+            .title(Span::styled(
+                format!(" {word}? "),
+                Style::new().fg(theme.bright_foreground),
+            )),
     );
 
     frame.render_widget(Clear, popup);
@@ -317,12 +340,18 @@ fn draw_help(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Them
     } else if let Some(err) = &compose.error {
         Line::from(Span::styled(format!("Send failed: {err}"), Style::new().fg(theme.red)))
     } else if !compose.suggestions.items.is_empty() {
-        Line::from(Span::styled("\u{2191}/\u{2193} choose suggestion   Enter/Tab accept   Esc dismiss", muted))
+        Line::from(Span::styled(
+            "\u{2191}/\u{2193} choose suggestion   Enter/Tab accept   Esc dismiss",
+            muted,
+        ))
     } else if body_focused {
         let (label, hint) = body_mode_text(compose.vim.mode, compose.vim.pending_keys());
         let mut spans = Vec::new();
         if !label.is_empty() {
-            spans.push(Span::styled(label, Style::new().fg(theme.accent).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(
+                label,
+                Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
+            ));
             spans.push(Span::raw("  "));
         }
         spans.push(Span::styled(hint, muted));
@@ -345,12 +374,16 @@ fn draw_help(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Them
 fn body_mode_text(mode: VimMode, pending: &str) -> (String, &'static str) {
     const VISUAL_HINT: &str = "d delete   y yank   c change   ~ u U case   Esc cancel";
     match mode {
-        VimMode::Insert => ("-- INSERT --".to_string(), "Esc normal mode   Tab next field   Ctrl+S send"),
+        VimMode::Insert => (
+            "-- INSERT --".to_string(),
+            "Esc normal mode   Tab next field   Ctrl+S send",
+        ),
         VimMode::Visual => ("-- VISUAL --".to_string(), VISUAL_HINT),
         VimMode::VisualLine => ("-- VISUAL LINE --".to_string(), VISUAL_HINT),
-        VimMode::Normal | VimMode::Command(_) => {
-            (pending.to_string(), "i insert   v visual   u undo   :wq send   :q! discard   Tab next field")
-        }
+        VimMode::Normal | VimMode::Command(_) => (
+            pending.to_string(),
+            "i insert   v visual   u undo   :wq send   :q! discard   Tab next field",
+        ),
     }
 }
 
@@ -420,7 +453,11 @@ mod tests {
     #[test]
     fn spellcheck_line_matches_a_token_despite_trailing_punctuation() {
         let misspelled = flagged(&["wrold"]);
-        let line = spellcheck_line("hello wrold.", &misspelled, Style::new().add_modifier(Modifier::UNDERLINED));
+        let line = spellcheck_line(
+            "hello wrold.",
+            &misspelled,
+            Style::new().add_modifier(Modifier::UNDERLINED),
+        );
 
         let flagged_spans: Vec<&str> = line
             .spans
@@ -428,7 +465,11 @@ mod tests {
             .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(flagged_spans, vec!["wrold."], "the whole token (punctuation included) is styled, only the lookup key is stripped");
+        assert_eq!(
+            flagged_spans,
+            vec!["wrold."],
+            "the whole token (punctuation included) is styled, only the lookup key is stripped"
+        );
     }
 
     #[test]
@@ -438,7 +479,12 @@ mod tests {
         // exactly — including with multibyte characters, where an
         // off-by-one would panic rather than just mismatch.
         let misspelled = flagged(&["wrold", "häuser"]);
-        for line in ["hello wrold today", "  wrold  ", "Häuser sind schön wrold.", "no matches at all"] {
+        for line in [
+            "hello wrold today",
+            "  wrold  ",
+            "Häuser sind schön wrold.",
+            "no matches at all",
+        ] {
             let rendered = spellcheck_line(line, &misspelled, Style::new());
             let reconstructed: String = rendered.spans.iter().map(|s| s.content.as_ref()).collect();
             assert_eq!(reconstructed, line);
@@ -473,7 +519,11 @@ mod tests {
     #[test]
     fn overlay_style_spans_several_existing_spans_and_keeps_their_styling() {
         let underlined = Style::new().add_modifier(Modifier::UNDERLINED);
-        let line = Line::from(vec![Span::raw("say "), Span::styled("wrold", underlined), Span::raw(" now")]);
+        let line = Line::from(vec![
+            Span::raw("say "),
+            Span::styled("wrold", underlined),
+            Span::raw(" now"),
+        ]);
         let out = overlay_style(line, 2, 7, selection());
         assert_eq!(text_of(&out), "say wrold now");
         assert_eq!(highlighted(&out), "y wro");
@@ -483,7 +533,10 @@ mod tests {
             .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(still_underlined, "wrold", "the misspelling underline survives the selection");
+        assert_eq!(
+            still_underlined, "wrold",
+            "the misspelling underline survives the selection"
+        );
     }
 
     #[test]
@@ -507,8 +560,16 @@ mod tests {
         assert_eq!(body_mode_text(VimMode::Insert, "").0, "-- INSERT --");
         assert_eq!(body_mode_text(VimMode::Visual, "").0, "-- VISUAL --");
         assert_eq!(body_mode_text(VimMode::VisualLine, "").0, "-- VISUAL LINE --");
-        assert_eq!(body_mode_text(VimMode::Normal, "").0, "", "Normal mode has no label, like vim");
-        assert_eq!(body_mode_text(VimMode::Normal, "2d").0, "2d", "shows the partly typed command");
+        assert_eq!(
+            body_mode_text(VimMode::Normal, "").0,
+            "",
+            "Normal mode has no label, like vim"
+        );
+        assert_eq!(
+            body_mode_text(VimMode::Normal, "2d").0,
+            "2d",
+            "shows the partly typed command"
+        );
         assert!(body_mode_text(VimMode::Normal, "").1.contains(":wq send"));
     }
 }

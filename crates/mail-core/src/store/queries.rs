@@ -18,11 +18,9 @@ pub fn upsert_account(conn: &Connection, email: &str, display_name: Option<&str>
          ON CONFLICT(email) DO UPDATE SET display_name = excluded.display_name",
         params![email, display_name],
     )?;
-    let id = conn.query_row(
-        "SELECT id FROM accounts WHERE email = ?1",
-        params![email],
-        |row| row.get(0),
-    )?;
+    let id = conn.query_row("SELECT id FROM accounts WHERE email = ?1", params![email], |row| {
+        row.get(0)
+    })?;
     Ok(id)
 }
 
@@ -55,12 +53,7 @@ pub fn get_or_create_folder(conn: &Connection, account_id: i64, name: &str) -> R
     .map_err(Into::into)
 }
 
-pub fn update_folder_uid_state(
-    conn: &Connection,
-    folder_id: i64,
-    uidvalidity: u32,
-    uidnext: u32,
-) -> Result<()> {
+pub fn update_folder_uid_state(conn: &Connection, folder_id: i64, uidvalidity: u32, uidnext: u32) -> Result<()> {
     conn.execute(
         "UPDATE folders SET uidvalidity = ?2, uidnext = ?3, last_synced_at = strftime('%s','now')
          WHERE id = ?1",
@@ -182,9 +175,7 @@ pub fn min_uid(conn: &Connection, folder_id: i64) -> Result<Option<u32>> {
 /// sweep (catches read/flag changes made from another client, without
 /// needing CONDSTORE/QRESYNC support from the server).
 pub fn recent_uids(conn: &Connection, folder_id: i64, limit: u32) -> Result<Vec<u32>> {
-    let mut stmt = conn.prepare(
-        "SELECT uid FROM messages WHERE folder_id = ?1 ORDER BY uid DESC LIMIT ?2",
-    )?;
+    let mut stmt = conn.prepare("SELECT uid FROM messages WHERE folder_id = ?1 ORDER BY uid DESC LIMIT ?2")?;
     let rows = stmt.query_map(params![folder_id, limit], |row| row.get::<_, i64>(0))?;
     rows.map(|r| r.map(|v| v as u32))
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -229,12 +220,7 @@ pub struct OutboxItem {
     pub attempts: i64,
 }
 
-pub fn insert_outbox(
-    conn: &Connection,
-    account_id: i64,
-    raw_mime_path: &str,
-    recipients: &[String],
-) -> Result<i64> {
+pub fn insert_outbox(conn: &Connection, account_id: i64, raw_mime_path: &str, recipients: &[String]) -> Result<i64> {
     conn.execute(
         "INSERT INTO outbox (account_id, raw_mime_path, recipients, created_at)
          VALUES (?1, ?2, ?3, strftime('%s','now'))",
@@ -244,9 +230,8 @@ pub fn insert_outbox(
 }
 
 pub fn list_outbox(conn: &Connection, account_id: i64) -> Result<Vec<OutboxItem>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, raw_mime_path, recipients, attempts FROM outbox WHERE account_id = ?1 ORDER BY id",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, raw_mime_path, recipients, attempts FROM outbox WHERE account_id = ?1 ORDER BY id")?;
     let rows = stmt.query_map(params![account_id], |row| {
         let recipients: String = row.get(2)?;
         Ok(OutboxItem {
@@ -353,8 +338,14 @@ mod tests {
         Envelope {
             uid,
             subject: subject.to_string(),
-            from: vec![Address { name: Some("Alice".into()), email: "alice@example.com".into() }],
-            to: vec![Address { name: None, email: "bob@example.com".into() }],
+            from: vec![Address {
+                name: Some("Alice".into()),
+                email: "alice@example.com".into(),
+            }],
+            to: vec![Address {
+                name: None,
+                email: "bob@example.com".into(),
+            }],
             date: Utc.timestamp_opt(1_700_000_000, 0).single(),
             flags: Flags::default(),
         }
@@ -368,7 +359,9 @@ mod tests {
         assert_eq!(id1, id2, "same email must resolve to the same account row");
 
         let name: Option<String> = conn
-            .query_row("SELECT display_name FROM accounts WHERE id = ?1", params![id1], |r| r.get(0))
+            .query_row("SELECT display_name FROM accounts WHERE id = ?1", params![id1], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(name.as_deref(), Some("A Updated"));
     }
@@ -382,8 +375,12 @@ mod tests {
 
         delete_account(&conn, account_id).unwrap();
 
-        let folder_count: i64 = conn.query_row("SELECT COUNT(*) FROM folders", [], |r| r.get(0)).unwrap();
-        let message_count: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0)).unwrap();
+        let folder_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM folders", [], |r| r.get(0))
+            .unwrap();
+        let message_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(folder_count, 0, "deleting an account must cascade to its folders");
         assert_eq!(message_count, 0, "deleting an account must cascade to its messages");
     }
@@ -438,7 +435,11 @@ mod tests {
         upsert_envelope(&conn, folder.id, &updated).unwrap();
 
         let rows = list_envelopes(&conn, folder.id, 10).unwrap();
-        assert_eq!(rows.len(), 1, "re-upserting the same (folder_id, uid) must not duplicate the row");
+        assert_eq!(
+            rows.len(),
+            1,
+            "re-upserting the same (folder_id, uid) must not duplicate the row"
+        );
         assert_eq!(rows[0].subject, "Updated subject");
         assert!(rows[0].flags.seen);
     }
@@ -455,7 +456,11 @@ mod tests {
             &conn,
             folder.id,
             1,
-            Flags { seen: true, flagged: true, ..Flags::default() },
+            Flags {
+                seen: true,
+                flagged: true,
+                ..Flags::default()
+            },
         )
         .unwrap();
 
@@ -517,7 +522,10 @@ mod tests {
 
         assert_eq!(get_message_raw_path(&conn, folder.id, 1).unwrap(), None);
         set_message_raw_path(&conn, folder.id, 1, "/tmp/1.eml").unwrap();
-        assert_eq!(get_message_raw_path(&conn, folder.id, 1).unwrap(), Some("/tmp/1.eml".to_string()));
+        assert_eq!(
+            get_message_raw_path(&conn, folder.id, 1).unwrap(),
+            Some("/tmp/1.eml".to_string())
+        );
 
         let removed_path = delete_message(&conn, folder.id, 1).unwrap();
         assert_eq!(removed_path, Some("/tmp/1.eml".to_string()));
@@ -582,22 +590,39 @@ mod tests {
         let folder = get_or_create_folder(&conn, account_id, "INBOX").unwrap();
 
         let mut msg1 = sample_envelope(1, "Hi");
-        msg1.from = vec![Address { name: Some("Alice".into()), email: "alice@example.com".into() }];
+        msg1.from = vec![Address {
+            name: Some("Alice".into()),
+            email: "alice@example.com".into(),
+        }];
         upsert_envelope(&conn, folder.id, &msg1).unwrap();
 
         let mut msg2 = sample_envelope(2, "Hi again");
-        msg2.from = vec![Address { name: None, email: "ALICE@example.com".into() }];
+        msg2.from = vec![Address {
+            name: None,
+            email: "ALICE@example.com".into(),
+        }];
         upsert_envelope(&conn, folder.id, &msg2).unwrap();
 
         let mut msg3 = sample_envelope(3, "Your receipt");
-        msg3.from = vec![Address { name: Some("Shop".into()), email: "no-reply@shop.com".into() }];
+        msg3.from = vec![Address {
+            name: Some("Shop".into()),
+            email: "no-reply@shop.com".into(),
+        }];
         upsert_envelope(&conn, folder.id, &msg3).unwrap();
 
         let senders = known_senders(&conn, account_id).unwrap();
 
-        assert_eq!(senders.len(), 1, "alice's two case variants must collapse into one entry, and no-reply must be dropped");
+        assert_eq!(
+            senders.len(),
+            1,
+            "alice's two case variants must collapse into one entry, and no-reply must be dropped"
+        );
         assert_eq!(senders[0].email.to_lowercase(), "alice@example.com");
-        assert_eq!(senders[0].name.as_deref(), Some("Alice"), "a known name must survive even though a later message for the same address lacked one");
+        assert_eq!(
+            senders[0].name.as_deref(),
+            Some("Alice"),
+            "a known name must survive even though a later message for the same address lacked one"
+        );
     }
 
     #[test]

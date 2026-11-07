@@ -36,7 +36,9 @@ pub enum BrowserPurpose {
     /// The original filename lives in the browser's own editable
     /// `filename` field (prefilled from it); only the bytes need
     /// carrying separately.
-    SaveAttachment { bytes: Vec<u8> },
+    SaveAttachment {
+        bytes: Vec<u8>,
+    },
 }
 
 pub enum BodyState {
@@ -74,7 +76,10 @@ pub struct Selectable<T> {
 
 impl<T> Default for Selectable<T> {
     fn default() -> Self {
-        Self { items: Vec::new(), selected: 0 }
+        Self {
+            items: Vec::new(),
+            selected: 0,
+        }
     }
 }
 
@@ -173,11 +178,7 @@ impl ComposeState {
     /// A reply to `source`, prefilled from its envelope (from/subject) —
     /// doesn't require the body to have been fetched.
     pub fn reply(source: &Envelope) -> Self {
-        let to = source
-            .from
-            .first()
-            .map(|a| a.email.clone())
-            .unwrap_or_default();
+        let to = source.from.first().map(|a| a.email.clone()).unwrap_or_default();
         let subject = if source.subject.to_lowercase().starts_with("re:") {
             source.subject.clone()
         } else {
@@ -241,7 +242,9 @@ impl ComposeState {
     /// Whether there's nothing in this compose worth keeping — `:q` only
     /// closes a blank one (`:q!` closes anything).
     pub fn is_blank(&self) -> bool {
-        [&self.to, &self.cc, &self.bcc, &self.subject].iter().all(|f| f.value.trim().is_empty())
+        [&self.to, &self.cc, &self.bcc, &self.subject]
+            .iter()
+            .all(|f| f.value.trim().is_empty())
             && self.body.lines.iter().all(|l| l.trim().is_empty())
             && self.attachments.items.is_empty()
     }
@@ -582,7 +585,12 @@ pub fn body_change(before: &[String], after: &[String]) -> BodyChange {
     if before.len() != after.len() {
         return BodyChange::Full;
     }
-    let mut changed = before.iter().zip(after).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i);
+    let mut changed = before
+        .iter()
+        .zip(after)
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, _)| i);
     match (changed.next(), changed.next()) {
         (None, _) => BodyChange::None,
         (Some(row), None) => BodyChange::Line(row),
@@ -611,8 +619,7 @@ fn last_recipient_separator(s: &str) -> Option<usize> {
 fn envelope_matches(e: &Envelope, needle: &str) -> bool {
     e.subject.to_lowercase().contains(needle)
         || e.from.iter().any(|a| {
-            a.email.to_lowercase().contains(needle)
-                || a.name.as_deref().unwrap_or("").to_lowercase().contains(needle)
+            a.email.to_lowercase().contains(needle) || a.name.as_deref().unwrap_or("").to_lowercase().contains(needle)
         })
 }
 
@@ -625,7 +632,10 @@ mod tests {
         Envelope {
             uid,
             subject: subject.to_string(),
-            from: vec![Address { name: Some(from_name.to_string()), email: from_email.to_string() }],
+            from: vec![Address {
+                name: Some(from_name.to_string()),
+                email: from_email.to_string(),
+            }],
             to: Vec::new(),
             date: None,
             flags: Flags::default(),
@@ -725,7 +735,10 @@ mod tests {
     fn select_page_down_and_up_jump_by_page_jump_and_clamp() {
         let mut app = sample_app();
         app.select_page_down();
-        assert_eq!(app.selected, 4, "only 5 rows exist, so a 10-row jump clamps to the last one");
+        assert_eq!(
+            app.selected, 4,
+            "only 5 rows exist, so a 10-row jump clamps to the last one"
+        );
 
         app.select_page_up();
         assert_eq!(app.selected, 0, "a 10-row jump back up from row 4 clamps to the top");
@@ -848,7 +861,10 @@ mod tests {
     #[test]
     fn expire_status_clears_a_message_past_its_ttl() {
         let mut app = sample_app();
-        app.status_message = Some(("old".to_string(), Instant::now() - STATUS_MESSAGE_TTL - Duration::from_secs(1)));
+        app.status_message = Some((
+            "old".to_string(),
+            Instant::now() - STATUS_MESSAGE_TTL - Duration::from_secs(1),
+        ));
 
         let remaining = app.expire_status();
 
@@ -877,7 +893,10 @@ mod tests {
         app.has_more_older = false;
         app.loading_more = true;
         app.pending_g = true;
-        app.known_senders = vec![Address { name: None, email: "x@example.com".to_string() }];
+        app.known_senders = vec![Address {
+            name: None,
+            email: "x@example.com".to_string(),
+        }];
         app.body = BodyState::Loaded(Message {
             uid: 1,
             subject: String::new(),
@@ -950,8 +969,14 @@ mod tests {
 
     fn senders() -> Vec<Address> {
         vec![
-            Address { name: Some("Alice Doe".to_string()), email: "alice@example.com".to_string() },
-            Address { name: Some("Bob Smith".to_string()), email: "bob@example.com".to_string() },
+            Address {
+                name: Some("Alice Doe".to_string()),
+                email: "alice@example.com".to_string(),
+            },
+            Address {
+                name: Some("Bob Smith".to_string()),
+                email: "bob@example.com".to_string(),
+            },
         ]
     }
 
@@ -1039,7 +1064,10 @@ mod tests {
 
         compose.accept_suggestion();
 
-        assert_eq!(compose.to.value, "\"Doe, Jane\" <jane@example.com>, Alice Doe <alice@example.com>, ");
+        assert_eq!(
+            compose.to.value,
+            "\"Doe, Jane\" <jane@example.com>, Alice Doe <alice@example.com>, "
+        );
     }
 
     #[test]
@@ -1059,7 +1087,10 @@ mod tests {
 
     #[test]
     fn selectable_move_up_and_down_clamp_at_the_list_bounds() {
-        let mut s = Selectable { items: vec!['a', 'b', 'c'], selected: 0 };
+        let mut s = Selectable {
+            items: vec!['a', 'b', 'c'],
+            selected: 0,
+        };
         s.move_up();
         assert_eq!(s.selected, 0, "move_up must not go below 0");
 
@@ -1080,7 +1111,10 @@ mod tests {
 
     #[test]
     fn selectable_remove_selected_clamps_onto_the_new_last_item() {
-        let mut s = Selectable { items: vec!['a', 'b', 'c'], selected: 2 };
+        let mut s = Selectable {
+            items: vec!['a', 'b', 'c'],
+            selected: 2,
+        };
         s.remove_selected();
         assert_eq!(s.items, vec!['a', 'b']);
         assert_eq!(s.selected, 1, "selection must move back onto the new last item");
@@ -1095,7 +1129,10 @@ mod tests {
 
     #[test]
     fn selectable_selected_item_reflects_the_current_index() {
-        let s = Selectable { items: vec!['a', 'b', 'c'], selected: 1 };
+        let s = Selectable {
+            items: vec!['a', 'b', 'c'],
+            selected: 1,
+        };
         assert_eq!(s.selected_item(), Some(&'b'));
 
         let empty: Selectable<char> = Selectable::default();
@@ -1104,7 +1141,10 @@ mod tests {
 
     #[test]
     fn selectable_clear_empties_the_list_and_resets_the_selection() {
-        let mut s = Selectable { items: vec!['a', 'b'], selected: 1 };
+        let mut s = Selectable {
+            items: vec!['a', 'b'],
+            selected: 1,
+        };
         s.clear();
         assert!(s.items.is_empty());
         assert_eq!(s.selected, 0);
@@ -1135,7 +1175,11 @@ mod tests {
 
         compose.set_line_misspellings(2, misspelling("oops", &[]));
 
-        assert_eq!(compose.misspelled_by_line.len(), 3, "earlier lines must be backfilled empty");
+        assert_eq!(
+            compose.misspelled_by_line.len(),
+            3,
+            "earlier lines must be backfilled empty"
+        );
         assert!(compose.misspelled_by_line[0].is_empty());
         assert!(compose.misspelled_by_line[1].is_empty());
         assert_eq!(compose.misspelled_by_line[2], misspelling("oops", &[]));
@@ -1149,7 +1193,10 @@ mod tests {
         compose.set_all_misspellings(vec![HashMap::new(), misspelling("fresh", &["fresher"])]);
 
         assert_eq!(compose.misspelled_by_line.len(), 2);
-        assert!(compose.misspelled_by_line[0].is_empty(), "the stale single-line entry must be gone");
+        assert!(
+            compose.misspelled_by_line[0].is_empty(),
+            "the stale single-line entry must be gone"
+        );
         assert_eq!(compose.misspelled_by_line[1], misspelling("fresh", &["fresher"]));
     }
 
@@ -1189,7 +1236,11 @@ mod tests {
         compose.body.cursor_col = 5;
         compose.set_line_misspellings(0, misspelling("wrold", &["world"]));
 
-        assert_eq!(compose.misspelled_word_at_cursor(), None, "a non-Body focus means a stale cursor position");
+        assert_eq!(
+            compose.misspelled_word_at_cursor(),
+            None,
+            "a non-Body focus means a stale cursor position"
+        );
     }
 
     // -- body_change ----------------------------------------------------------
@@ -1202,8 +1253,16 @@ mod tests {
     fn body_change_reports_no_change_one_line_or_a_full_recheck() {
         assert_eq!(body_change(&lines("a\nb"), &lines("a\nb")), BodyChange::None);
         assert_eq!(body_change(&lines("a\nb"), &lines("a\nbx")), BodyChange::Line(1));
-        assert_eq!(body_change(&lines("a\nb"), &lines("ax\nbx")), BodyChange::Full, "two lines changed");
-        assert_eq!(body_change(&lines("a\nb"), &lines("a")), BodyChange::Full, "line count changed");
+        assert_eq!(
+            body_change(&lines("a\nb"), &lines("ax\nbx")),
+            BodyChange::Full,
+            "two lines changed"
+        );
+        assert_eq!(
+            body_change(&lines("a\nb"), &lines("a")),
+            BodyChange::Full,
+            "line count changed"
+        );
         assert_eq!(body_change(&lines("a"), &lines("a\n")), BodyChange::Full);
     }
 

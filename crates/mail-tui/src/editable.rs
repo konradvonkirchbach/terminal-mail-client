@@ -140,10 +140,7 @@ impl TextArea {
 /// it's past the end — the conversion every char-indexed cursor in this
 /// crate needs before touching the underlying `String`.
 pub(crate) fn byte_index(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
+    s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
 }
 
 #[cfg(test)]
@@ -262,7 +259,10 @@ mod tests {
         // area is now ["long line", "x"], cursor at end of "x" (col 1)
         area.up();
         assert_eq!(area.cursor_row, 0);
-        assert_eq!(area.cursor_col, 1, "moving up keeps the column when the line above is long enough");
+        assert_eq!(
+            area.cursor_col, 1,
+            "moving up keeps the column when the line above is long enough"
+        );
 
         area.cursor_col = "long line".chars().count();
         area.down();

@@ -21,17 +21,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         BodyState::Loading => Text::from("Loading..."),
         BodyState::Error(msg) => Text::from(Span::styled(msg.clone(), Style::new().fg(theme.red))),
         BodyState::Loaded(message) => {
-            let from = message
-                .from
-                .first()
-                .map(|a| a.to_string())
-                .unwrap_or_default();
-            let to = message
-                .to
-                .iter()
-                .map(|a| a.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let from = message.from.first().map(|a| a.to_string()).unwrap_or_default();
+            let to = message.to.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
             let date = message
                 .date
                 .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
@@ -46,10 +37,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     Span::styled("From: ", Style::new().fg(theme.muted)),
                     Span::raw(from),
                 ]),
-                Line::from(vec![
-                    Span::styled("To: ", Style::new().fg(theme.muted)),
-                    Span::raw(to),
-                ]),
+                Line::from(vec![Span::styled("To: ", Style::new().fg(theme.muted)), Span::raw(to)]),
                 Line::from(vec![
                     Span::styled("Date: ", Style::new().fg(theme.muted)),
                     Span::raw(date),

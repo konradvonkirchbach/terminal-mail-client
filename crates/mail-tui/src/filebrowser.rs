@@ -76,7 +76,11 @@ impl FileBrowser {
                 continue;
             };
             if metadata.is_dir() {
-                dirs.push(BrowserEntry { name, is_dir: true, size: 0 });
+                dirs.push(BrowserEntry {
+                    name,
+                    is_dir: true,
+                    size: 0,
+                });
             } else {
                 files.push(BrowserEntry {
                     name,
@@ -263,7 +267,10 @@ mod tests {
         let result = browser.activate();
 
         assert_eq!(result, Some(dir.0.join("banana.txt")));
-        assert_eq!(browser.current_dir, dir.0, "picking a file must not change the browsed directory");
+        assert_eq!(
+            browser.current_dir, dir.0,
+            "picking a file must not change the browsed directory"
+        );
     }
 
     #[test]

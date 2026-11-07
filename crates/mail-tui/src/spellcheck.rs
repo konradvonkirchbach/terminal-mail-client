@@ -169,12 +169,10 @@ fn best_dictionary_for_language(lang_prefix: &str, preferred_locale: &str, searc
 /// `run()`'s startup path before the event loop (and its terminal
 /// redraws) even begins.
 async fn active_keyboard_language() -> Option<String> {
-    let output = tokio::task::spawn_blocking(|| {
-        std::process::Command::new("hyprctl").args(["devices", "-j"]).output()
-    })
-    .await
-    .ok()?
-    .ok()?;
+    let output = tokio::task::spawn_blocking(|| std::process::Command::new("hyprctl").args(["devices", "-j"]).output())
+        .await
+        .ok()?
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -257,7 +255,10 @@ fn parse_response_line(line: &str) -> Option<Misspelling> {
     if let Some(rest) = line.strip_prefix("# ") {
         // "word offset"
         let word = rest.split_whitespace().next()?.to_string();
-        return Some(Misspelling { word, suggestions: Vec::new() });
+        return Some(Misspelling {
+            word,
+            suggestions: Vec::new(),
+        });
     }
     None
 }
@@ -283,7 +284,11 @@ impl SpellChecker {
         if dict_bases.is_empty() {
             return Err(io::Error::other("no dictionaries given"));
         }
-        let dict_arg = dict_bases.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(",");
+        let dict_arg = dict_bases
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
 
         let mut child = Command::new("hunspell")
             .arg("-a")
@@ -392,7 +397,11 @@ impl SpellCheckHandle {
     /// request that arrives before the previous one was even picked up
     /// simply replaces it — only the latest state is ever worth checking.
     pub fn request_line(&self, compose_id: u64, index: usize, text: String) {
-        let _ = self.request_tx.send(SpellCheckRequest::Line { compose_id, index, text });
+        let _ = self.request_tx.send(SpellCheckRequest::Line {
+            compose_id,
+            index,
+            text,
+        });
     }
 
     /// Queues a recheck of the whole body, line by line — used when an
@@ -558,7 +567,10 @@ mod tests {
         dir.touch("en_US.aff");
         dir.touch("en_US.dic");
 
-        assert_eq!(find_dictionaries(std::slice::from_ref(&dir.0)), vec![dir.0.join("en_US")]);
+        assert_eq!(
+            find_dictionaries(std::slice::from_ref(&dir.0)),
+            vec![dir.0.join("en_US")]
+        );
     }
 
     #[test]
@@ -602,7 +614,11 @@ mod tests {
         std::os::unix::fs::symlink(real.0.join("en_US.dic"), linked.0.join("en_US.dic")).unwrap();
 
         let found = find_dictionaries(&[real.0.clone(), linked.0.clone()]);
-        assert_eq!(found, vec![real.0.join("en_US")], "the symlinked duplicate must be skipped");
+        assert_eq!(
+            found,
+            vec![real.0.join("en_US")],
+            "the symlinked duplicate must be skipped"
+        );
     }
 
     // -- keyboard-layout language mapping ---------------------------------
@@ -668,7 +684,11 @@ mod tests {
 
         // Neither installed dictionary matches the de_DE locale exactly.
         let found = best_dictionary_for_language("de", "de_DE", std::slice::from_ref(&dir.0));
-        assert_eq!(found, Some(dir.0.join("de_AT")), "falls back to the alphabetically first match");
+        assert_eq!(
+            found,
+            Some(dir.0.join("de_AT")),
+            "falls back to the alphabetically first match"
+        );
     }
 
     #[test]
@@ -677,7 +697,10 @@ mod tests {
         dir.touch("fr_FR.aff");
         dir.touch("fr_FR.dic");
 
-        assert_eq!(best_dictionary_for_language("de", "de_DE", std::slice::from_ref(&dir.0)), None);
+        assert_eq!(
+            best_dictionary_for_language("de", "de_DE", std::slice::from_ref(&dir.0)),
+            None
+        );
     }
 
     // -- word normalization -----------------------------------------------------
@@ -687,7 +710,11 @@ mod tests {
         assert_eq!(normalize_word("Wrold."), "wrold");
         assert_eq!(normalize_word("\"Hello\""), "hello");
         assert_eq!(normalize_word("don't"), "don't", "an internal apostrophe must survive");
-        assert_eq!(normalize_word("well-known"), "well-known", "an internal hyphen must survive");
+        assert_eq!(
+            normalize_word("well-known"),
+            "well-known",
+            "an internal hyphen must survive"
+        );
     }
 
     // -- tokenization and cursor-word lookup -----------------------------------
@@ -767,7 +794,11 @@ mod tests {
     fn parse_response_line_treats_correct_word_lines_as_not_misspelled() {
         assert_eq!(parse_response_line("*"), None, "'*' is an exact dictionary match");
         assert_eq!(parse_response_line("+ root"), None, "'+' is a match via affix");
-        assert_eq!(parse_response_line("- compound"), None, "'-' is a match via compound analysis");
+        assert_eq!(
+            parse_response_line("- compound"),
+            None,
+            "'-' is a match via compound analysis"
+        );
     }
 
     #[test]

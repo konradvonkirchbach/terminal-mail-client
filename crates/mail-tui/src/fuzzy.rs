@@ -75,13 +75,19 @@ mod tests {
     use super::*;
 
     fn addr(name: &str, email: &str) -> Address {
-        Address { name: Some(name.to_string()), email: email.to_string() }
+        Address {
+            name: Some(name.to_string()),
+            email: email.to_string(),
+        }
     }
 
     #[test]
     fn score_requires_every_needle_character_to_appear_in_order() {
         assert!(score("ac", "abc").is_some());
-        assert!(score("ca", "abc").is_none(), "'c' then 'a' never appears in that order in \"abc\"");
+        assert!(
+            score("ca", "abc").is_none(),
+            "'c' then 'a' never appears in that order in \"abc\""
+        );
     }
 
     #[test]
@@ -147,6 +153,9 @@ mod tests {
         ];
         let results = best_matches("alice", &senders, 8);
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].email, "alice@example.com", "the prefix/earlier match must rank first");
+        assert_eq!(
+            results[0].email, "alice@example.com",
+            "the prefix/earlier match must rank first"
+        );
     }
 }

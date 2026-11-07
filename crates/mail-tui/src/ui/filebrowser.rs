@@ -79,8 +79,7 @@ pub fn draw(frame: &mut Frame, area: Rect, browser: &FileBrowser, purpose: &Brow
             state.select(Some(browser.selected));
         }
 
-        let list = List::new(items)
-            .highlight_style(Style::new().bg(theme.selection).fg(theme.bright_foreground));
+        let list = List::new(items).highlight_style(Style::new().bg(theme.selection).fg(theme.bright_foreground));
         frame.render_stateful_widget(list, list_area, &mut state);
     }
 
@@ -103,10 +102,7 @@ pub fn draw(frame: &mut Frame, area: Rect, browser: &FileBrowser, purpose: &Brow
             filename_area,
         );
         if browser.filename_focused {
-            frame.set_cursor_position((
-                filename_area.x + 9 + filename.cursor as u16,
-                filename_area.y,
-            ));
+            frame.set_cursor_position((filename_area.x + 9 + filename.cursor as u16, filename_area.y));
         }
     }
 

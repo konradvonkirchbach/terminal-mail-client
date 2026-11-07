@@ -155,10 +155,8 @@ mod tests {
         // index and stamp it as version 1, mirroring what an old install
         // would actually have on disk.
         conn.execute_batch(super::super::schema::SCHEMA_V1).unwrap();
-        conn.execute_batch(
-            "CREATE INDEX messages_folder_date ON messages(folder_id, date);",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE INDEX messages_folder_date ON messages(folder_id, date);")
+            .unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
         assert!(index_exists(&conn, "messages_folder_date"));
 

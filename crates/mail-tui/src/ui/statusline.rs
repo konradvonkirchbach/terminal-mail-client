@@ -23,10 +23,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     ];
 
     if app.confirm_delete.is_some() {
-        spans.push(Span::styled(
-            "Delete this message? [y/N]",
-            Style::new().fg(theme.red),
-        ));
+        spans.push(Span::styled("Delete this message? [y/N]", Style::new().fg(theme.red)));
     } else {
         match &app.status_message {
             Some((msg, _)) => spans.push(Span::styled(msg.clone(), Style::new().fg(theme.green))),

@@ -56,7 +56,11 @@ fn named_key(name: &str) -> Option<(KeyCode, KeyModifiers)> {
 
 /// A buffer from `text`, with `|` marking the cursor (default: start).
 fn buffer(text: &str) -> TextArea {
-    let mut area = TextArea { lines: Vec::new(), cursor_row: 0, cursor_col: 0 };
+    let mut area = TextArea {
+        lines: Vec::new(),
+        cursor_row: 0,
+        cursor_col: 0,
+    };
     for (row, line) in text.split('\n').enumerate() {
         match line.find('|') {
             Some(byte) => {
@@ -95,7 +99,11 @@ struct Ed {
 
 impl Ed {
     fn new(text: &str) -> Self {
-        Self { vim: Vim::new(), area: buffer(text), outcomes: Vec::new() }
+        Self {
+            vim: Vim::new(),
+            area: buffer(text),
+            outcomes: Vec::new(),
+        }
     }
 
     fn feed(&mut self, s: &str) -> &mut Self {
@@ -125,9 +133,21 @@ fn check(start: &str, keys: &str, expected: &str) {
 
 #[test]
 fn key_notation_parses_named_keys_chords_and_literals() {
-    assert_eq!(keys("a<Esc>"), vec![(KeyCode::Char('a'), KeyModifiers::NONE), (KeyCode::Esc, KeyModifiers::NONE)]);
+    assert_eq!(
+        keys("a<Esc>"),
+        vec![
+            (KeyCode::Char('a'), KeyModifiers::NONE),
+            (KeyCode::Esc, KeyModifiers::NONE)
+        ]
+    );
     assert_eq!(keys("<C-r>"), vec![(KeyCode::Char('r'), KeyModifiers::CONTROL)]);
-    assert_eq!(keys("<x"), vec![(KeyCode::Char('<'), KeyModifiers::NONE), (KeyCode::Char('x'), KeyModifiers::NONE)]);
+    assert_eq!(
+        keys("<x"),
+        vec![
+            (KeyCode::Char('<'), KeyModifiers::NONE),
+            (KeyCode::Char('x'), KeyModifiers::NONE)
+        ]
+    );
     assert_eq!(keys("<lt>"), vec![(KeyCode::Char('<'), KeyModifiers::NONE)]);
 }
 
@@ -169,7 +189,11 @@ fn desired_column_resets_after_focus_changes() {
     ed.area.cursor_col = 1;
     ed.vim.enter_normal(&mut ed.area);
     ed.feed("j");
-    assert_eq!(ed.show(), "abcd\na|bcd", "a new vertical run starts from the actual column");
+    assert_eq!(
+        ed.show(),
+        "abcd\na|bcd",
+        "a new vertical run starts from the actual column"
+    );
 }
 
 #[test]
@@ -392,11 +416,23 @@ fn yank_fills_the_register_without_changing_the_buffer() {
     let mut ed = Ed::new("|foo bar");
     ed.feed("yw");
     assert_eq!(ed.show(), "|foo bar");
-    assert_eq!(ed.vim.register(), &Register { text: "foo ".into(), linewise: false });
+    assert_eq!(
+        ed.vim.register(),
+        &Register {
+            text: "foo ".into(),
+            linewise: false
+        }
+    );
 
     let mut ed = Ed::new("|a\nb\nc");
     ed.feed("y2j");
-    assert_eq!(ed.vim.register(), &Register { text: "a\nb\nc".into(), linewise: true });
+    assert_eq!(
+        ed.vim.register(),
+        &Register {
+            text: "a\nb\nc".into(),
+            linewise: true
+        }
+    );
 }
 
 #[test]
@@ -405,7 +441,11 @@ fn deletes_fill_the_register_but_empty_deletes_do_not_clobber_it() {
     ed.feed("x");
     assert_eq!(ed.vim.register().text, "a");
     ed.feed("jx");
-    assert_eq!(ed.vim.register().text, "a", "x on an empty line leaves the register alone");
+    assert_eq!(
+        ed.vim.register().text,
+        "a",
+        "x on an empty line leaves the register alone"
+    );
 }
 
 // -- insert mode -------------------------------------------------------------
@@ -524,7 +564,11 @@ fn undo_history_is_capped() {
     for _ in 0..UNDO_LIMIT {
         ed.feed("u");
     }
-    assert_eq!(ed.area.lines[0].chars().count(), 50, "only the last {UNDO_LIMIT} steps are kept");
+    assert_eq!(
+        ed.area.lines[0].chars().count(),
+        50,
+        "only the last {UNDO_LIMIT} steps are kept"
+    );
     ed.feed("u");
     assert_eq!(ed.outcomes, vec![Outcome::Notice("Already at oldest change".into())]);
 }
@@ -581,13 +625,25 @@ fn visual_line_operations() {
 fn visual_yank_fills_the_register_and_returns_to_normal() {
     let mut ed = Ed::new("a|bcd");
     ed.feed("v$y");
-    assert_eq!(ed.vim.register(), &Register { text: "bcd".into(), linewise: false });
+    assert_eq!(
+        ed.vim.register(),
+        &Register {
+            text: "bcd".into(),
+            linewise: false
+        }
+    );
     assert_eq!(ed.vim.mode, Mode::Normal);
     assert_eq!(ed.show(), "a|bcd");
 
     let mut ed = Ed::new("|a\nb");
     ed.feed("Vjy");
-    assert_eq!(ed.vim.register(), &Register { text: "a\nb".into(), linewise: true });
+    assert_eq!(
+        ed.vim.register(),
+        &Register {
+            text: "a\nb".into(),
+            linewise: true
+        }
+    );
 }
 
 #[test]
@@ -609,7 +665,11 @@ fn visual_mode_switching_and_escape() {
 #[test]
 fn selection_on_row_reports_the_highlighted_columns() {
     let mut ed = Ed::new("a|bcd\nefg");
-    assert_eq!(ed.vim.selection_on_row(&ed.area, 0), None, "no selection outside Visual mode");
+    assert_eq!(
+        ed.vim.selection_on_row(&ed.area, 0),
+        None,
+        "no selection outside Visual mode"
+    );
     ed.feed("vlj");
     assert_eq!(ed.vim.selection_on_row(&ed.area, 0), Some((1, 4)));
     assert_eq!(ed.vim.selection_on_row(&ed.area, 1), Some((0, 3)));
@@ -628,7 +688,10 @@ fn ex_commands_produce_outcomes() {
         (":q!<CR>", Outcome::Quit { force: true }),
         (":wq<CR>", Outcome::Send),
         (":x<CR>", Outcome::Send),
-        (":w<CR>", Outcome::Notice("Drafts aren't saved yet — :wq sends, :q! discards".into())),
+        (
+            ":w<CR>",
+            Outcome::Notice("Drafts aren't saved yet — :wq sends, :q! discards".into()),
+        ),
         (":foo<CR>", Outcome::Notice("Not an editor command: foo".into())),
     ];
     for (keys, expected) in cases {
@@ -702,7 +765,10 @@ struct Lcg(u64);
 
 impl Lcg {
     fn next(&mut self) -> usize {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.0 >> 33) as usize
     }
 }
@@ -713,18 +779,27 @@ fn assert_invariants(ed: &Ed, context: &str) {
     assert!(!area.lines.is_empty(), "buffer emptied: {context}");
     assert!(area.cursor_row < area.lines.len(), "row out of bounds: {context}");
     let len = area.lines[area.cursor_row].chars().count();
-    let max = if ed.vim.mode == Mode::Insert { len } else { len.saturating_sub(1) };
-    assert!(area.cursor_col <= max, "col {} past {max} in {:?}: {context}", area.cursor_col, ed.vim.mode);
+    let max = if ed.vim.mode == Mode::Insert {
+        len
+    } else {
+        len.saturating_sub(1)
+    };
+    assert!(
+        area.cursor_col <= max,
+        "col {} past {max} in {:?}: {context}",
+        area.cursor_col,
+        ed.vim.mode
+    );
 }
 
 #[test]
 fn random_key_sequences_never_panic_or_break_invariants() {
     const ALPHABET: &[&str] = &[
-        "h", "j", "k", "l", "w", "b", "e", "W", "B", "E", "0", "^", "$", "g", "G", "f", "F", "t", "T", ";", ",",
-        "{", "}", "%", "x", "X", "d", "c", "y", "D", "C", "p", "P", "u", "<C-r>", "J", "~", "r", "s", "S", "i",
-        "a", "I", "A", "o", "O", "v", "V", ".", "n", "N", "*", "#", ":", "/", "?", "q", "!", "2", "3", "<Esc>",
-        "<CR>", "<BS>", "<C-w>", "<C-u>", "<C-d>", "ä", " ", "(", ")", "\"", "<Left>", "<Right>", "<Up>",
-        "<Down>", "<Home>", "<End>", "<Del>", "Y", "p", "U", "o",
+        "h", "j", "k", "l", "w", "b", "e", "W", "B", "E", "0", "^", "$", "g", "G", "f", "F", "t", "T", ";", ",", "{",
+        "}", "%", "x", "X", "d", "c", "y", "D", "C", "p", "P", "u", "<C-r>", "J", "~", "r", "s", "S", "i", "a", "I",
+        "A", "o", "O", "v", "V", ".", "n", "N", "*", "#", ":", "/", "?", "q", "!", "2", "3", "<Esc>", "<CR>", "<BS>",
+        "<C-w>", "<C-u>", "<C-d>", "ä", " ", "(", ")", "\"", "<Left>", "<Right>", "<Up>", "<Down>", "<Home>", "<End>",
+        "<Del>", "Y", "p", "U", "o",
     ];
     const SAMPLES: &[&str] = &[
         "|",

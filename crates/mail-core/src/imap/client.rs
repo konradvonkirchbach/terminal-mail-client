@@ -89,11 +89,7 @@ pub(crate) async fn logout(session: &mut ImapSession) {
 
 /// Fetches envelopes for a sequence-number range (`start:end`), used for
 /// the initial bulk sync of a folder.
-pub(crate) async fn fetch_envelope_seq_range(
-    session: &mut ImapSession,
-    start: u32,
-    end: u32,
-) -> Result<Vec<Envelope>> {
+pub(crate) async fn fetch_envelope_seq_range(session: &mut ImapSession, start: u32, end: u32) -> Result<Vec<Envelope>> {
     let fetches: Vec<_> = session
         .fetch(format!("{start}:{end}"), "(UID FLAGS BODY.PEEK[HEADER])")
         .await
@@ -107,10 +103,7 @@ pub(crate) async fn fetch_envelope_seq_range(
 
 /// Fetches envelopes for a specific UID set (e.g. `"42,57:60"`), used to
 /// pull down mail that arrived since the last sync.
-pub(crate) async fn fetch_envelopes_by_uid(
-    session: &mut ImapSession,
-    uid_set: &str,
-) -> Result<Vec<Envelope>> {
+pub(crate) async fn fetch_envelopes_by_uid(session: &mut ImapSession, uid_set: &str) -> Result<Vec<Envelope>> {
     let fetches: Vec<_> = session
         .uid_fetch(uid_set, "(UID FLAGS BODY.PEEK[HEADER])")
         .await
@@ -145,10 +138,7 @@ pub(crate) fn escape_search_term(term: &str) -> String {
 
 /// Fetches just flags for a UID set — the cheap half of the incremental
 /// sync's "did anything change" sweep over recently-cached messages.
-pub(crate) async fn fetch_flags_by_uid(
-    session: &mut ImapSession,
-    uid_set: &str,
-) -> Result<Vec<(u32, Flags)>> {
+pub(crate) async fn fetch_flags_by_uid(session: &mut ImapSession, uid_set: &str) -> Result<Vec<(u32, Flags)>> {
     let fetches: Vec<_> = session
         .uid_fetch(uid_set, "(UID FLAGS)")
         .await
@@ -248,7 +238,11 @@ pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
             } else {
                 part.contents().to_vec()
             };
-            MessageAttachment { filename, size_bytes, bytes }
+            MessageAttachment {
+                filename,
+                size_bytes,
+                bytes,
+            }
         })
         .collect();
 
@@ -475,9 +469,7 @@ mod tests {
 
     #[test]
     fn message_from_raw_extracts_a_named_attachment() {
-        let raw = multipart_message_with_attachment(
-            "Content-Disposition: attachment; filename=\"notes.txt\"",
-        );
+        let raw = multipart_message_with_attachment("Content-Disposition: attachment; filename=\"notes.txt\"");
         let msg = message_from_raw(1, &raw).unwrap();
 
         assert_eq!(msg.attachments.len(), 1);

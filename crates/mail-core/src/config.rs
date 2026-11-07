@@ -159,8 +159,7 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let raw =
-            toml::to_string_pretty(self).map_err(|e| Error::Config(format!("serialize: {e}")))?;
+        let raw = toml::to_string_pretty(self).map_err(|e| Error::Config(format!("serialize: {e}")))?;
         std::fs::write(&path, raw)?;
         Ok(())
     }

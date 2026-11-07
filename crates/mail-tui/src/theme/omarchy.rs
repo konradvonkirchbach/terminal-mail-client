@@ -28,9 +28,7 @@ struct OmarchyColors {
 /// to `Theme::fallback()` in that case.
 pub fn load() -> Option<Theme> {
     let base = directories::BaseDirs::new()?;
-    let path = base
-        .state_dir()?
-        .join("omarchy/current/theme/colors.toml");
+    let path = base.state_dir()?.join("omarchy/current/theme/colors.toml");
 
     let raw = std::fs::read_to_string(path).ok()?;
     let colors: OmarchyColors = toml::from_str(&raw).ok()?;
