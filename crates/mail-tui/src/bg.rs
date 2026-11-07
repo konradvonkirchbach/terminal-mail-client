@@ -90,6 +90,11 @@ pub enum BgMsg {
         compose_id: u64,
         by_line: Vec<HashMap<String, Vec<String>>>,
     },
+    /// Saving an attachment (extracting it, then writing `path`) finished.
+    AttachmentSaved {
+        path: std::path::PathBuf,
+        result: Result<(), String>,
+    },
     /// A (re)detection of the dictionary matching the active keyboard
     /// layout finished — replaces whatever spellchecker was running.
     /// Fired every time compose opens, so switching keyboard layout before
@@ -215,6 +220,13 @@ pub fn apply(app: &mut App, session: &mut Session, msg: BgMsg) {
                 compose.set_all_misspellings(by_line);
             }
         }
+        BgMsg::AttachmentSaved { path, result } => match result {
+            Ok(()) => app.set_status(format!("Saved to {}", path.display())),
+            Err(e) => {
+                tracing::error!("saving attachment to {} failed: {e}", path.display());
+                app.set_status(format!("Couldn't save {}: {e}", path.display()));
+            }
+        },
         BgMsg::SpellCheckerReady { handle, language } => {
             if let Some(compose) = &mut app.compose {
                 match &handle {
@@ -328,6 +340,27 @@ pub fn spawn_fetch_body(ctx: AccountCtx, uid: u32, tx: mpsc::Sender<BgMsg>) {
             uid,
             result,
         },
+    );
+}
+
+pub fn spawn_save_attachment(
+    ctx: AccountCtx,
+    uid: u32,
+    index: usize,
+    path: std::path::PathBuf,
+    tx: mpsc::Sender<BgMsg>,
+) {
+    let target = path.clone();
+    spawn_bg(
+        tx,
+        async move {
+            let bytes =
+                mail_core::sync::attachment_bytes(&ctx.account, &ctx.store, ctx.account_id, ctx.folder_id, uid, index)
+                    .await?;
+            tokio::fs::write(&target, bytes).await?;
+            Ok::<_, mail_core::Error>(())
+        },
+        move |result| BgMsg::AttachmentSaved { path, result },
     );
 }
 

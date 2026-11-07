@@ -29,7 +29,7 @@ fn default_download_dir() -> PathBuf {
 
 pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session: &mut Session) {
     if app.file_browser.is_some() {
-        handle_browser_key(app, code);
+        handle_browser_key(app, code, session);
         return;
     }
 
@@ -252,22 +252,10 @@ fn start_download(app: &mut App) {
     let Some(attachment) = message.attachments.get(app.selected_attachment) else {
         return;
     };
-
-    // mail-core skips loading the content of a pathologically large
-    // attachment (see MAX_ATTACHMENT_LOAD_BYTES) — bytes empty but a
-    // nonzero size means "too large," not "actually empty."
-    if attachment.bytes.is_empty() && attachment.size_bytes > 0 {
-        app.set_status(format!(
-            "{} is too large to download ({}).",
-            attachment.filename,
-            attach::human_size(attachment.size_bytes)
-        ));
-        return;
-    }
-
     let browser = FileBrowser::open_for_save(default_download_dir(), attachment.filename.clone());
     let purpose = BrowserPurpose::SaveAttachment {
-        bytes: attachment.bytes.clone(),
+        uid: message.uid,
+        index: app.selected_attachment,
     };
     app.file_browser = Some((browser, purpose));
 }
@@ -482,7 +470,7 @@ fn edit_input(compose: &mut ComposeState, op: impl Fn(&mut TextInput)) {
 /// attach and for picking where to save a downloaded attachment. All of
 /// this is local filesystem work (stat/read-dir/write), so it stays
 /// synchronous rather than round-tripping through a background task.
-fn handle_browser_key(app: &mut App, code: KeyCode) {
+fn handle_browser_key(app: &mut App, code: KeyCode, session: &Session) {
     match code {
         KeyCode::Esc => {
             app.file_browser = None;
@@ -505,7 +493,7 @@ fn handle_browser_key(app: &mut App, code: KeyCode) {
             KeyCode::Right => edit_browser_filename(app, TextInput::right),
             KeyCode::Char(c) => edit_browser_filename(app, move |f| f.insert(c)),
             KeyCode::Backspace => edit_browser_filename(app, TextInput::backspace),
-            KeyCode::Enter => confirm_save(app),
+            KeyCode::Enter => confirm_save(app, session),
             _ => {}
         }
         return;
@@ -588,44 +576,46 @@ fn finish_attach(app: &mut App, path: PathBuf) {
     }
 }
 
-fn confirm_save(app: &mut App) {
-    let Some((browser, BrowserPurpose::SaveAttachment { bytes })) = &mut app.file_browser else {
+/// Enter in the save dialog's filename field: saves in the background once
+/// the target is confirmed (see `confirm_save_target`).
+fn confirm_save(app: &mut App, session: &Session) {
+    let Some((path, uid, index)) = confirm_save_target(app) else {
         return;
     };
-    let Some(save_path) = browser.save_path() else { return };
+    app.file_browser = None;
+    app.set_status(format!("Saving to {}...", path.display()));
+    bg::spawn_save_attachment(session.accounts.current().clone(), uid, index, path, session.tx.clone());
+}
 
-    // Never silently replace an existing file: the first Enter asks, a
-    // second one on the same path confirms.
+/// Decides whether the save dialog's current path may be written: returns
+/// it, with the attachment to save there, or `None` while it's still
+/// waiting on the user. Never silently replaces an existing file: the
+/// first Enter on one asks, a second on the same path confirms.
+fn confirm_save_target(app: &mut App) -> Option<(PathBuf, u32, usize)> {
+    let Some((browser, BrowserPurpose::SaveAttachment { uid, index })) = &mut app.file_browser else {
+        return None;
+    };
+    let save_path = browser.save_path()?;
     if save_path.exists() && browser.confirm_overwrite.as_ref() != Some(&save_path) {
         browser.error = Some(format!(
             "{} already exists — press Enter again to overwrite, or edit the name.",
             save_path.display()
         ));
         browser.confirm_overwrite = Some(save_path);
-        return;
+        return None;
     }
-
-    match std::fs::write(&save_path, bytes) {
-        Ok(()) => {
-            app.set_status(format!("Saved to {}", save_path.display()));
-            app.file_browser = None;
-        }
-        Err(e) => {
-            browser.confirm_overwrite = None;
-            browser.error = Some(format!("{}: {e}", save_path.display()));
-        }
-    }
+    Some((save_path, *uid, *index))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn app_saving(dir: &Path, name: &str, bytes: &[u8]) -> App {
+    fn app_saving(dir: &Path, name: &str) -> App {
         let mut app = App::new(vec!["me@example.com".to_string()]);
         app.file_browser = Some((
             FileBrowser::open_for_save(dir.to_path_buf(), name.to_string()),
-            BrowserPurpose::SaveAttachment { bytes: bytes.to_vec() },
+            BrowserPurpose::SaveAttachment { uid: 7, index: 1 },
         ));
         app
     }
@@ -745,44 +735,36 @@ mod tests {
     }
 
     #[test]
-    fn saving_a_new_file_writes_it_straight_away() {
+    fn saving_to_a_new_path_is_confirmed_straight_away() {
         let dir = tempfile::tempdir().unwrap();
-        let mut app = app_saving(dir.path(), "new.txt", b"hello");
+        let mut app = app_saving(dir.path(), "new.txt");
 
-        confirm_save(&mut app);
-
-        assert_eq!(std::fs::read(dir.path().join("new.txt")).unwrap(), b"hello");
-        assert!(app.file_browser.is_none());
+        assert_eq!(confirm_save_target(&mut app), Some((dir.path().join("new.txt"), 7, 1)));
     }
 
     #[test]
     fn overwriting_an_existing_file_needs_a_second_enter() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("a.txt");
-        std::fs::write(&target, b"old").unwrap();
-        let mut app = app_saving(dir.path(), "a.txt", b"new");
+        std::fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        let mut app = app_saving(dir.path(), "a.txt");
 
-        confirm_save(&mut app);
-        assert_eq!(std::fs::read(&target).unwrap(), b"old", "the first Enter only asks");
+        assert_eq!(confirm_save_target(&mut app), None, "the first Enter only asks");
         assert!(app.file_browser.as_ref().unwrap().0.error.is_some());
 
-        confirm_save(&mut app);
-        assert_eq!(std::fs::read(&target).unwrap(), b"new");
-        assert!(app.file_browser.is_none());
+        assert_eq!(confirm_save_target(&mut app), Some((dir.path().join("a.txt"), 7, 1)));
     }
 
     #[test]
     fn editing_the_name_cancels_a_pending_overwrite_prompt() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"old").unwrap();
-        let mut app = app_saving(dir.path(), "a.txt", b"new");
+        let mut app = app_saving(dir.path(), "a.txt");
 
-        confirm_save(&mut app);
+        assert_eq!(confirm_save_target(&mut app), None);
         edit_browser_filename(&mut app, TextInput::backspace);
         edit_browser_filename(&mut app, |f| f.insert('t'));
         assert!(app.file_browser.as_ref().unwrap().0.confirm_overwrite.is_none());
 
-        confirm_save(&mut app); // "a.txt" again: must ask again
-        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"old");
+        assert_eq!(confirm_save_target(&mut app), None, "\"a.txt\" again: must ask again");
     }
 }

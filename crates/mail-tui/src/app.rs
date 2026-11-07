@@ -34,11 +34,12 @@ pub const MAX_RECIPIENT_SUGGESTIONS: usize = 8;
 /// when the user picks a file or confirms a save location.
 pub enum BrowserPurpose {
     AttachToCompose,
-    /// The original filename lives in the browser's own editable
-    /// `filename` field (prefilled from it); only the bytes need
-    /// carrying separately.
+    /// Which attachment of which message to save; the filename lives in
+    /// the browser's own editable `filename` field (prefilled from it).
+    /// The content is only extracted once a location is confirmed.
     SaveAttachment {
-        bytes: Vec<u8>,
+        uid: u32,
+        index: usize,
     },
 }
 

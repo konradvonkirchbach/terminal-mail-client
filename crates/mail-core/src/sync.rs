@@ -276,26 +276,24 @@ pub async fn fetch_body(
     folder_id: i64,
     uid: u32,
 ) -> Result<Message> {
-    if let Some(path) = store.get_message_raw_path(folder_id, uid).await? {
-        if let Ok(raw) = tokio::fs::read(&path).await {
-            if let Ok(message) = client::message_from_raw(uid, &raw) {
-                // Served from the cache, so the server never saw this
-                // message being read: mark it there too (in the
-                // background — the body is ready now).
-                if store.mark_seen(folder_id, uid).await? {
-                    let account = account.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = client::mark_seen(&account, uid).await {
-                            tracing::warn!("failed to mark uid {uid} read on the server: {e}");
-                        }
-                    });
-                }
-                return Ok(message);
+    if let Some(raw) = cached_raw(store, folder_id, uid).await? {
+        if let Ok(message) = client::message_from_raw(uid, &raw) {
+            // Served from the cache, so the server never saw this message
+            // being read: mark it there too (in the background — the body
+            // is ready now).
+            if store.mark_seen(folder_id, uid).await? {
+                let account = account.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = client::mark_seen(&account, uid).await {
+                        tracing::warn!("failed to mark uid {uid} read on the server: {e}");
+                    }
+                });
             }
+            return Ok(message);
         }
-        // Cache entry pointed at a file that's missing or unparsable —
-        // fall through and refetch it.
+        // The cached file is unparsable — fall through and refetch it.
     }
+    // (No cache entry, or its file has gone missing: fetch it.)
 
     // Fetching `BODY[]` sets `\Seen` on the server by itself; just mirror it
     // locally so the list doesn't keep showing the message as unread until
@@ -309,6 +307,39 @@ pub async fn fetch_body(
     }
 
     Ok(message)
+}
+
+/// The decoded content of attachment `index` (its position in
+/// `Message::attachments`) of message `uid`, read from the on-disk cache —
+/// where opening the message put it — or fetched and cached again if the
+/// file has gone missing since.
+pub async fn attachment_bytes(
+    account: &Account,
+    store: &Store,
+    account_id: i64,
+    folder_id: i64,
+    uid: u32,
+    index: usize,
+) -> Result<Vec<u8>> {
+    let raw = match cached_raw(store, folder_id, uid).await? {
+        Some(raw) => raw,
+        None => {
+            let raw = client::fetch_message_raw(account, uid).await?;
+            if let Err(e) = cache_raw_message(store, account_id, folder_id, uid, &raw).await {
+                tracing::warn!("failed to cache message uid {uid} on disk: {e}");
+            }
+            raw
+        }
+    };
+    client::attachment_from_raw(uid, &raw, index)
+}
+
+/// The cached raw message, if one was cached and its file is still readable.
+async fn cached_raw(store: &Store, folder_id: i64, uid: u32) -> Result<Option<Vec<u8>>> {
+    let Some(path) = store.get_message_raw_path(folder_id, uid).await? else {
+        return Ok(None);
+    };
+    Ok(tokio::fs::read(&path).await.ok())
 }
 
 /// Deletes a message on the server (moved to Trash if a candidate folder

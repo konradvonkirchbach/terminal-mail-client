@@ -252,16 +252,6 @@ pub(crate) async fn fetch_message_raw(account: &Account, uid: u32) -> Result<Vec
         .ok_or_else(|| Error::Imap(format!("no such message: uid {uid}")))
 }
 
-/// A message's raw bytes are already fully in memory by the time we parse
-/// it (fetched whole over IMAP, or read whole from the on-disk cache), so
-/// this doesn't bound total memory use — it bounds the *extra* copy each
-/// attachment gets when we pull its decoded bytes out into our own
-/// `MessageAttachment`. Generous relative to what any mainstream provider
-/// lets through in the first place (Gmail/Yahoo ~25MB, Outlook ~20MB
-/// total per message), so it should never trigger for real mail; it's a
-/// backstop against a pathological/oversized message, not a normal limit.
-const MAX_ATTACHMENT_LOAD_BYTES: u64 = 50 * 1024 * 1024;
-
 /// Parses raw RFC822 bytes (freshly fetched or read back from the on-disk
 /// cache) into our `Message` type.
 pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
@@ -277,20 +267,9 @@ pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
                 .attachment_name()
                 .and_then(safe_filename)
                 .unwrap_or_else(|| format!("attachment-{}", i + 1));
-            let size_bytes = part.contents().len() as u64;
-            let bytes = if size_bytes > MAX_ATTACHMENT_LOAD_BYTES {
-                tracing::warn!(
-                    "uid {uid}: attachment {filename:?} is {size_bytes} bytes, over the \
-                     {MAX_ATTACHMENT_LOAD_BYTES}-byte load cap — skipping its content"
-                );
-                Vec::new()
-            } else {
-                part.contents().to_vec()
-            };
             MessageAttachment {
                 filename,
-                size_bytes,
-                bytes,
+                size_bytes: part.contents().len() as u64,
             }
         })
         .collect();
@@ -308,6 +287,19 @@ pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
             .unwrap_or_default(),
         attachments,
     })
+}
+
+/// The decoded content of the message's `index`-th attachment, in the same
+/// order `message_from_raw` lists them. Extracted on demand (when the user
+/// saves one) rather than copied into every `Message` up front, which used
+/// to hold every attachment — inline images included — in memory just for
+/// opening a message.
+pub(crate) fn attachment_from_raw(uid: u32, raw: &[u8], index: usize) -> Result<Vec<u8>> {
+    let parsed = mail_parser::MessageParser::default()
+        .parse(raw)
+        .ok_or_else(|| Error::Parse(format!("failed to parse message uid {uid}")))?;
+    let bytes = parsed.attachments().nth(index).map(|part| part.contents().to_vec());
+    bytes.ok_or_else(|| Error::Parse(format!("message uid {uid} has no attachment #{}", index + 1)))
 }
 
 /// Reduces an attachment name taken from a message header to a plain file
@@ -596,8 +588,9 @@ mod tests {
 
         assert_eq!(msg.attachments.len(), 1);
         assert_eq!(msg.attachments[0].filename, "notes.txt");
-        assert_eq!(msg.attachments[0].bytes, b"hello world");
         assert_eq!(msg.attachments[0].size_bytes, 11);
+        assert_eq!(attachment_from_raw(1, &raw, 0).unwrap(), b"hello world");
+        assert!(attachment_from_raw(1, &raw, 1).is_err(), "there's only one");
     }
 
     #[test]

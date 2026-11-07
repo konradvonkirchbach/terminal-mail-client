@@ -50,14 +50,15 @@ pub struct Message {
     pub attachments: Vec<MessageAttachment>,
 }
 
-/// An attachment extracted from a received message, bytes and all — read
-/// alongside the body since we've already parsed the whole raw message by
-/// that point, so there's no separate fetch to save a download for later.
+/// An attachment of a received message: what to show for it. The content
+/// itself is extracted only when it's saved — see
+/// `sync::attachment_bytes`, which takes its index in `Message::attachments`.
 #[derive(Debug, Clone)]
 pub struct MessageAttachment {
+    /// A plain file name, safe to use as a default when saving (no path
+    /// components — see `imap::client::safe_filename`).
     pub filename: String,
     pub size_bytes: u64,
-    pub bytes: Vec<u8>,
 }
 
 #[cfg(test)]
