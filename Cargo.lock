@@ -1732,7 +1732,6 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

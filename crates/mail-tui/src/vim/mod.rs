@@ -18,6 +18,8 @@ mod motion;
 #[cfg(test)]
 mod tests;
 
+use std::collections::VecDeque;
+
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::editable::TextArea;
@@ -200,7 +202,8 @@ pub struct Vim {
     pub command_line: String,
     pending: Pending,
     register: Register,
-    undo: Vec<Snapshot>,
+    /// Oldest first; capped at `UNDO_LIMIT` by dropping from the front.
+    undo: VecDeque<Snapshot>,
     redo: Vec<Snapshot>,
     /// The buffer as it was before the change in progress — committed to
     /// `undo` once the change completes (a Normal-mode command, or a whole
@@ -236,7 +239,7 @@ impl Vim {
             command_line: String::new(),
             pending: Pending::default(),
             register: Register::default(),
-            undo: Vec::new(),
+            undo: VecDeque::new(),
             redo: Vec::new(),
             pending_undo: None,
             last_find: None,
@@ -365,9 +368,9 @@ impl Vim {
     fn commit_undo(&mut self, area: &TextArea) {
         if let Some(snapshot) = self.pending_undo.take() {
             if snapshot.lines != area.lines {
-                self.undo.push(snapshot);
+                self.undo.push_back(snapshot);
                 if self.undo.len() > UNDO_LIMIT {
-                    self.undo.remove(0);
+                    self.undo.pop_front();
                 }
                 self.redo.clear();
             }
@@ -945,7 +948,7 @@ impl Vim {
         // The snapshot taken for this key isn't a change of its own.
         self.pending_undo = None;
         for i in 0..count {
-            let Some(snapshot) = self.undo.pop() else {
+            let Some(snapshot) = self.undo.pop_back() else {
                 return if i == 0 {
                     Outcome::Notice("Already at oldest change".to_string())
                 } else {
@@ -968,7 +971,7 @@ impl Vim {
                     Outcome::None
                 };
             };
-            self.undo.push(Snapshot::of(area));
+            self.undo.push_back(Snapshot::of(area));
             snapshot.restore(area);
         }
         Outcome::None

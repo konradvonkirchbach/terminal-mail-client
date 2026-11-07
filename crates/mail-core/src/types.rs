@@ -10,17 +10,6 @@ pub struct Flags {
     pub draft: bool,
 }
 
-/// Named accessor kept around for future per-flag matching (filters, etc.)
-/// without exposing the raw bitfield shape everywhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Flag {
-    Seen,
-    Answered,
-    Flagged,
-    Deleted,
-    Draft,
-}
-
 /// Header-only summary of a message, cheap to fetch and enough to render
 /// the message list without pulling the body over the wire.
 #[derive(Debug, Clone)]

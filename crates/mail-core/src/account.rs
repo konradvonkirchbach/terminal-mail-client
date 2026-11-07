@@ -1,7 +1,7 @@
 use crate::config::AccountConfig;
 use crate::error::{Error, Result};
 
-const KEYRING_SERVICE: &str = "email_client";
+const KEYRING_SERVICE: &str = crate::config::APP_ID;
 
 /// A configured account plus the ability to fetch its secret from the OS
 /// keyring. The config file never stores the password itself.

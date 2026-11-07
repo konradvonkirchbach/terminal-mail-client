@@ -37,8 +37,9 @@ pub struct AccountConfig {
     #[serde(default)]
     pub auth: AuthMethod,
 
-    /// How many recent messages to pull into memory in Phase 1 (no local
-    /// cache yet). Kept small by default so startup stays fast.
+    /// How many messages one page from the server holds: the initial sync
+    /// fetches the newest this many, and each "load older mail" another
+    /// batch. Kept small by default so startup stays fast.
     #[serde(default = "default_fetch_limit")]
     pub fetch_limit: u32,
 }
@@ -84,16 +85,28 @@ fn default_theme_mode() -> String {
     "auto".to_string()
 }
 
+/// The application's on-disk identity: names its config, data and log
+/// directories and its OS keyring service. Changing it would orphan every
+/// existing install's config, cache and stored passwords.
+pub const APP_ID: &str = "email_client";
+
+fn project_dirs() -> Result<directories::ProjectDirs> {
+    directories::ProjectDirs::from("", "", APP_ID)
+        .ok_or_else(|| Error::Config("could not determine the config/data directories".into()))
+}
+
 pub fn config_path() -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "email_client")
-        .ok_or_else(|| Error::Config("could not determine config directory".into()))?;
-    Ok(dirs.config_dir().join("config.toml"))
+    Ok(project_dirs()?.config_dir().join("config.toml"))
 }
 
 fn data_dir() -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "email_client")
-        .ok_or_else(|| Error::Config("could not determine data directory".into()))?;
-    Ok(dirs.data_dir().to_path_buf())
+    Ok(project_dirs()?.data_dir().to_path_buf())
+}
+
+/// Where the TUI writes its log files.
+pub fn log_dir() -> Result<PathBuf> {
+    let dirs = project_dirs()?;
+    Ok(dirs.state_dir().unwrap_or_else(|| dirs.cache_dir()).join("logs"))
 }
 
 /// Path to the local SQLite cache.
@@ -160,7 +173,12 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         let raw = toml::to_string_pretty(self).map_err(|e| Error::Config(format!("serialize: {e}")))?;
-        std::fs::write(&path, raw)?;
+        // Write a sibling temp file and rename it over the real one: a
+        // crash or full disk mid-write then leaves the old config intact
+        // rather than a truncated one (which would read as "no accounts").
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, raw)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 }
@@ -170,26 +188,14 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// A scratch directory under the OS temp dir, unique to this test
-    /// process/thread/call — deliberately not the real config/data dirs,
-    /// since these tests must never touch the user's actual mail cache.
-    struct ScratchDir(PathBuf);
+    /// A throwaway directory, deleted again on drop — these tests must
+    /// never touch real user files. `.0` is its path.
+    struct ScratchDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     impl ScratchDir {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "mail-core-test-{label}-{}-{:?}",
-                std::process::id(),
-                std::time::Instant::now()
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+        fn new(_label: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            Self(dir.path().to_path_buf(), dir)
         }
     }
 

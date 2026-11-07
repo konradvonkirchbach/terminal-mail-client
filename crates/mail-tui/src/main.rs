@@ -33,8 +33,7 @@ use session::{AccountCtx, Accounts, Session, DISPLAY_LIMIT};
 use vim::Mode as VimMode;
 
 fn init_tracing() -> anyhow::Result<()> {
-    let dirs = directories::ProjectDirs::from("", "", "email_client").context("could not determine state directory")?;
-    let log_dir = dirs.state_dir().unwrap_or_else(|| dirs.cache_dir()).join("logs");
+    let log_dir = mail_core::config::log_dir().context("could not determine the log directory")?;
     std::fs::create_dir_all(&log_dir)?;
     let file_appender = tracing_appender::rolling::daily(log_dir, "mail-tui.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);

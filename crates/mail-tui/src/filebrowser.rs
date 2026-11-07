@@ -151,25 +151,14 @@ impl FileBrowser {
 mod tests {
     use super::*;
 
-    /// A scratch directory tree under the OS temp dir, unique per test —
-    /// these tests must never touch real user files.
-    struct ScratchDir(PathBuf);
+    /// A throwaway directory, deleted again on drop — these tests must
+    /// never touch real user files. `.0` is its path.
+    struct ScratchDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
     impl ScratchDir {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "mail-tui-test-fb-{label}-{}-{:?}",
-                std::process::id(),
-                std::time::Instant::now()
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+        fn new(_label: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            Self(dir.path().to_path_buf(), dir)
         }
     }
 

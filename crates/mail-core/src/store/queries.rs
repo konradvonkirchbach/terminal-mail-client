@@ -9,7 +9,6 @@ use crate::types::{Address, Envelope, Flags};
 pub struct FolderRow {
     pub id: i64,
     pub uidvalidity: Option<u32>,
-    pub uidnext: Option<u32>,
 }
 
 pub fn upsert_account(conn: &Connection, email: &str, display_name: Option<&str>) -> Result<i64> {
@@ -40,13 +39,12 @@ pub fn get_or_create_folder(conn: &Connection, account_id: i64, name: &str) -> R
         params![account_id, name],
     )?;
     conn.query_row(
-        "SELECT id, uidvalidity, uidnext FROM folders WHERE account_id = ?1 AND name = ?2",
+        "SELECT id, uidvalidity FROM folders WHERE account_id = ?1 AND name = ?2",
         params![account_id, name],
         |row| {
             Ok(FolderRow {
                 id: row.get(0)?,
                 uidvalidity: row.get::<_, Option<i64>>(1)?.map(|v| v as u32),
-                uidnext: row.get::<_, Option<i64>>(2)?.map(|v| v as u32),
             })
         },
     )
@@ -208,8 +206,9 @@ pub fn max_uid(conn: &Connection, folder_id: i64) -> Result<Option<u32>> {
     .map_err(Into::into)
 }
 
-/// The lowest UID cached for a folder — the boundary "load older mail"
-/// backfills below.
+/// The lowest UID cached for a folder. Only tests need it: "load older
+/// mail" deliberately goes by `backfill_floor` instead.
+#[cfg(test)]
 pub fn min_uid(conn: &Connection, folder_id: i64) -> Result<Option<u32>> {
     conn.query_row(
         "SELECT MIN(uid) FROM messages WHERE folder_id = ?1",
@@ -442,7 +441,6 @@ mod tests {
         let f2 = get_or_create_folder(&conn, account_id, "INBOX").unwrap();
         assert_eq!(f1.id, f2.id);
         assert_eq!(f1.uidvalidity, None);
-        assert_eq!(f1.uidnext, None);
     }
 
     #[test]
@@ -454,7 +452,12 @@ mod tests {
 
         let refreshed = get_or_create_folder(&conn, account_id, "INBOX").unwrap();
         assert_eq!(refreshed.uidvalidity, Some(42));
-        assert_eq!(refreshed.uidnext, Some(100));
+        let uidnext: Option<i64> = conn
+            .query_row("SELECT uidnext FROM folders WHERE id = ?1", params![folder.id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(uidnext, Some(100));
     }
 
     #[test]
