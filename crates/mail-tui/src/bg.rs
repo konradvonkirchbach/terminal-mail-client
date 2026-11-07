@@ -92,11 +92,14 @@ pub enum BgMsg {
     },
     /// A (re)detection of the dictionary matching the active keyboard
     /// layout finished — replaces whatever spellchecker was running.
-    /// Fired at startup and again every time compose opens, so switching
-    /// keyboard layout before writing a new email picks up the matching
-    /// dictionary; `None` if no installed dictionary matches (or none is
-    /// installed at all), which simply turns spellcheck off.
-    SpellCheckerReady(Option<spellcheck::SpellCheckHandle>),
+    /// Fired every time compose opens, so switching keyboard layout before
+    /// writing a new email picks up the matching dictionary. `handle` is
+    /// `None` if no installed dictionary matches `language` (or Hunspell
+    /// isn't installed at all), which turns spellcheck off.
+    SpellCheckerReady {
+        handle: Option<spellcheck::SpellCheckHandle>,
+        language: String,
+    },
 }
 
 /// Folds one finished background result into the UI state. Results for an
@@ -212,7 +215,16 @@ pub fn apply(app: &mut App, session: &mut Session, msg: BgMsg) {
                 compose.set_all_misspellings(by_line);
             }
         }
-        BgMsg::SpellCheckerReady(handle) => {
+        BgMsg::SpellCheckerReady { handle, language } => {
+            if let Some(compose) = &mut app.compose {
+                match &handle {
+                    // Anything typed before the checker came up hasn't been
+                    // checked yet.
+                    Some(handle) if !compose.is_blank() => handle.request_full(compose.id, &compose.body.lines),
+                    Some(_) => {}
+                    None => compose.spellcheck_note = Some(format!("spellcheck off: install hunspell-{language}")),
+                }
+            }
             session.spellcheck = handle;
         }
         BgMsg::RemoteSearchDone {
@@ -484,6 +496,10 @@ pub async fn spawn_spellchecker(tx: mpsc::Sender<BgMsg>) -> Option<spellcheck::S
 pub fn spawn_spellchecker_reload(tx: mpsc::Sender<BgMsg>) {
     tokio::spawn(async move {
         let handle = spawn_spellchecker(tx.clone()).await;
-        let _ = tx.send(BgMsg::SpellCheckerReady(handle)).await;
+        let language = match handle {
+            Some(_) => String::new(),
+            None => spellcheck::active_language().await,
+        };
+        let _ = tx.send(BgMsg::SpellCheckerReady { handle, language }).await;
     });
 }

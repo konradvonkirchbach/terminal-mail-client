@@ -154,24 +154,12 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, account
 
     bg::spawn_known_senders(accounts.current().clone(), tx.clone());
 
-    // Compose's spellcheck rides on whatever Hunspell dictionary matches
-    // the language actually being typed in — entirely optional, so a
-    // missing binary or dictionary just leaves it off for the session
-    // instead of failing startup. Re-detected on every compose open too
-    // (see the 'c'/'r' key handlers), so switching keyboard layout
-    // before writing a new email picks up the matching dictionary.
-    let spellcheck_handle = bg::spawn_spellchecker(tx.clone()).await;
-    if spellcheck_handle.is_none() {
-        let lang = spellcheck::active_language().await;
-        app.set_status(format!(
-            "Spellcheck unavailable — install hunspell and a matching dictionary (e.g. hunspell-{lang}) to enable it."
-        ));
-    }
-
+    // Spellcheck starts with the first compose (see `bg::spawn_spellchecker_reload`),
+    // so launch never waits on `hyprctl`/`hunspell`.
     let mut session = Session {
         accounts,
         tx,
-        spellcheck: spellcheck_handle,
+        spellcheck: None,
     };
 
     // Every account gets synced (which also flushes its outbox) concurrently at

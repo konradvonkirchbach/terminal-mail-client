@@ -4,7 +4,7 @@
 //! typed — `find_dictionary_for_active_language` prefers the active
 //! Hyprland keyboard layout, falling back to the system locale
 //! (`detect_locale`) when that can't be read or mapped. Re-detected on
-//! every compose open (see `spawn_spellchecker_reload` in `main.rs`), so
+//! every compose open (see `spawn_spellchecker_reload` in `bg.rs`), so
 //! switching keyboard layout before writing a new email picks up the
 //! right dictionary without restarting the app.
 //!
@@ -14,7 +14,7 @@
 //! (large, per-language wordlists the user's package manager already
 //! knows how to install and update). Degrades silently to "off for this
 //! session" whenever the binary or a dictionary isn't there — see
-//! `spawn_spellchecker` in `main.rs`.
+//! `spawn_spellchecker` in `bg.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -76,13 +76,10 @@ pub fn default_search_dirs() -> Vec<PathBuf> {
 
 /// Every valid `<name>.aff`/`<name>.dic` pair found across
 /// `search_dirs`, as their shared base path (without extension) — what
-/// Hunspell's `-d` flag wants, one entry per installed dictionary.
-/// Deliberately gathers everything rather than picking just the one
-/// matching the detected system locale: Hunspell can check a word
-/// against several dictionaries at once, so someone who writes mail in
-/// more than one language gets accurate results in all of them, with no
-/// extra configuration beyond installing the relevant dictionary
-/// packages. Each directory's matches are sorted for determinism, and
+/// Hunspell's `-d` flag wants, one entry per installed dictionary — the
+/// candidates `best_dictionary_for_language` picks the single active
+/// language's dictionary from. Each directory's matches are sorted for
+/// determinism, and
 /// searched in the order `search_dirs` lists them; a dictionary already
 /// found under an earlier directory is skipped if a later one turns out
 /// to be the same file — Debian/Ubuntu-style layouts symlink an entire
@@ -128,7 +125,7 @@ pub async fn find_dictionary_for_active_language(search_dirs: &[PathBuf]) -> Opt
 /// The language currently being typed in: Hyprland's active keyboard
 /// layout when that can be read (re-checking this each time compose
 /// opens is how switching layout before writing a new email picks up
-/// the right dictionary — see `spawn_spellchecker_reload` in `main.rs`),
+/// the right dictionary — see `spawn_spellchecker_reload` in `bg.rs`),
 /// falling back to the system locale's language otherwise. Exposed
 /// separately from `find_dictionary_for_active_language` so a caller
 /// can name the language in a message (e.g. "no dictionary installed
@@ -265,8 +262,9 @@ fn parse_response_line(line: &str) -> Option<Misspelling> {
 }
 
 /// A running `hunspell -a` process, communicating over its stdin/stdout
-/// pipe. One instance is spawned per app session — the system language
-/// doesn't change mid-run — and reused for every check.
+/// pipe. A fresh one is spawned each time compose opens (the active
+/// keyboard layout, and with it the language, may have changed since the
+/// last) and reused for every check while it's open.
 pub struct SpellChecker {
     child: Child,
     stdin: ChildStdin,
@@ -274,11 +272,10 @@ pub struct SpellChecker {
 }
 
 impl SpellChecker {
-    /// Spawns `hunspell -a -d <dict_bases joined by comma>` — Hunspell
-    /// checks a word against every listed dictionary and only flags it
-    /// if none of them recognize it, so passing several at once is how
-    /// multiple languages get checked together in one process — and
-    /// consumes the startup banner line. Fails if the `hunspell` binary
+    /// Spawns `hunspell -a -d <dict_bases joined by comma>` (in practice
+    /// one dictionary, the active language's; Hunspell would flag only
+    /// words none of several listed ones recognize) and consumes the
+    /// startup banner line. Fails if the `hunspell` binary
     /// isn't installed, `dict_bases` is empty, or it won't start with
     /// these dictionaries.
     pub async fn spawn(dict_bases: &[PathBuf]) -> io::Result<Self> {

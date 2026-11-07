@@ -220,7 +220,13 @@ fn draw_body(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Them
         .border_type(BorderType::Plain)
         .border_style(Style::new().fg(if focused { theme.accent } else { theme.muted }))
         .style(Style::new().bg(theme.background).fg(theme.foreground))
-        .title(Span::styled(" body ", Style::new().fg(theme.bright_foreground)));
+        .title(Span::styled(
+            match &compose.spellcheck_note {
+                Some(note) => format!(" body — {note} "),
+                None => " body ".to_string(),
+            },
+            Style::new().fg(theme.bright_foreground),
+        ));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);

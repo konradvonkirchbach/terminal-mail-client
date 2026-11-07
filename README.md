@@ -97,8 +97,9 @@ and typing in English only flags English ones — switch layouts, open
 compose, and it picks the right dictionary with no configuration. If
 Hyprland's layout can't be read (not running under Hyprland, say), it
 falls back to your system locale (`$LANG`). If nothing installed matches
-either, spellcheck just stays off (a one-time status message says so at
-launch) — install a dictionary per language you type in to cover them all.
+either, spellcheck just stays off (the compose body's title says so and
+names the package to install) — install a dictionary per language you
+type in to cover them all.
 
 ## Getting started
 

@@ -169,6 +169,9 @@ pub struct ComposeState {
     /// A one-shot message for the status line (vim errors, `:q` refusing
     /// to discard an unsent draft), cleared by the next key.
     pub notice: Option<String>,
+    /// Set when no spellchecker could be started for this compose; shown
+    /// in the body's title for as long as compose stays open.
+    pub spellcheck_note: Option<String>,
 }
 
 impl ComposeState {
@@ -188,6 +191,7 @@ impl ComposeState {
             misspelled_by_line: Vec::new(),
             vim: Vim::new(),
             notice: None,
+            spellcheck_note: None,
         }
     }
 
