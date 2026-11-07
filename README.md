@@ -148,6 +148,7 @@ mailc --set-default-account
 | `gg` / `G` | Jump to the first / last message (also loads older mail if needed) |
 | `Ctrl-d` / `Ctrl-u` | Jump 10 messages down / up |
 | `Enter` | Read selected message |
+| `J` / `K`, `Space`, `Ctrl-f` / `Ctrl-b` | Scroll the open message by a line / a page down / a page up |
 | `/` | Search (live filter by sender/subject); `Enter` confirms — if there are no local matches, this also runs a server-side search — `Esc` clears |
 | `c` | Compose a new message |
 | `r` | Reply to selected message |

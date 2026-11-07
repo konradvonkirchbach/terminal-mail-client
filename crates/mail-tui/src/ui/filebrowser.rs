@@ -9,6 +9,8 @@ use crate::attach::human_size;
 use crate::filebrowser::FileBrowser;
 use crate::theme::Theme;
 
+use super::layout;
+
 pub fn draw(frame: &mut Frame, area: Rect, browser: &FileBrowser, purpose: &BrowserPurpose, theme: &Theme) {
     let modal = centered_rect(80, 22, area);
     frame.render_widget(Clear, modal);
@@ -94,15 +96,25 @@ pub fn draw(frame: &mut Frame, area: Rect, browser: &FileBrowser, purpose: &Brow
         } else {
             Style::new().fg(theme.muted)
         };
+        const LABEL: &str = "Save as: ";
+        let field_width = (filename_area.width as usize).saturating_sub(LABEL.len());
+        let (start, cursor_x) = if browser.filename_focused {
+            layout::input_window(&filename.value, filename.cursor, field_width)
+        } else {
+            (0, 0)
+        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("Save as: ", label_style),
-                Span::styled(filename.value.clone(), Style::new().fg(theme.foreground)),
+                Span::styled(LABEL, label_style),
+                Span::styled(
+                    layout::from_char(&filename.value, start).to_string(),
+                    Style::new().fg(theme.foreground),
+                ),
             ])),
             filename_area,
         );
         if browser.filename_focused {
-            frame.set_cursor_position((filename_area.x + 9 + filename.cursor as u16, filename_area.y));
+            frame.set_cursor_position((filename_area.x + LABEL.len() as u16 + cursor_x as u16, filename_area.y));
         }
     }
 

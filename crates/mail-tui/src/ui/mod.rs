@@ -1,5 +1,6 @@
 mod compose;
 mod filebrowser;
+mod layout;
 mod message_list;
 mod reading_pane;
 mod search_bar;

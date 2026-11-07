@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{ComposeField, ComposeState};
@@ -12,6 +12,8 @@ use crate::editable::byte_index;
 use crate::spellcheck::{self, normalize_word};
 use crate::theme::Theme;
 use crate::vim::Mode as VimMode;
+
+use super::layout;
 
 const LABEL_WIDTH: usize = 9; // fits "Subject:" (8) plus a trailing space
 
@@ -85,22 +87,33 @@ fn draw_header(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Th
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = vec![
-        field_line("To:", &compose.to.value, compose.focus == ComposeField::To, theme),
-        field_line("Cc:", &compose.cc.value, compose.focus == ComposeField::Cc, theme),
-        field_line("Bcc:", &compose.bcc.value, compose.focus == ComposeField::Bcc, theme),
-        field_line(
-            "Subject:",
-            &compose.subject.value,
-            compose.focus == ComposeField::Subject,
-            theme,
-        ),
-        attachments_line(compose, theme),
+    // A focused field longer than the pane scrolls horizontally so its
+    // cursor stays visible; unfocused ones just show their start.
+    let field_width = (inner.width as usize).saturating_sub(LABEL_WIDTH);
+    let fields = [
+        ("To:", &compose.to, ComposeField::To),
+        ("Cc:", &compose.cc, ComposeField::Cc),
+        ("Bcc:", &compose.bcc, ComposeField::Bcc),
+        ("Subject:", &compose.subject, ComposeField::Subject),
     ];
+    let mut lines = Vec::with_capacity(fields.len() + 1);
+    let mut cursor = None;
+    for (row, (label, input, field)) in fields.into_iter().enumerate() {
+        let focused = compose.focus == field;
+        let shown = if focused {
+            let (start, x) = layout::input_window(&input.value, input.cursor, field_width);
+            cursor = Some((row as u16, x as u16));
+            layout::from_char(&input.value, start)
+        } else {
+            input.value.as_str()
+        };
+        lines.push(field_line(label, shown, focused, theme));
+    }
+    lines.push(attachments_line(compose, theme));
     frame.render_widget(Paragraph::new(lines), inner);
 
-    if let Some((row, input)) = focused_input_row(compose) {
-        frame.set_cursor_position((inner.x + LABEL_WIDTH as u16 + input.cursor as u16, inner.y + row));
+    if let Some((row, x)) = cursor {
+        frame.set_cursor_position((inner.x + LABEL_WIDTH as u16 + x, inner.y + row));
     }
 }
 
@@ -212,39 +225,59 @@ fn draw_body(frame: &mut Frame, area: Rect, compose: &ComposeState, theme: &Them
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let visible_height = inner.height.max(1);
-    let scroll_y = (compose.body.cursor_row as u16).saturating_sub(visible_height - 1);
-
+    let width = inner.width as usize;
     let flagged_style = Style::new().fg(theme.red).add_modifier(Modifier::UNDERLINED);
     let selection_style = Style::new().bg(theme.selection).fg(theme.bright_foreground);
     let no_misspellings = HashMap::new();
-    let text = Text::from(
-        compose
-            .body
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let misspelled = compose.misspelled_by_line.get(i).unwrap_or(&no_misspellings);
-                let line = spellcheck_line(l, misspelled, flagged_style);
-                match compose.vim.selection_on_row(&compose.body, i) {
-                    // A selected empty line still shows as one highlighted cell.
-                    Some(_) if l.is_empty() => Line::from(Span::styled(" ", selection_style)),
-                    Some((start, end)) => overlay_style(line, start, end, selection_style),
-                    None => line,
-                }
-            })
-            .collect::<Vec<_>>(),
-    );
-    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false }).scroll((scroll_y, 0));
+
+    // Wrapped here (not by `Paragraph::wrap`) so the cursor and scroll are
+    // computed in the same visual rows the text is actually drawn in — a
+    // logical line wider than the pane would otherwise push the cursor
+    // past the border and every later line off its expected row.
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut cursor = (0, 0);
+    for (i, l) in compose.body.lines.iter().enumerate() {
+        let misspelled = compose.misspelled_by_line.get(i).unwrap_or(&no_misspellings);
+        let line = spellcheck_line(l, misspelled, flagged_style);
+        let line = match compose.vim.selection_on_row(&compose.body, i) {
+            // A selected empty line still shows as one highlighted cell.
+            Some(_) if l.is_empty() => Line::from(Span::styled(" ", selection_style)),
+            Some((start, end)) => overlay_style(line, start, end, selection_style),
+            None => line,
+        };
+        if l.is_empty() {
+            if i == compose.body.cursor_row {
+                cursor = (rows.len(), 0);
+            }
+            rows.push(line);
+            continue;
+        }
+        let ranges = layout::wrap_ranges(l, width);
+        if i == compose.body.cursor_row {
+            let (row, x) = layout::locate(l, &ranges, compose.body.cursor_col, width);
+            cursor = (rows.len() + row, x);
+        }
+        rows.extend(
+            ranges
+                .into_iter()
+                .map(|(start, end)| layout::slice_line(&line, start, end)),
+        );
+    }
+
+    // Keep the cursor's row on screen, pinned to the bottom edge once it
+    // goes past it.
+    let visible_height = inner.height.max(1) as usize;
+    let scroll_y = cursor.0.saturating_sub(visible_height - 1);
+    let paragraph = Paragraph::new(Text::from(rows)).scroll((scroll_y as u16, 0));
     frame.render_widget(paragraph, inner);
 
     // In Command mode the cursor belongs to the command line (`draw_help`).
     if focused && !matches!(compose.vim.mode, VimMode::Command(_)) {
-        let y = (compose.body.cursor_row as u16).saturating_sub(scroll_y);
-        frame.set_cursor_position((inner.x + compose.body.cursor_col as u16, inner.y + y));
+        let y = (cursor.0 - scroll_y) as u16;
+        let x = cursor.1 as u16;
+        frame.set_cursor_position((inner.x + x, inner.y + y));
         if matches!(compose.vim.mode, VimMode::Normal | VimMode::Insert) {
-            draw_misspelling_suggestions(frame, inner, y, compose, theme);
+            draw_misspelling_suggestions(frame, inner, (x, y), compose, theme);
         }
     }
 }
@@ -290,7 +323,7 @@ fn overlay_style(line: Line<'static>, start: usize, end: usize, style: Style) ->
 fn draw_misspelling_suggestions(
     frame: &mut Frame,
     body_inner: Rect,
-    cursor_screen_row: u16,
+    (cursor_x, cursor_y): (u16, u16),
     compose: &ComposeState,
     theme: &Theme,
 ) {
@@ -301,8 +334,8 @@ fn draw_misspelling_suggestions(
         return;
     }
 
-    let x = body_inner.x + (compose.body.cursor_col as u16).min(body_inner.width.saturating_sub(1));
-    let y = body_inner.y + cursor_screen_row + 1;
+    let x = body_inner.x + cursor_x.min(body_inner.width.saturating_sub(1));
+    let y = body_inner.y + cursor_y + 1;
 
     let max_content_chars = suggestions.iter().map(|s| s.chars().count() as u16).max().unwrap_or(10);
     let Some(popup) = popup_rect(frame.area(), x, y, max_content_chars, 10, 40, suggestions.len()) else {
@@ -420,6 +453,68 @@ fn spellcheck_line(line: &str, misspelled: &HashMap<String, Vec<String>>, flagge
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editable::TextInput;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Position;
+    use ratatui::Terminal;
+
+    /// Renders `compose` into a `width`x`height` test terminal and returns
+    /// where the cursor ended up.
+    fn rendered_cursor(compose: &ComposeState, width: u16, height: u16) -> Position {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let theme = Theme::fallback();
+        terminal.draw(|f| draw(f, f.area(), compose, &theme)).unwrap();
+        terminal.get_cursor_position().unwrap()
+    }
+
+    #[test]
+    fn a_long_body_line_wraps_and_the_cursor_follows_it_inside_the_box() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::Body;
+        compose.vim.enter_insert(&compose.body);
+        for c in "word ".repeat(30).chars() {
+            compose.body.insert(c);
+        }
+
+        // 40 wide -> 38-cell body: rows of 35 chars ("word " x7), so the
+        // 150-char line takes 5 rows and the cursor sits 10 cells into the
+        // last one. Header block is 7 rows; the body's inner area starts
+        // at (1, 8).
+        assert_eq!(rendered_cursor(&compose, 40, 20), Position::new(11, 12));
+    }
+
+    #[test]
+    fn the_cursor_stays_on_screen_when_wrapped_rows_push_it_past_the_bottom() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::Body;
+        compose.vim.enter_insert(&compose.body);
+        for _ in 0..6 {
+            for c in "word ".repeat(30).chars() {
+                compose.body.insert(c);
+            }
+            compose.body.newline();
+        }
+
+        // 6 lines x 5 visual rows each = 30+ rows in a 10-row body pane.
+        let pos = rendered_cursor(&compose, 40, 20);
+        assert!(
+            (8..18).contains(&pos.y),
+            "cursor row {} must be inside the body pane",
+            pos.y
+        );
+        assert_eq!(pos.x, 1, "an empty last line puts the cursor at its start");
+    }
+
+    #[test]
+    fn a_long_header_field_scrolls_so_the_cursor_stays_visible() {
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::To;
+        compose.to = TextInput::with_value("a".repeat(100));
+
+        let pos = rendered_cursor(&compose, 40, 20);
+        assert!(pos.x < 39, "cursor x {} must stay inside the border", pos.x);
+        assert_eq!(pos.y, 1);
+    }
 
     /// A misspelled-word map with empty suggestion lists — `spellcheck_line`
     /// only ever checks key presence, so the tests exercising it don't

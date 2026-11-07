@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -50,6 +51,17 @@ pub enum BodyState {
     },
     Loaded(Message),
     Error(String),
+}
+
+/// The reading pane's size as of the last frame — recorded by rendering
+/// (the only place that knows it) so scroll keys can clamp and page.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BodyViewport {
+    /// Visible rows inside the border.
+    pub height: u16,
+    /// The furthest the content can scroll before its last row would
+    /// leave the bottom of the pane.
+    pub max_scroll: u16,
 }
 
 pub enum ListState {
@@ -371,6 +383,8 @@ pub struct App {
     /// How many lines the reading pane is scrolled down. Reset whenever a
     /// different message is opened.
     pub body_scroll: u16,
+    /// Written by the reading pane each frame; see `BodyViewport`.
+    pub body_viewport: Cell<BodyViewport>,
     /// Which of the open message's attachments is highlighted for
     /// download — reset to 0 whenever a new message body loads.
     pub selected_attachment: usize,
@@ -428,6 +442,7 @@ impl App {
             selected: 0,
             body: BodyState::Empty,
             body_scroll: 0,
+            body_viewport: Cell::new(BodyViewport::default()),
             selected_attachment: 0,
             compose: None,
             known_senders: Vec::new(),
@@ -657,6 +672,23 @@ impl App {
             BodyState::Loaded(message) => Some(message.uid),
             BodyState::Empty | BodyState::Error(_) => None,
         }
+    }
+
+    /// Scrolls the reading pane by `lines` (negative is up), clamped to
+    /// the content. A no-op unless a message is open.
+    pub fn scroll_body(&mut self, lines: i32) {
+        if !matches!(self.body, BodyState::Loaded(_)) {
+            return;
+        }
+        let max = i32::from(self.body_viewport.get().max_scroll);
+        self.body_scroll = (i32::from(self.body_scroll) + lines).clamp(0, max) as u16;
+    }
+
+    /// Scrolls the reading pane by one screenful, keeping one line of
+    /// overlap for context.
+    pub fn page_body(&mut self, down: bool) {
+        let page = i32::from(self.body_viewport.get().height.saturating_sub(1).max(1));
+        self.scroll_body(if down { page } else { -page });
     }
 
     pub fn start_loading_body(&mut self, uid: u32) {
@@ -1128,6 +1160,41 @@ mod tests {
 
         app.finish_body(4, Err("boom".to_string()));
         assert!(matches!(&app.body, BodyState::Error(e) if e == "boom"));
+    }
+
+    #[test]
+    fn scroll_body_clamps_to_the_rendered_content_and_needs_an_open_message() {
+        let mut app = sample_app();
+        app.body_viewport.set(BodyViewport {
+            height: 10,
+            max_scroll: 25,
+        });
+        app.scroll_body(5);
+        assert_eq!(app.body_scroll, 0, "nothing is open yet");
+
+        app.start_loading_body(5);
+        app.finish_body(5, Ok(message(5)));
+        app.scroll_body(5);
+        assert_eq!(app.body_scroll, 5);
+        app.page_body(true);
+        assert_eq!(
+            app.body_scroll, 14,
+            "a page is the pane height minus one line of overlap"
+        );
+        app.page_body(true);
+        assert_eq!(app.body_scroll, 23);
+        app.page_body(true);
+        assert_eq!(app.body_scroll, 25, "clamped to the last screenful");
+        app.scroll_body(-100);
+        assert_eq!(app.body_scroll, 0);
+    }
+
+    #[test]
+    fn opening_another_message_resets_the_scroll() {
+        let mut app = sample_app();
+        app.body_scroll = 12;
+        app.start_loading_body(4);
+        assert_eq!(app.body_scroll, 0);
     }
 
     #[test]

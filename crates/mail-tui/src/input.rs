@@ -87,6 +87,13 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session
             maybe_load_more(app, session);
         }
         KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.select_page_up(),
+        // Reading pane scrolling: line-wise on J/K, a screenful on
+        // Space/Ctrl-f and back on Ctrl-b.
+        KeyCode::Char('J') => app.scroll_body(1),
+        KeyCode::Char('K') => app.scroll_body(-1),
+        KeyCode::Char(' ') => app.page_body(true),
+        KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL) => app.page_body(true),
+        KeyCode::Char('b') if modifiers.contains(KeyModifiers::CONTROL) => app.page_body(false),
         KeyCode::Char('/') => app.start_search(),
         KeyCode::Char('S') => {
             app.list_state = ListState::Loading;
