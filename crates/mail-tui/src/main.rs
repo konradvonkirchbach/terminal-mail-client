@@ -17,8 +17,8 @@ use std::io::stdout;
 use std::time::Duration;
 
 use anyhow::Context;
-use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::cursor::{SetCursorStyle, Show};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::StreamExt;
@@ -74,22 +74,41 @@ async fn main() -> anyhow::Result<()> {
     init_tracing()?;
     let accounts = load_or_setup_accounts()?;
 
+    // A panic would otherwise leave the shell in raw mode on the alternate
+    // screen, with the panic message itself unreadable. Restore first, then
+    // let the default hook print it.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        tracing::error!("panic: {info}");
+        default_hook(info);
+    }));
+
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
+    // Bracketed paste delivers a paste as one event instead of a burst of
+    // key presses — which in Normal mode or the message list would run as
+    // commands (a pasted "d" then "y" deletes a message).
+    execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let result = run(&mut terminal, accounts).await;
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        SetCursorStyle::DefaultUserShape,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
-
+    restore_terminal();
     result
+}
+
+/// Undoes everything `main` set up on the terminal. Best-effort and
+/// idempotent, since it also runs from the panic hook.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        stdout(),
+        DisableBracketedPaste,
+        SetCursorStyle::DefaultUserShape,
+        LeaveAlternateScreen,
+        Show
+    );
 }
 
 async fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, accounts: Vec<Account>) -> anyhow::Result<()> {
@@ -215,6 +234,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, account
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         input::handle_key(&mut app, key.code, key.modifiers, &mut session);
                     }
+                    Some(Ok(Event::Paste(text))) => input::handle_paste(&mut app, &text, session.spellcheck.as_ref()),
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
                         tracing::error!("terminal event error: {e}");

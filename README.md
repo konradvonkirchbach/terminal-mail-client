@@ -163,7 +163,8 @@ mailc --set-default-account
 | `Tab` / `Shift+Tab` | Switch account (when more than one is configured) |
 | `1`–`9` | Jump directly to account N |
 | `D` | Set the current account as the one that opens by default |
-| `q` / `Esc` | Quit |
+| `Esc` | Clear the search filter, then close the open message (never quits) |
+| `q` | Quit |
 
 **Compose:**
 

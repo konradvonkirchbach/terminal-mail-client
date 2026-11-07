@@ -426,13 +426,11 @@ pub async fn spawn_spellchecker(tx: mpsc::Sender<BgMsg>) -> Option<spellcheck::S
         .await
         .ok()?;
 
-    let (request_tx, mut request_rx) = tokio::sync::watch::channel(spellcheck::SpellCheckRequest::default());
+    let (handle, mut requests) = spellcheck::requests();
     tokio::spawn(async move {
-        loop {
-            if request_rx.changed().await.is_err() {
-                return; // every SpellCheckHandle was dropped
-            }
-            let request = request_rx.borrow_and_update().clone();
+        // Ends once the handle is dropped (compose reopened with a fresh
+        // checker, or the app exiting), taking the Hunspell process with it.
+        while let Some(request) = requests.next().await {
             let msg = match request {
                 spellcheck::SpellCheckRequest::None => continue,
                 spellcheck::SpellCheckRequest::Line {
@@ -473,7 +471,7 @@ pub async fn spawn_spellchecker(tx: mpsc::Sender<BgMsg>) -> Option<spellcheck::S
         }
     });
 
-    Some(spellcheck::SpellCheckHandle::new(request_tx))
+    Some(handle)
 }
 
 /// Re-detects the active keyboard layout and (re)spawns a spellchecker

@@ -19,6 +19,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -367,7 +368,7 @@ impl Drop for SpellChecker {
 /// echoed back in the corresponding result so the caller can tell a
 /// result apart from one meant for a compose session that's since closed
 /// (and possibly been replaced by an unrelated new one).
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SpellCheckRequest {
     #[default]
     None,
@@ -382,33 +383,117 @@ pub enum SpellCheckRequest {
     },
 }
 
-/// A handle to the background task that owns the running `SpellChecker`
-/// and feeds it text — cheap to hold onto and send requests through.
+/// Folds a new request into whatever is still waiting to be picked up.
+/// Only the latest state is worth checking, but a pending request can't
+/// simply be replaced: if a `Full` recheck (queued after an edit that
+/// shifted line indices) were overwritten by the next keystroke's `Line`
+/// request, the shift would never be accounted for and underlines would
+/// land on the wrong lines. So anything that would lose pending work —
+/// a pending `Full`, or a pending edit on a *different* line — becomes a
+/// `Full` of the current body.
+fn merge_request(
+    pending: SpellCheckRequest,
+    compose_id: u64,
+    line: Option<usize>,
+    body: &[String],
+) -> SpellCheckRequest {
+    let full = || SpellCheckRequest::Full {
+        compose_id,
+        text: body.join("\n"),
+    };
+    let Some(index) = line.filter(|&i| i < body.len()) else {
+        return full();
+    };
+    let line_request = SpellCheckRequest::Line {
+        compose_id,
+        index,
+        text: body[index].clone(),
+    };
+    match pending {
+        SpellCheckRequest::None => line_request,
+        // Left over from a compose session that's gone: irrelevant.
+        SpellCheckRequest::Line { compose_id: id, .. } | SpellCheckRequest::Full { compose_id: id, .. }
+            if id != compose_id =>
+        {
+            line_request
+        }
+        SpellCheckRequest::Line {
+            index: pending_index, ..
+        } if pending_index == index => line_request,
+        SpellCheckRequest::Line { .. } | SpellCheckRequest::Full { .. } => full(),
+    }
+}
+
+fn lock_slot(slot: &Mutex<SpellCheckRequest>) -> std::sync::MutexGuard<'_, SpellCheckRequest> {
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Compose's side of the spellcheck queue: cheap, non-blocking requests
+/// merged into a single pending slot (see `merge_request`).
 pub struct SpellCheckHandle {
-    request_tx: watch::Sender<SpellCheckRequest>,
+    slot: Arc<Mutex<SpellCheckRequest>>,
+    /// Wakes the worker. Dropping the handle closes it, which is how the
+    /// worker (and with it the Hunspell process) knows to shut down.
+    doorbell: watch::Sender<()>,
+}
+
+/// The worker's side of the queue — see `requests`.
+pub struct SpellCheckRequests {
+    slot: Arc<Mutex<SpellCheckRequest>>,
+    doorbell: watch::Receiver<()>,
+}
+
+/// A connected handle/worker pair.
+pub fn requests() -> (SpellCheckHandle, SpellCheckRequests) {
+    let slot = Arc::new(Mutex::new(SpellCheckRequest::None));
+    let (doorbell, doorbell_rx) = watch::channel(());
+    (
+        SpellCheckHandle {
+            slot: Arc::clone(&slot),
+            doorbell,
+        },
+        SpellCheckRequests {
+            slot,
+            doorbell: doorbell_rx,
+        },
+    )
 }
 
 impl SpellCheckHandle {
-    pub fn new(request_tx: watch::Sender<SpellCheckRequest>) -> Self {
-        Self { request_tx }
-    }
-
-    /// Queues a recheck of just one body line. Cheap and non-blocking: a
-    /// request that arrives before the previous one was even picked up
-    /// simply replaces it — only the latest state is ever worth checking.
-    pub fn request_line(&self, compose_id: u64, index: usize, text: String) {
-        let _ = self.request_tx.send(SpellCheckRequest::Line {
-            compose_id,
-            index,
-            text,
-        });
+    /// Queues a recheck of body line `index` after an edit that touched
+    /// only it. `body` is the whole current body, in case this has to be
+    /// widened into a full recheck (see `merge_request`).
+    pub fn request_line(&self, compose_id: u64, index: usize, body: &[String]) {
+        self.submit(compose_id, Some(index), body);
     }
 
     /// Queues a recheck of the whole body, line by line — used when an
     /// edit changed the line count, so per-line indices from before it
     /// can no longer be trusted.
-    pub fn request_full(&self, compose_id: u64, text: String) {
-        let _ = self.request_tx.send(SpellCheckRequest::Full { compose_id, text });
+    pub fn request_full(&self, compose_id: u64, body: &[String]) {
+        self.submit(compose_id, None, body);
+    }
+
+    fn submit(&self, compose_id: u64, line: Option<usize>, body: &[String]) {
+        {
+            let mut slot = lock_slot(&self.slot);
+            let pending = std::mem::take(&mut *slot);
+            *slot = merge_request(pending, compose_id, line, body);
+        }
+        self.doorbell.send_replace(());
+    }
+}
+
+impl SpellCheckRequests {
+    /// Waits for the next request; `None` once the handle has been dropped.
+    pub async fn next(&mut self) -> Option<SpellCheckRequest> {
+        loop {
+            self.doorbell.changed().await.ok()?;
+            let request = std::mem::take(&mut *lock_slot(&self.slot));
+            if request != SpellCheckRequest::None {
+                return Some(request);
+            }
+        }
     }
 }
 
@@ -772,6 +857,100 @@ mod tests {
     #[test]
     fn word_at_cursor_handles_a_multibyte_word() {
         assert_eq!(word_at_cursor("häuser world", 3), Some("häuser"));
+    }
+
+    // -- request merging ----------------------------------------------------
+
+    fn body(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn a_line_request_on_an_empty_slot_stays_a_line_request() {
+        let b = body(&["one", "two"]);
+        assert_eq!(
+            merge_request(SpellCheckRequest::None, 1, Some(1), &b),
+            SpellCheckRequest::Line {
+                compose_id: 1,
+                index: 1,
+                text: "two".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_pending_full_recheck_is_never_downgraded_to_a_line() {
+        let pending = SpellCheckRequest::Full {
+            compose_id: 1,
+            text: "old".into(),
+        };
+        let b = body(&["new", "text"]);
+        assert_eq!(
+            merge_request(pending, 1, Some(0), &b),
+            SpellCheckRequest::Full {
+                compose_id: 1,
+                text: "new\ntext".into()
+            },
+            "the line shift the full recheck was queued for must still be accounted for"
+        );
+    }
+
+    #[test]
+    fn edits_on_two_different_lines_widen_into_a_full_recheck() {
+        let pending = SpellCheckRequest::Line {
+            compose_id: 1,
+            index: 0,
+            text: "a".into(),
+        };
+        let b = body(&["a", "b"]);
+        assert!(matches!(
+            merge_request(pending, 1, Some(1), &b),
+            SpellCheckRequest::Full { .. }
+        ));
+    }
+
+    #[test]
+    fn repeated_edits_on_the_same_line_keep_the_latest_text() {
+        let pending = SpellCheckRequest::Line {
+            compose_id: 1,
+            index: 0,
+            text: "hel".into(),
+        };
+        assert_eq!(
+            merge_request(pending, 1, Some(0), &body(&["hello"])),
+            SpellCheckRequest::Line {
+                compose_id: 1,
+                index: 0,
+                text: "hello".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_pending_request_from_a_closed_compose_is_simply_replaced() {
+        let pending = SpellCheckRequest::Full {
+            compose_id: 1,
+            text: "old session".into(),
+        };
+        assert!(matches!(
+            merge_request(pending, 2, Some(0), &body(&["x"])),
+            SpellCheckRequest::Line { compose_id: 2, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_worker_sees_merged_requests_and_stops_when_the_handle_drops() {
+        let (handle, mut requests) = requests();
+        let b = body(&["one", "two"]);
+        handle.request_full(7, &b);
+        handle.request_line(7, 0, &b); // arrives before the worker looked
+        assert!(matches!(
+            requests.next().await,
+            Some(SpellCheckRequest::Full { compose_id: 7, .. })
+        ));
+
+        drop(handle);
+        assert_eq!(requests.next().await, None);
     }
 
     // -- Hunspell "-a" pipe response parsing -----------------------------------

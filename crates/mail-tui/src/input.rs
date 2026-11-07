@@ -12,7 +12,8 @@ use crate::bg;
 use crate::editable::TextInput;
 use crate::filebrowser::FileBrowser;
 use crate::session::Session;
-use crate::vim::Outcome;
+use crate::spellcheck::SpellCheckHandle;
+use crate::vim::{Mode as VimMode, Outcome};
 
 fn default_browse_dir() -> PathBuf {
     directories::UserDirs::new()
@@ -58,11 +59,15 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session
 
     match code {
         KeyCode::Char('q') => app.should_quit = true,
+        // Esc backs out of whatever is open — a search filter first, then
+        // the open message — but never quits: that's `q`'s job, so a
+        // reflexive Esc can't close the app.
         KeyCode::Esc => {
             if app.search().is_some() {
                 app.clear_search();
             } else {
-                app.should_quit = true;
+                app.body = BodyState::Empty;
+                app.body_scroll = 0;
             }
         }
         KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('n') => {
@@ -155,6 +160,63 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session
             }
         }
         _ => {}
+    }
+}
+
+/// A bracketed paste: inserted as text wherever text is being typed, and
+/// ignored everywhere else, so pasted text can never run as commands.
+pub fn handle_paste(app: &mut App, text: &str, spellcheck: Option<&SpellCheckHandle>) {
+    // Single-line fields take the text with line breaks flattened.
+    let single_line = || {
+        text.chars()
+            .map(|c| if c == '\n' { ' ' } else { c })
+            .filter(|c| !c.is_control())
+    };
+
+    if let Some((browser, _)) = &mut app.file_browser {
+        if browser.filename_focused {
+            if let Some(filename) = &mut browser.filename {
+                single_line().for_each(|c| filename.insert(c));
+                browser.error = None;
+                browser.confirm_overwrite = None;
+            }
+        }
+        return;
+    }
+
+    if let Some(compose) = &mut app.compose {
+        if compose.sending {
+            return;
+        }
+        match compose.focus {
+            ComposeField::Body => match compose.vim.mode {
+                VimMode::Insert => {
+                    for c in text.chars() {
+                        match c {
+                            '\n' => compose.body.newline(),
+                            '\t' => (0..4).for_each(|_| compose.body.insert(' ')),
+                            c if c.is_control() => {}
+                            c => compose.body.insert(c),
+                        }
+                    }
+                    if let Some(handle) = spellcheck {
+                        handle.request_full(compose.id, &compose.body.lines);
+                    }
+                }
+                VimMode::Command(_) => single_line().for_each(|c| compose.vim.command_line.push(c)),
+                _ => compose.notice = Some("Paste in Insert mode (press i first)".to_string()),
+            },
+            ComposeField::Attachments => {}
+            _ => {
+                single_line().for_each(|c| edit_input(compose, |f| f.insert(c)));
+                compose.refresh_suggestions(&app.known_senders);
+            }
+        }
+        return;
+    }
+
+    if app.search_editing {
+        single_line().for_each(|c| app.edit_search(|s| s.insert(c)));
     }
 }
 
@@ -334,8 +396,8 @@ fn handle_body_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, sessio
     if let Some(handle) = &session.spellcheck {
         match body_change(&before, &compose.body.lines) {
             BodyChange::None => {}
-            BodyChange::Line(row) => handle.request_line(compose.id, row, compose.body.lines[row].clone()),
-            BodyChange::Full => handle.request_full(compose.id, compose.body.text()),
+            BodyChange::Line(row) => handle.request_line(compose.id, row, &compose.body.lines),
+            BodyChange::Full => handle.request_full(compose.id, &compose.body.lines),
         }
     }
 }
@@ -474,6 +536,9 @@ fn edit_browser_filename(app: &mut App, op: impl Fn(&mut TextInput)) {
     if let Some((browser, _)) = &mut app.file_browser {
         if let Some(filename) = &mut browser.filename {
             op(filename);
+            // A pending "already exists" prompt was about the old name.
+            browser.error = None;
+            browser.confirm_overwrite = None;
         }
     }
 }
@@ -524,13 +589,21 @@ fn finish_attach(app: &mut App, path: PathBuf) {
 }
 
 fn confirm_save(app: &mut App) {
-    let Some((browser, purpose)) = &app.file_browser else {
-        return;
-    };
-    let BrowserPurpose::SaveAttachment { bytes, .. } = purpose else {
+    let Some((browser, BrowserPurpose::SaveAttachment { bytes })) = &mut app.file_browser else {
         return;
     };
     let Some(save_path) = browser.save_path() else { return };
+
+    // Never silently replace an existing file: the first Enter asks, a
+    // second one on the same path confirms.
+    if save_path.exists() && browser.confirm_overwrite.as_ref() != Some(&save_path) {
+        browser.error = Some(format!(
+            "{} already exists — press Enter again to overwrite, or edit the name.",
+            save_path.display()
+        ));
+        browser.confirm_overwrite = Some(save_path);
+        return;
+    }
 
     match std::fs::write(&save_path, bytes) {
         Ok(()) => {
@@ -538,9 +611,178 @@ fn confirm_save(app: &mut App) {
             app.file_browser = None;
         }
         Err(e) => {
-            if let Some((browser, _)) = &mut app.file_browser {
-                browser.error = Some(format!("{}: {e}", save_path.display()));
-            }
+            browser.confirm_overwrite = None;
+            browser.error = Some(format!("{}: {e}", save_path.display()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_saving(dir: &Path, name: &str, bytes: &[u8]) -> App {
+        let mut app = App::new(vec!["me@example.com".to_string()]);
+        app.file_browser = Some((
+            FileBrowser::open_for_save(dir.to_path_buf(), name.to_string()),
+            BrowserPurpose::SaveAttachment { bytes: bytes.to_vec() },
+        ));
+        app
+    }
+
+    fn app() -> App {
+        App::new(vec!["me@example.com".to_string()])
+    }
+
+    #[test]
+    fn a_paste_in_the_message_list_runs_nothing() {
+        let mut app = app();
+        app.replace_envelopes(vec![mail_core::Envelope {
+            uid: 1,
+            subject: "x".into(),
+            from: Vec::new(),
+            to: Vec::new(),
+            date: None,
+            flags: Default::default(),
+        }]);
+        handle_paste(&mut app, "dyq", None);
+        assert!(app.confirm_delete.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn a_paste_in_insert_mode_inserts_the_text_with_its_line_breaks() {
+        let mut app = app();
+        let mut compose = ComposeState::blank();
+        compose.focus_body_normal();
+        compose.vim.enter_insert(&compose.body);
+        app.compose = Some(compose);
+
+        handle_paste(&mut app, "hello\nworld", None);
+
+        let body = &app.compose.as_ref().unwrap().body;
+        assert_eq!(body.lines, vec!["hello".to_string(), "world".to_string()]);
+    }
+
+    #[test]
+    fn a_paste_in_normal_mode_does_not_run_as_vim_commands() {
+        let mut app = app();
+        let mut compose = ComposeState::blank();
+        compose.body.lines = vec!["keep me".to_string()];
+        compose.focus_body_normal();
+        app.compose = Some(compose);
+
+        handle_paste(&mut app, "dd", None);
+
+        let compose = app.compose.as_ref().unwrap();
+        assert_eq!(compose.body.lines, vec!["keep me".to_string()]);
+        assert!(compose.notice.is_some());
+    }
+
+    #[test]
+    fn a_paste_into_a_header_field_flattens_line_breaks() {
+        let mut app = app();
+        let mut compose = ComposeState::blank();
+        compose.focus = ComposeField::Subject;
+        app.compose = Some(compose);
+
+        handle_paste(&mut app, "two\nlines", None);
+
+        assert_eq!(app.compose.as_ref().unwrap().subject.value, "two lines");
+    }
+
+    /// A one-account session over a throwaway store — enough for key
+    /// handling paths that don't spawn background work.
+    fn test_session(dir: &Path) -> Session {
+        let store = mail_core::Store::open(&dir.join("mail.db")).unwrap();
+        let account = mail_core::Account::new(mail_core::config::AccountConfig {
+            email: "me@example.com".to_string(),
+            display_name: None,
+            imap_host: "imap.example.com".to_string(),
+            imap_port: 993,
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            auth: Default::default(),
+            fetch_limit: 50,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        Session {
+            accounts: crate::session::Accounts {
+                list: vec![crate::session::AccountCtx {
+                    account,
+                    store,
+                    account_id: 1,
+                    folder_id: 1,
+                }],
+                current: 0,
+            },
+            tx,
+            spellcheck: None,
+        }
+    }
+
+    #[test]
+    fn esc_backs_out_of_search_then_the_open_message_but_never_quits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = test_session(dir.path());
+        let mut app = app();
+        app.start_search();
+        app.search_editing = false; // confirmed filter, back in the list
+        app.body = BodyState::Loading { uid: 1 };
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut session);
+        assert!(app.search().is_none(), "first Esc clears the filter");
+        assert!(matches!(app.body, BodyState::Loading { .. }));
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut session);
+        assert!(matches!(app.body, BodyState::Empty), "second Esc closes the message");
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut session);
+        assert!(!app.should_quit, "Esc never quits");
+
+        handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::NONE, &mut session);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn saving_a_new_file_writes_it_straight_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_saving(dir.path(), "new.txt", b"hello");
+
+        confirm_save(&mut app);
+
+        assert_eq!(std::fs::read(dir.path().join("new.txt")).unwrap(), b"hello");
+        assert!(app.file_browser.is_none());
+    }
+
+    #[test]
+    fn overwriting_an_existing_file_needs_a_second_enter() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.txt");
+        std::fs::write(&target, b"old").unwrap();
+        let mut app = app_saving(dir.path(), "a.txt", b"new");
+
+        confirm_save(&mut app);
+        assert_eq!(std::fs::read(&target).unwrap(), b"old", "the first Enter only asks");
+        assert!(app.file_browser.as_ref().unwrap().0.error.is_some());
+
+        confirm_save(&mut app);
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(app.file_browser.is_none());
+    }
+
+    #[test]
+    fn editing_the_name_cancels_a_pending_overwrite_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        let mut app = app_saving(dir.path(), "a.txt", b"new");
+
+        confirm_save(&mut app);
+        edit_browser_filename(&mut app, TextInput::backspace);
+        edit_browser_filename(&mut app, |f| f.insert('t'));
+        assert!(app.file_browser.as_ref().unwrap().0.confirm_overwrite.is_none());
+
+        confirm_save(&mut app); // "a.txt" again: must ask again
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"old");
     }
 }

@@ -275,7 +275,7 @@ pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
         .map(|(i, part)| {
             let filename = part
                 .attachment_name()
-                .map(str::to_string)
+                .and_then(safe_filename)
                 .unwrap_or_else(|| format!("attachment-{}", i + 1));
             let size_bytes = part.contents().len() as u64;
             let bytes = if size_bytes > MAX_ATTACHMENT_LOAD_BYTES {
@@ -308,6 +308,23 @@ pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
             .unwrap_or_default(),
         attachments,
     })
+}
+
+/// Reduces an attachment name taken from a message header to a plain file
+/// name. The header is attacker-controlled, and frontends offer it as the
+/// default name when saving: a name like `../../.bashrc` or
+/// `/home/me/.ssh/authorized_keys` would otherwise write outside the
+/// directory the user picked. Keeps only the last path component (either
+/// separator), drops control characters, and rejects names that are
+/// empty or just dots.
+fn safe_filename(name: &str) -> Option<String> {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = last.chars().filter(|c| !c.is_control()).collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+        return None;
+    }
+    Some(cleaned.to_string())
 }
 
 /// Common `Sent` mailbox names across providers. We don't yet do
@@ -581,6 +598,28 @@ mod tests {
         assert_eq!(msg.attachments[0].filename, "notes.txt");
         assert_eq!(msg.attachments[0].bytes, b"hello world");
         assert_eq!(msg.attachments[0].size_bytes, 11);
+    }
+
+    #[test]
+    fn safe_filename_strips_directories_and_control_characters() {
+        assert_eq!(safe_filename("report.pdf").as_deref(), Some("report.pdf"));
+        assert_eq!(safe_filename("../../.bashrc").as_deref(), Some(".bashrc"));
+        assert_eq!(
+            safe_filename("/home/me/.ssh/authorized_keys").as_deref(),
+            Some("authorized_keys")
+        );
+        assert_eq!(safe_filename("C:\\Windows\\evil.exe").as_deref(), Some("evil.exe"));
+        assert_eq!(safe_filename("na\u{1b}[2Jme.txt").as_deref(), Some("na[2Jme.txt"));
+        assert_eq!(safe_filename(".."), None);
+        assert_eq!(safe_filename("dir/"), None);
+        assert_eq!(safe_filename("   "), None);
+    }
+
+    #[test]
+    fn message_from_raw_never_yields_a_path_as_an_attachment_name() {
+        let raw = multipart_message_with_attachment("Content-Disposition: attachment; filename=\"../../evil.sh\"");
+        let msg = message_from_raw(1, &raw).unwrap();
+        assert_eq!(msg.attachments[0].filename, "evil.sh");
     }
 
     #[test]

@@ -23,6 +23,9 @@ pub struct FileBrowser {
     /// this is a plain "pick an existing file" browser.
     pub filename: Option<TextInput>,
     pub filename_focused: bool,
+    /// Set after Enter on a save path that already exists: a second Enter
+    /// on the same path confirms overwriting it.
+    pub confirm_overwrite: Option<PathBuf>,
 }
 
 impl FileBrowser {
@@ -34,6 +37,7 @@ impl FileBrowser {
             error: None,
             filename: None,
             filename_focused: false,
+            confirm_overwrite: None,
         };
         browser.reload();
         browser
