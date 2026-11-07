@@ -2,6 +2,9 @@
 //! envelopes into SQLite, and serves message bodies from the on-disk
 //! cache when possible instead of re-fetching over the network.
 
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
 use crate::account::Account;
 use crate::config;
 use crate::error::Result;
@@ -29,13 +32,34 @@ pub struct SyncOutcome {
 /// (e.g. on a manual refresh) — does an initial bulk fetch the first time
 /// or after a `UIDVALIDITY` change, and a cheap incremental fetch otherwise.
 pub async fn sync_inbox(account: &Account, store: &Store) -> Result<SyncOutcome> {
+    let mut session = client::open_session(account).await?;
+    let outcome = sync_inbox_on(&mut session, account, store).await;
+    client::logout(&mut session).await;
+    outcome
+}
+
+/// `sync_inbox` over an already-open session — the IDLE loop syncs on its
+/// own connection instead of opening another one per wake-up. Leaves INBOX
+/// selected.
+///
+/// Syncs of the same account are serialized: startup, IDLE wakes, a manual
+/// refresh and an account switch can all trigger one, and two running at
+/// once would both "discover" the same new mail (two notifications) and
+/// race on the cache.
+pub(crate) async fn sync_inbox_on(
+    session: &mut client::ImapSession,
+    account: &Account,
+    store: &Store,
+) -> Result<SyncOutcome> {
+    let lock = sync_lock(&account.config.email);
+    let _guard = lock.lock().await;
+
     let account_id = store
         .upsert_account(account.config.email.clone(), account.config.display_name.clone())
         .await?;
     let folder = store.get_or_create_folder(account_id, "INBOX".to_string()).await?;
 
-    let mut session = client::open_session(account).await?;
-    let mailbox = client::select_inbox(&mut session).await?;
+    let mailbox = client::select_inbox(session).await?;
 
     let uidvalidity_changed = folder.uidvalidity != Some(mailbox.uid_validity);
     let had_prior_sync = folder.uidvalidity.is_some();
@@ -45,19 +69,11 @@ pub async fn sync_inbox(account: &Account, store: &Store) -> Result<SyncOutcome>
             let stale = store.clear_folder_messages(folder.id).await?;
             remove_cached_files(stale).await;
         }
-        initial_sync(
-            &mut session,
-            store,
-            folder.id,
-            account.config.fetch_limit,
-            mailbox.exists,
-        )
-        .await?
+        initial_sync(session, store, folder.id, account.config.fetch_limit, mailbox.exists).await?
     } else {
-        incremental_sync(&mut session, store, folder.id, &mailbox, account.config.fetch_limit).await?
+        incremental_sync(session, store, folder.id, &mailbox, account.config.fetch_limit).await?
     };
 
-    client::logout(&mut session).await;
     store
         .update_folder_uid_state(folder.id, mailbox.uid_validity, mailbox.uid_next)
         .await?;
@@ -67,6 +83,16 @@ pub async fn sync_inbox(account: &Account, store: &Store) -> Result<SyncOutcome>
         folder_id: folder.id,
         new_envelopes,
     })
+}
+
+/// One lock per account (keyed by email), created on first use.
+fn sync_lock(email: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(locks.entry(email.to_string()).or_default())
 }
 
 async fn initial_sync(
@@ -316,6 +342,15 @@ async fn cache_raw_message(store: &Store, account_id: i64, folder_id: i64, uid: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_lock_is_shared_per_account_and_separate_across_accounts() {
+        let a1 = sync_lock("a@example.com");
+        let a2 = sync_lock("a@example.com");
+        let b = sync_lock("b@example.com");
+        assert!(Arc::ptr_eq(&a1, &a2));
+        assert!(!Arc::ptr_eq(&a1, &b));
+    }
 
     #[test]
     fn expunged_uids_are_the_requested_ones_the_server_did_not_return() {

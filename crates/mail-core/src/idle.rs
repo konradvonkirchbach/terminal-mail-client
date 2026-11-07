@@ -13,10 +13,14 @@ use crate::send;
 use crate::store::Store;
 use crate::sync;
 
-/// RFC 2177 recommends re-issuing IDLE before ~29 minutes to avoid
-/// server-side inactivity timeouts; this doubles as a periodic
+/// RFC 2177 requires re-issuing IDLE before ~29 minutes to avoid
+/// server-side inactivity timeouts. Renewing well inside that also keeps
+/// NAT/firewall mappings from going stale and doubles as a periodic
 /// safety-net sync even if no server notification ever arrives.
-const IDLE_RENEW: Duration = Duration::from_secs(29 * 60);
+const IDLE_RENEW: Duration = Duration::from_secs(10 * 60);
+/// How long the server gets to answer `DONE` before the connection is
+/// treated as dead and replaced.
+const DONE_TIMEOUT: Duration = Duration::from_secs(30);
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(15);
 
 /// Runs forever: opens one connection to `account`'s INBOX and idles on
@@ -43,9 +47,14 @@ async fn run_once(account: &Account, store: &Store, events: &UnboundedSender<App
         handle.init().await.map_err(|e| Error::Imap(e.to_string()))?;
         let (wait, _stop_source) = handle.wait_with_timeout(IDLE_RENEW);
         wait.await.map_err(|e| Error::Imap(e.to_string()))?;
-        session = handle.done().await.map_err(|e| Error::Imap(e.to_string()))?;
+        session = tokio::time::timeout(DONE_TIMEOUT, handle.done())
+            .await
+            .map_err(|_| Error::Imap("no reply to IDLE DONE".into()))?
+            .map_err(|e| Error::Imap(e.to_string()))?;
 
-        let outcome = sync::sync_inbox(account, store).await?;
+        // Sync on this same connection rather than opening a second one
+        // (TCP + TLS + LOGIN) for every wake-up.
+        let outcome = sync::sync_inbox_on(&mut session, account, store).await?;
         // The server is reachable again, so this is a good moment to retry
         // anything queued while it wasn't. In the background: a slow SMTP
         // server mustn't delay push updates.

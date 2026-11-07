@@ -1725,6 +1725,7 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",

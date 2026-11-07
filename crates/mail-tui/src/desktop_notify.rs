@@ -9,11 +9,15 @@ use mail_core::Envelope;
 const MAX_PREVIEW: usize = 3;
 
 pub fn notify_new_mail(account_email: &str, envelopes: &[Envelope]) {
+    // Mail that's already read by the time it's seen here (read on another
+    // device first, or a copy of something sent from this account) isn't
+    // news worth interrupting for.
+    let envelopes: Vec<&Envelope> = envelopes.iter().filter(|e| !e.flags.seen).collect();
     if envelopes.is_empty() {
         return;
     }
 
-    let (summary, body) = if let [only] = envelopes {
+    let (summary, body) = if let [only] = envelopes.as_slice() {
         let from = sender_display(only);
         (
             format!("New mail — {account_email}"),

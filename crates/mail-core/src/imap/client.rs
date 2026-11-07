@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use async_imap::types::{Fetch, Flag as ImapFlag};
 use async_imap::Session;
@@ -22,24 +23,58 @@ pub(crate) struct MailboxInfo {
     pub uid_next: u32,
 }
 
-fn tls_connector() -> Result<TlsConnector> {
-    crate::ensure_crypto_provider();
+/// How long connecting, the TLS handshake and LOGIN may take together
+/// before giving up, rather than hanging on an unresponsive server.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-    let mut root_store = rustls::RootCertStore::empty();
-    let certs = rustls_native_certs::load_native_certs();
-    for err in &certs.errors {
-        tracing::warn!("failed to load a native cert: {err}");
+/// The rustls client config, built once per process: loading and parsing
+/// the system's root certificate bundle is far too slow to repeat for
+/// every connection (and every sync, body fetch, delete, ... opens one).
+fn tls_connector() -> TlsConnector {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    let config = CONFIG.get_or_init(|| {
+        crate::ensure_crypto_provider();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        let certs = rustls_native_certs::load_native_certs();
+        for err in &certs.errors {
+            tracing::warn!("failed to load a native cert: {err}");
+        }
+        let (_added, ignored) = root_store.add_parsable_certificates(certs.certs);
+        if ignored > 0 {
+            tracing::warn!("ignored {ignored} unparsable native root certificates");
+        }
+
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        )
+    });
+    TlsConnector::from(Arc::clone(config))
+}
+
+/// Makes a dead connection fail instead of hanging. After a suspend/resume
+/// or a network switch the server's end is gone without a FIN or RST, and
+/// an idle socket would otherwise wait forever (IDLE in particular): TCP
+/// keepalive probes an idle socket and errors it out within ~2 minutes,
+/// and on Linux `TCP_USER_TIMEOUT` does the same for data sent but never
+/// acknowledged (a write into a dead connection, like IDLE's `DONE`), which
+/// would otherwise retransmit for a quarter of an hour. Best-effort: a
+/// failure here only costs that robustness.
+fn harden_socket(tcp: &TcpStream) {
+    let socket = socket2::SockRef::from(tcp);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(15))
+        .with_retries(4);
+    if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+        tracing::warn!("couldn't enable TCP keepalive: {e}");
     }
-    let (_added, ignored) = root_store.add_parsable_certificates(certs.certs);
-    if ignored > 0 {
-        tracing::warn!("ignored {ignored} unparsable native root certificates");
+    #[cfg(target_os = "linux")]
+    if let Err(e) = socket.set_tcp_user_timeout(Some(Duration::from_secs(120))) {
+        tracing::warn!("couldn't set TCP_USER_TIMEOUT: {e}");
     }
-
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    Ok(TlsConnector::from(Arc::new(config)))
 }
 
 /// Opens a fresh authenticated session. Callers drive `SELECT`/`FETCH`
@@ -48,22 +83,36 @@ fn tls_connector() -> Result<TlsConnector> {
 pub(crate) async fn open_session(account: &Account) -> Result<ImapSession> {
     let password = account.password()?;
     let cfg = &account.config;
+    tokio::time::timeout(CONNECT_TIMEOUT, connect_and_login(account, &password))
+        .await
+        .map_err(|_| {
+            Error::ImapConnect(format!(
+                "{}:{}: timed out after {}s",
+                cfg.imap_host,
+                cfg.imap_port,
+                CONNECT_TIMEOUT.as_secs()
+            ))
+        })?
+}
+
+async fn connect_and_login(account: &Account, password: &str) -> Result<ImapSession> {
+    let cfg = &account.config;
 
     let tcp = TcpStream::connect((cfg.imap_host.as_str(), cfg.imap_port))
         .await
         .map_err(|e| Error::ImapConnect(format!("{}:{}: {e}", cfg.imap_host, cfg.imap_port)))?;
+    harden_socket(&tcp);
 
-    let connector = tls_connector()?;
     let server_name = rustls::pki_types::ServerName::try_from(cfg.imap_host.clone())
         .map_err(|e| Error::Tls(format!("invalid hostname {:?}: {e}", cfg.imap_host)))?;
-    let tls_stream = connector
+    let tls_stream = tls_connector()
         .connect(server_name, tcp)
         .await
         .map_err(|e| Error::Tls(e.to_string()))?;
 
     let client = async_imap::Client::new(tls_stream);
     let session = client
-        .login(&cfg.email, &password)
+        .login(&cfg.email, password)
         .await
         .map_err(|(e, _client)| Error::ImapConnect(format!("login failed: {e}")))?;
 
