@@ -93,21 +93,35 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
 
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let mut version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let initial = version;
     if version == 0 {
+        // SCHEMA_V1 as it stands already includes the version-2 change.
         conn.execute_batch(super::schema::SCHEMA_V1)?;
-        conn.pragma_update(None, "user_version", 2)?;
-    } else if version == 1 {
+        version = 2;
+    }
+    if version == 1 {
         // messages_folder_date was never read by any query (all of them
         // filter/sort by (folder_id, uid), already covered by the
         // UNIQUE(folder_id, uid) constraint's own index) — just dead
         // weight on every insert/update. Drop it for databases created
         // before this was noticed; SCHEMA_V1 no longer creates it at all.
         conn.execute_batch("DROP INDEX IF EXISTS messages_folder_date;")?;
-        conn.pragma_update(None, "user_version", 2)?;
+        version = 2;
+    }
+    if version == 2 {
+        conn.execute_batch(super::schema::MIGRATION_V3)?;
+        version = 3;
+    }
+    if version != initial {
+        conn.pragma_update(None, "user_version", version)?;
     }
     Ok(())
 }
+
+/// The schema version `init_connection` brings every database to.
+#[cfg(test)]
+pub(crate) const CURRENT_VERSION: i64 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -133,7 +147,7 @@ mod tests {
     fn fresh_database_lands_on_current_schema_version() {
         let conn = Connection::open_in_memory().unwrap();
         init_connection(&conn).unwrap();
-        assert_eq!(user_version(&conn), 2);
+        assert_eq!(user_version(&conn), CURRENT_VERSION);
         // Sanity check the schema actually applied, not just the pragma.
         conn.execute("INSERT INTO accounts (email) VALUES ('a@example.com')", [])
             .unwrap();
@@ -144,7 +158,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_connection(&conn).unwrap();
         init_connection(&conn).unwrap();
-        assert_eq!(user_version(&conn), 2);
+        assert_eq!(user_version(&conn), CURRENT_VERSION);
     }
 
     #[test]
@@ -162,7 +176,32 @@ mod tests {
 
         init_connection(&conn).unwrap();
 
-        assert_eq!(user_version(&conn), 2);
+        assert_eq!(user_version(&conn), CURRENT_VERSION);
         assert!(!index_exists(&conn, "messages_folder_date"));
+    }
+
+    #[test]
+    fn migrates_a_version_2_database_seeding_the_backfill_floor_from_the_cache() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(super::super::schema::SCHEMA_V1).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, email) VALUES (1, 'a@example.com');
+             INSERT INTO folders (id, account_id, name) VALUES (1, 1, 'INBOX'), (2, 1, 'Empty');
+             INSERT INTO messages (folder_id, uid) VALUES (1, 40), (1, 17), (1, 99);",
+        )
+        .unwrap();
+
+        init_connection(&conn).unwrap();
+
+        assert_eq!(user_version(&conn), CURRENT_VERSION);
+        let floor = |id: i64| -> Option<i64> {
+            conn.query_row("SELECT backfill_floor_uid FROM folders WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(floor(1), Some(17));
+        assert_eq!(floor(2), None);
     }
 }

@@ -7,7 +7,7 @@ use crate::config;
 use crate::error::Result;
 use crate::imap::client;
 use crate::store::Store;
-use crate::types::{Envelope, Message};
+use crate::types::{Envelope, Flags, Message};
 
 /// How many recently-cached messages to re-check flags for on every sync.
 /// Catches read/starred/deleted changes made from another client without
@@ -42,7 +42,8 @@ pub async fn sync_inbox(account: &Account, store: &Store) -> Result<SyncOutcome>
 
     let new_envelopes = if uidvalidity_changed {
         if had_prior_sync {
-            store.clear_folder_messages(folder.id).await?;
+            let stale = store.clear_folder_messages(folder.id).await?;
+            remove_cached_files(stale).await;
         }
         initial_sync(
             &mut session,
@@ -53,7 +54,7 @@ pub async fn sync_inbox(account: &Account, store: &Store) -> Result<SyncOutcome>
         )
         .await?
     } else {
-        incremental_sync(&mut session, store, folder.id, mailbox.uid_next).await?
+        incremental_sync(&mut session, store, folder.id, &mailbox, account.config.fetch_limit).await?
     };
 
     client::logout(&mut session).await;
@@ -83,6 +84,9 @@ async fn initial_sync(
 
     let envelopes = client::fetch_envelope_seq_range(session, start, end).await?;
     store.upsert_envelopes(folder_id, envelopes.clone()).await?;
+    if let Some(oldest) = envelopes.iter().map(|e| e.uid).min() {
+        store.lower_backfill_floor(folder_id, oldest).await?;
+    }
     Ok(envelopes)
 }
 
@@ -90,35 +94,66 @@ async fn incremental_sync(
     session: &mut client::ImapSession,
     store: &Store,
     folder_id: i64,
-    server_uid_next: u32,
+    mailbox: &client::MailboxInfo,
+    fetch_limit: u32,
 ) -> Result<Vec<Envelope>> {
     let cached_max_uid = store.max_uid(folder_id).await?;
 
     let new_envelopes = match cached_max_uid {
-        Some(cached_max) if server_uid_next > cached_max + 1 => {
-            let uid_set = format!("{}:{}", cached_max + 1, server_uid_next.saturating_sub(1));
+        Some(cached_max) if mailbox.uid_next > cached_max + 1 => {
+            let uid_set = format!("{}:{}", cached_max + 1, mailbox.uid_next.saturating_sub(1));
             let envelopes = client::fetch_envelopes_by_uid(session, &uid_set).await?;
             store.upsert_envelopes(folder_id, envelopes.clone()).await?;
             envelopes
         }
         Some(_) => Vec::new(),
         // Folder row already matched the server's UIDVALIDITY but we have
-        // no cached messages (e.g. a prior sync was interrupted) — treat
-        // it like a first sync rather than diffing against nothing.
-        None => {
-            let mailbox = client::select_inbox(session).await?;
-            initial_sync(session, store, folder_id, u32::MAX, mailbox.exists).await?
-        }
+        // no cached messages (an empty inbox at the last sync, or every
+        // cached message deleted since) — fetch a normal first page rather
+        // than diffing against nothing. Not the whole mailbox: older mail
+        // is still available on demand through "load more".
+        None => initial_sync(session, store, folder_id, fetch_limit, mailbox.exists).await?,
     };
 
     let recent = store.recent_uids(folder_id, FLAG_REFRESH_WINDOW).await?;
     if !recent.is_empty() {
         let uid_set = uid_list(&recent);
         let flags = client::fetch_flags_by_uid(session, &uid_set).await?;
+
+        // A cached UID the server no longer returns was expunged — deleted
+        // or moved away from another client — so drop it here too, or it
+        // would linger in the list forever. Skipped when the server
+        // returned nothing at all for a non-empty mailbox: that's more
+        // likely a server quirk than every recent message vanishing.
+        let gone = expunged_uids(&recent, &flags);
+        if !gone.is_empty() && (!flags.is_empty() || mailbox.exists == 0) {
+            tracing::info!("{} cached message(s) were removed on the server", gone.len());
+            let paths = store.delete_messages(folder_id, gone).await?;
+            remove_cached_files(paths).await;
+        }
+
         store.update_message_flags_batch(folder_id, flags).await?;
     }
 
     Ok(new_envelopes)
+}
+
+/// The UIDs from `requested` that a `UID FETCH` didn't return — on IMAP,
+/// fetching a UID that no longer exists silently yields nothing.
+fn expunged_uids(requested: &[u32], returned: &[(u32, Flags)]) -> Vec<u32> {
+    let present: std::collections::HashSet<u32> = returned.iter().map(|(uid, _)| *uid).collect();
+    requested.iter().copied().filter(|uid| !present.contains(uid)).collect()
+}
+
+/// Best-effort removal of cached `.eml` files whose rows are gone.
+async fn remove_cached_files(paths: Vec<String>) {
+    for path in paths {
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("failed to remove cached message {path}: {e}");
+            }
+        }
+    }
 }
 
 fn uid_list(uids: &[u32]) -> String {
@@ -132,17 +167,19 @@ fn uid_list(uids: &[u32]) -> String {
 /// history up front. Returns how many were actually found and fetched;
 /// `0` means there's nothing older left on the server.
 pub async fn fetch_older(account: &Account, store: &Store, folder_id: i64, batch_size: u32) -> Result<usize> {
-    let Some(min_uid) = store.min_uid(folder_id).await? else {
-        return Ok(0); // nothing cached yet at all — a plain sync should run first
+    // The floor, not MIN(uid): cached server-search hits can be much older
+    // than the contiguous window and would make this skip the gap.
+    let Some(floor) = store.backfill_floor(folder_id).await? else {
+        return Ok(0); // nothing synced yet at all — a plain sync should run first
     };
-    if min_uid <= 1 {
-        return Ok(0); // already have UID 1 — nothing older can exist
+    if floor <= 1 {
+        return Ok(0); // already down to UID 1 — nothing older can exist
     }
 
     let mut session = client::open_session(account).await?;
     client::select_inbox(&mut session).await?;
 
-    let mut candidates = client::uid_search(&mut session, &format!("UID 1:{}", min_uid - 1)).await?;
+    let mut candidates = client::uid_search(&mut session, &format!("UID 1:{}", floor - 1)).await?;
     candidates.sort_unstable();
     candidates.reverse(); // newest-of-the-older first
     candidates.truncate(batch_size as usize);
@@ -154,6 +191,11 @@ pub async fn fetch_older(account: &Account, store: &Store, folder_id: i64, batch
         let envelopes = client::fetch_envelopes_by_uid(&mut session, &uid_set).await?;
         let count = envelopes.len();
         store.upsert_envelopes(folder_id, envelopes).await?;
+        // Every candidate was searched for, fetched or not — the next batch
+        // continues below the oldest of them.
+        if let Some(&oldest) = candidates.last() {
+            store.lower_backfill_floor(folder_id, oldest).await?;
+        }
         count
     };
 
@@ -211,6 +253,17 @@ pub async fn fetch_body(
     if let Some(path) = store.get_message_raw_path(folder_id, uid).await? {
         if let Ok(raw) = tokio::fs::read(&path).await {
             if let Ok(message) = client::message_from_raw(uid, &raw) {
+                // Served from the cache, so the server never saw this
+                // message being read: mark it there too (in the
+                // background — the body is ready now).
+                if store.mark_seen(folder_id, uid).await? {
+                    let account = account.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = client::mark_seen(&account, uid).await {
+                            tracing::warn!("failed to mark uid {uid} read on the server: {e}");
+                        }
+                    });
+                }
                 return Ok(message);
             }
         }
@@ -218,8 +271,12 @@ pub async fn fetch_body(
         // fall through and refetch it.
     }
 
+    // Fetching `BODY[]` sets `\Seen` on the server by itself; just mirror it
+    // locally so the list doesn't keep showing the message as unread until
+    // the next flag sweep.
     let raw = client::fetch_message_raw(account, uid).await?;
     let message = client::message_from_raw(uid, &raw)?;
+    store.mark_seen(folder_id, uid).await?;
 
     if let Err(e) = cache_raw_message(store, account_id, folder_id, uid, &raw).await {
         tracing::warn!("failed to cache message uid {uid} on disk: {e}");
@@ -254,4 +311,17 @@ async fn cache_raw_message(store: &Store, account_id: i64, folder_id: i64, uid: 
         .set_message_raw_path(folder_id, uid, path.to_string_lossy().into_owned())
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expunged_uids_are_the_requested_ones_the_server_did_not_return() {
+        let returned = vec![(10, Flags::default()), (8, Flags::default())];
+        assert_eq!(expunged_uids(&[10, 9, 8, 7], &returned), vec![9, 7]);
+        assert!(expunged_uids(&[10, 8], &returned).is_empty());
+        assert_eq!(expunged_uids(&[3], &[]), vec![3]);
+    }
 }

@@ -28,9 +28,44 @@ impl Store {
             .await
     }
 
-    pub async fn clear_folder_messages(&self, folder_id: i64) -> Result<()> {
-        self.run(move |conn| queries::clear_folder_messages(conn, folder_id))
+    /// Returns the raw `.eml` paths the cleared messages had cached.
+    pub async fn clear_folder_messages(&self, folder_id: i64) -> Result<Vec<String>> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let paths = queries::clear_folder_messages(&tx, folder_id)?;
+            tx.commit()?;
+            Ok(paths)
+        })
+        .await
+    }
+
+    /// Removes several messages at once (e.g. ones expunged from another
+    /// client), returning the raw `.eml` paths they had cached.
+    pub async fn delete_messages(&self, folder_id: i64, uids: Vec<u32>) -> Result<Vec<String>> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let mut paths = Vec::new();
+            for uid in uids {
+                paths.extend(queries::delete_message(&tx, folder_id, uid)?);
+            }
+            tx.commit()?;
+            Ok(paths)
+        })
+        .await
+    }
+
+    pub async fn backfill_floor(&self, folder_id: i64) -> Result<Option<u32>> {
+        self.run(move |conn| queries::backfill_floor(conn, folder_id)).await
+    }
+
+    pub async fn lower_backfill_floor(&self, folder_id: i64, uid: u32) -> Result<()> {
+        self.run(move |conn| queries::lower_backfill_floor(conn, folder_id, uid))
             .await
+    }
+
+    /// See `queries::mark_seen`.
+    pub async fn mark_seen(&self, folder_id: i64, uid: u32) -> Result<bool> {
+        self.run(move |conn| queries::mark_seen(conn, folder_id, uid)).await
     }
 
     /// Wrapped in one transaction rather than N auto-committed statements

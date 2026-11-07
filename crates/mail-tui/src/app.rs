@@ -706,6 +706,11 @@ impl App {
         }
         match result {
             Ok(message) => {
+                // mail-core marked it read in the cache (and on the server);
+                // mirror that in the list right away.
+                if let Some(envelope) = self.envelopes.iter_mut().find(|e| e.uid == uid) {
+                    envelope.flags.seen = true;
+                }
                 self.selected_attachment = 0;
                 self.body = BodyState::Loaded(message);
             }
@@ -1147,6 +1152,15 @@ mod tests {
         app.finish_body(5, Ok(message(5)));
 
         assert!(matches!(&app.body, BodyState::Loaded(m) if m.uid == 5));
+    }
+
+    #[test]
+    fn opening_a_message_marks_it_read_in_the_list() {
+        let mut app = sample_app();
+        assert!(!app.envelopes()[0].flags.seen);
+        app.start_loading_body(5);
+        app.finish_body(5, Ok(message(5)));
+        assert!(app.envelopes()[0].flags.seen);
     }
 
     #[test]

@@ -80,3 +80,14 @@ CREATE TABLE outbox (
     last_error      TEXT
 );
 "#;
+
+/// Version 3: a per-folder lower bound for "load older mail". Pagination
+/// used to backfill below `MIN(uid)`, but server-side search results are
+/// cached too and can be far older than the contiguous cached window — one
+/// search hit would then make "load more" skip everything in between.
+/// Existing folders start from their current `MIN(uid)`, the best guess
+/// available.
+pub const MIGRATION_V3: &str = r#"
+ALTER TABLE folders ADD COLUMN backfill_floor_uid INTEGER;
+UPDATE folders SET backfill_floor_uid = (SELECT MIN(uid) FROM messages WHERE messages.folder_id = folders.id);
+"#;

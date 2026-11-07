@@ -343,6 +343,24 @@ pub async fn delete_message(account: &Account, uid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Sets `\Seen` on a message server-side. Needed when a message is opened
+/// from the on-disk cache: only fetching `BODY[]` over IMAP marks it read
+/// implicitly, so a cache hit would otherwise leave it unread everywhere
+/// else.
+pub(crate) async fn mark_seen(account: &Account, uid: u32) -> Result<()> {
+    let mut session = open_session(account).await?;
+    select_inbox(&mut session).await?;
+    session
+        .uid_store(uid.to_string(), "+FLAGS (\\Seen)")
+        .await
+        .map_err(|e| Error::Imap(format!("STORE +Seen uid {uid}: {e}")))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| Error::Imap(e.to_string()))?;
+    logout(&mut session).await;
+    Ok(())
+}
+
 fn to_flags<'a>(flags: impl Iterator<Item = ImapFlag<'a>>) -> Flags {
     let mut out = Flags::default();
     for flag in flags {

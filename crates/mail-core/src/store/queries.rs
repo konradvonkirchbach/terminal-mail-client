@@ -64,9 +64,58 @@ pub fn update_folder_uid_state(conn: &Connection, folder_id: i64, uidvalidity: u
 
 /// Wipes all cached messages for a folder — used when the server's
 /// `UIDVALIDITY` no longer matches ours, meaning our UIDs are meaningless.
-pub fn clear_folder_messages(conn: &Connection, folder_id: i64) -> Result<()> {
+///
+/// Returns the on-disk paths of whatever raw `.eml` files those messages
+/// had cached, for the caller to delete — they live outside SQLite. Also
+/// resets the folder's backfill floor, since it described UIDs that no
+/// longer mean anything.
+pub fn clear_folder_messages(conn: &Connection, folder_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT raw_path FROM messages WHERE folder_id = ?1 AND raw_path IS NOT NULL")?;
+    let paths = stmt
+        .query_map(params![folder_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     conn.execute("DELETE FROM messages WHERE folder_id = ?1", params![folder_id])?;
+    conn.execute(
+        "UPDATE folders SET backfill_floor_uid = NULL WHERE id = ?1",
+        params![folder_id],
+    )?;
+    Ok(paths)
+}
+
+/// The lowest UID "load older mail" has backfilled down to (or the initial
+/// sync started from) — older mail is searched for strictly below this.
+/// Deliberately not `MIN(uid)`: server-side search results get cached too,
+/// and can be far older than the contiguous window.
+pub fn backfill_floor(conn: &Connection, folder_id: i64) -> Result<Option<u32>> {
+    conn.query_row(
+        "SELECT backfill_floor_uid FROM folders WHERE id = ?1",
+        params![folder_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .optional()
+    .map(|v| v.flatten().map(|v| v as u32))
+    .map_err(Into::into)
+}
+
+/// Moves the backfill floor down to `uid` — never up, so a later, newer
+/// batch can't undo an earlier backfill.
+pub fn lower_backfill_floor(conn: &Connection, folder_id: i64, uid: u32) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET backfill_floor_uid = ?2
+         WHERE id = ?1 AND (backfill_floor_uid IS NULL OR backfill_floor_uid > ?2)",
+        params![folder_id, uid],
+    )?;
     Ok(())
+}
+
+/// Marks a message read in the cache. Returns whether it was unread
+/// before, i.e. whether anything changed.
+pub fn mark_seen(conn: &Connection, folder_id: i64, uid: u32) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE messages SET seen = 1 WHERE folder_id = ?1 AND uid = ?2 AND seen = 0",
+        params![folder_id, uid],
+    )?;
+    Ok(changed > 0)
 }
 
 pub fn upsert_envelope(conn: &Connection, folder_id: i64, env: &Envelope) -> Result<()> {
@@ -421,6 +470,70 @@ mod tests {
 
         assert!(list_envelopes(&conn, folder_a.id, 10).unwrap().is_empty());
         assert_eq!(list_envelopes(&conn, folder_b.id, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn clear_folder_messages_returns_cached_raw_paths_and_resets_the_floor() {
+        let conn = test_conn();
+        let account_id = upsert_account(&conn, "a@example.com", None).unwrap();
+        let folder = get_or_create_folder(&conn, account_id, "INBOX").unwrap();
+        upsert_envelope(&conn, folder.id, &sample_envelope(1, "A")).unwrap();
+        upsert_envelope(&conn, folder.id, &sample_envelope(2, "B")).unwrap();
+        set_message_raw_path(&conn, folder.id, 2, "/tmp/2.eml").unwrap();
+        lower_backfill_floor(&conn, folder.id, 1).unwrap();
+
+        let paths = clear_folder_messages(&conn, folder.id).unwrap();
+
+        assert_eq!(paths, vec!["/tmp/2.eml".to_string()]);
+        assert_eq!(backfill_floor(&conn, folder.id).unwrap(), None);
+    }
+
+    #[test]
+    fn the_backfill_floor_only_ever_moves_down() {
+        let conn = test_conn();
+        let account_id = upsert_account(&conn, "a@example.com", None).unwrap();
+        let folder = get_or_create_folder(&conn, account_id, "INBOX").unwrap();
+        assert_eq!(backfill_floor(&conn, folder.id).unwrap(), None);
+
+        lower_backfill_floor(&conn, folder.id, 500).unwrap();
+        assert_eq!(backfill_floor(&conn, folder.id).unwrap(), Some(500));
+        lower_backfill_floor(&conn, folder.id, 800).unwrap();
+        assert_eq!(
+            backfill_floor(&conn, folder.id).unwrap(),
+            Some(500),
+            "a higher uid must not raise it"
+        );
+        lower_backfill_floor(&conn, folder.id, 450).unwrap();
+        assert_eq!(backfill_floor(&conn, folder.id).unwrap(), Some(450));
+    }
+
+    #[test]
+    fn caching_an_old_search_hit_does_not_move_the_backfill_floor() {
+        let conn = test_conn();
+        let account_id = upsert_account(&conn, "a@example.com", None).unwrap();
+        let folder = get_or_create_folder(&conn, account_id, "INBOX").unwrap();
+        for uid in 900..=1000 {
+            upsert_envelope(&conn, folder.id, &sample_envelope(uid, "x")).unwrap();
+        }
+        lower_backfill_floor(&conn, folder.id, 900).unwrap();
+
+        upsert_envelope(&conn, folder.id, &sample_envelope(5, "ancient search hit")).unwrap();
+
+        assert_eq!(min_uid(&conn, folder.id).unwrap(), Some(5));
+        assert_eq!(backfill_floor(&conn, folder.id).unwrap(), Some(900));
+    }
+
+    #[test]
+    fn mark_seen_reports_whether_the_message_was_unread() {
+        let conn = test_conn();
+        let account_id = upsert_account(&conn, "a@example.com", None).unwrap();
+        let folder = get_or_create_folder(&conn, account_id, "INBOX").unwrap();
+        upsert_envelope(&conn, folder.id, &sample_envelope(1, "x")).unwrap();
+
+        assert!(mark_seen(&conn, folder.id, 1).unwrap());
+        assert!(!mark_seen(&conn, folder.id, 1).unwrap(), "already read");
+        assert!(list_envelopes(&conn, folder.id, 10).unwrap()[0].flags.seen);
+        assert!(!mark_seen(&conn, folder.id, 999).unwrap(), "missing uid is a no-op");
     }
 
     #[test]
