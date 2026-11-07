@@ -73,6 +73,8 @@ pub enum Outcome {
     },
     /// `:wq` / `:x`.
     Send,
+    /// `:w`: save as a draft.
+    Save,
     /// A one-line message for the status line (errors like "Pattern not
     /// found", or "Already at oldest change").
     Notice(String),
@@ -1126,7 +1128,7 @@ impl Vim {
             "q" => Outcome::Quit { force: false },
             "q!" => Outcome::Quit { force: true },
             "wq" | "wq!" | "x" | "x!" => Outcome::Send,
-            "w" => Outcome::Notice("Drafts aren't saved yet — :wq sends, :q! discards".to_string()),
+            "w" | "w!" => Outcome::Save,
             _ if cmd.chars().all(|c| c.is_ascii_digit()) => {
                 let line: usize = cmd.parse().unwrap_or(usize::MAX);
                 let row = line.saturating_sub(1).min(area.lines.len() - 1);

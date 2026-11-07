@@ -6,6 +6,7 @@ mod editable;
 mod filebrowser;
 mod fuzzy;
 mod input;
+mod reply;
 mod session;
 mod setup;
 mod spellcheck;
@@ -14,7 +15,7 @@ mod ui;
 mod vim;
 
 use std::io::stdout;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use crossterm::cursor::{SetCursorStyle, Show};
@@ -47,10 +48,10 @@ fn init_tracing() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_or_setup_accounts() -> anyhow::Result<Vec<Account>> {
+async fn load_or_setup_accounts() -> anyhow::Result<Vec<Account>> {
     let config = mail_core::config::Config::load()?;
     if config.accounts.is_empty() {
-        return Ok(vec![setup::run()?]);
+        return Ok(vec![setup::run().await?]);
     }
     Ok(config.accounts.into_iter().map(Account::new).collect())
 }
@@ -61,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
         return setup::set_password();
     }
     if std::env::args().any(|a| a == "--add-account") {
-        return setup::add_account();
+        return setup::add_account().await;
     }
     if std::env::args().any(|a| a == "--remove-account") {
         return setup::remove_account().await;
@@ -71,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     init_tracing()?;
-    let accounts = load_or_setup_accounts()?;
+    let accounts = load_or_setup_accounts().await?;
 
     // A panic would otherwise leave the shell in raw mode on the alternate
     // screen, with the panic message itself unreadable. Restore first, then
@@ -122,12 +123,13 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, account
         let account_id = store
             .upsert_account(account.config.email.clone(), account.config.display_name.clone())
             .await?;
-        let folder = store.get_or_create_folder(account_id, "INBOX".to_string()).await?;
+        let inbox = store.get_or_create_folder(account_id, "INBOX".to_string()).await?;
         list.push(AccountCtx {
             account,
             store: store.clone(),
             account_id,
-            folder_id: folder.id,
+            folder_id: inbox.id,
+            inbox_id: inbox.id,
         });
     }
     let current = config
@@ -139,6 +141,14 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, account
 
     let mut app = App::new(accounts.list.iter().map(|a| a.account.config.email.clone()).collect());
     app.current_account = accounts.current;
+    app.current_folder_id = accounts.current().folder_id;
+    // The folder lists as last seen, so the sidebar is complete at once.
+    for (index, ctx) in accounts.list.iter().enumerate() {
+        match store.list_folders(ctx.account_id).await {
+            Ok(folders) => app.set_folders(index, folders),
+            Err(e) => tracing::warn!("reading cached folders failed: {e}"),
+        }
+    }
 
     // Render instantly from whatever's cached, then reconcile with the
     // server in the background — this is what makes launch feel instant
@@ -153,6 +163,8 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, account
     let (app_event_tx, mut app_events) = mpsc::unbounded_channel::<AppEvent>();
 
     bg::spawn_known_senders(accounts.current().clone(), tx.clone());
+    bg::spawn_outbox_counts(accounts.current().clone(), tx.clone());
+    bg::spawn_clean_open_dir();
 
     // Spellcheck starts with the first compose (see `bg::spawn_spellchecker_reload`),
     // so launch never waits on `hyprctl`/`hunspell`.
@@ -170,6 +182,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, account
     // on the next manual/account-switch sync.
     for account in &session.accounts.list {
         bg::spawn_sync(account.clone(), session.tx.clone());
+        bg::spawn_refresh_folders(account.clone(), session.tx.clone());
         tokio::spawn(mail_core::idle::run(
             account.account.clone(),
             account.store.clone(),
@@ -200,6 +213,11 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, account
         // next tick then becomes the idle interval) it could show stale
         // text for up to another heartbeat.
         let tick = app.expire_status().unwrap_or(IDLE_REDRAW_INTERVAL);
+
+        // Keep what's being written safe from a crash or a closed terminal.
+        if let Some(saved) = app.compose.as_mut().and_then(|c| c.autosave_due(Instant::now())) {
+            bg::spawn_save_draft(session.accounts.current(), saved, false, session.tx.clone());
+        }
 
         terminal.draw(|frame| ui::draw(frame, &app, &theme))?;
 

@@ -8,11 +8,31 @@ use std::path::{Path, PathBuf};
 /// base64-encoding attachments inflates their wire size by about a third.
 pub const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
+/// Where an attachment's content comes from when the message is sent.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum AttachmentSource {
+    /// A local file, read at send time.
+    File(PathBuf),
+    /// An attachment of a received message being forwarded: the
+    /// `index`-th of message `uid` in folder `folder_id`.
+    Message { folder_id: i64, uid: u32, index: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AttachmentEntry {
-    pub path: PathBuf,
+    pub source: AttachmentSource,
     pub filename: String,
     pub size_bytes: u64,
+}
+
+/// Encodes a compose's attachments for a saved draft.
+pub fn to_json(entries: &[AttachmentEntry]) -> String {
+    serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Decodes a saved draft's attachments; anything unreadable is dropped.
+pub fn from_json(json: &str) -> Vec<AttachmentEntry> {
+    serde_json::from_str(json).unwrap_or_default()
 }
 
 /// Validates a file the browser resolved to a concrete path: it must
@@ -42,7 +62,7 @@ pub fn validate(path: &Path, existing_total_bytes: u64) -> Result<AttachmentEntr
         .unwrap_or_else(|| path.display().to_string());
 
     Ok(AttachmentEntry {
-        path: path.to_path_buf(),
+        source: AttachmentSource::File(path.to_path_buf()),
         filename,
         size_bytes,
     })
@@ -122,7 +142,29 @@ mod tests {
 
         assert_eq!(entry.filename, "report.pdf");
         assert_eq!(entry.size_bytes, 11);
-        assert_eq!(entry.path, file);
+        assert_eq!(entry.source, AttachmentSource::File(file));
+    }
+
+    #[test]
+    fn attachments_round_trip_through_a_saved_draft() {
+        let entries = vec![
+            AttachmentEntry {
+                source: AttachmentSource::File(PathBuf::from("/home/me/a.pdf")),
+                filename: "a.pdf".into(),
+                size_bytes: 3,
+            },
+            AttachmentEntry {
+                source: AttachmentSource::Message {
+                    folder_id: 2,
+                    uid: 9,
+                    index: 1,
+                },
+                filename: "b.png".into(),
+                size_bytes: 4,
+            },
+        ];
+        assert_eq!(from_json(&to_json(&entries)), entries);
+        assert!(from_json("not json").is_empty());
     }
 
     #[test]

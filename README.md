@@ -12,14 +12,32 @@ notifications for new mail.
 ## Features
 
 - **IMAP/SMTP** — works with any standard provider (Gmail, Yahoo, Fastmail,
-  self-hosted, ...) via password or app-password auth
+  self-hosted, ...) via password or app-password auth, over TLS (993) or
+  STARTTLS (143); the setup wizard tests the login before saving anything
+- **Folders** — every folder on the server in the sidebar, with unread
+  counts; Sent, Trash, Drafts etc. are recognized from the server's
+  SPECIAL-USE markers (or their usual names), so deleting moves mail to the
+  real Trash and sent copies land in the real Sent folder (not duplicated on
+  Gmail, which files them itself)
 - **Multi-account** — add as many as you like, switch with `Tab` or a number key
 - **Instant + offline** — a local SQLite cache means launch is instant and
   reading works offline; syncs in the background
 - **Push updates** — a persistent IMAP `IDLE` connection per account means
   new mail shows up on its own, no polling
-- **Full compose flow** — reply, attachments (with a keyboard-driven
-  directory browser, not blind path typing), a 20MB size cap
+- **Full compose flow** — reply, reply-all and forward (quoting the
+  original, honoring `Reply-To`, and threaded with `In-Reply-To` /
+  `References` so replies stay in their conversation everywhere),
+  attachments (with a keyboard-driven directory browser, not blind path
+  typing; forwards keep the original's), a 20MB size cap
+- **Drafts** — whatever you're writing is saved automatically every few
+  seconds; `:w` saves on demand, closing keeps it as a draft, and `P`
+  brings saved drafts back (stored locally, not in the server's Drafts
+  folder)
+- **Read/star toggles** — mark mail read or unread and star it, synced to
+  the server
+- **Outbox** — mail that couldn't be sent (offline) is queued and retried
+  after every sync; the status bar shows how many are waiting, and `F`
+  sends them now
 - **Vim editing in the compose body** — Normal/Insert/Visual modes, motions,
   operators and text objects, counts, undo/redo, `.` repeat, `/` search,
   and `:wq` / `:q!`
@@ -32,7 +50,9 @@ notifications for new mail.
   a dictionary per language you type in; move the cursor onto a flagged
   word to see its suggested corrections; off automatically if none is
   installed
-- **Attachment downloads** — same directory browser, in reverse
+- **Attachment downloads** — same directory browser, in reverse; or open
+  an attachment straight in its default app, and an HTML email in the
+  browser (`xdg-open`)
 - **Search** — live filter the inbox by sender or subject; if nothing
   matches locally, hitting `Enter` falls back to a server-side search so you
   can find mail older than what's cached
@@ -114,6 +134,12 @@ You'll need your IMAP/SMTP host and port (e.g. `imap.gmail.com` / 993 and
 enabled require an **app password** rather than your normal one — Gmail,
 Yahoo, and most others generate these under Account Security settings.
 
+IMAP port 993 is TLS from the start; 143 connects in plain text and
+upgrades with STARTTLS (and refuses to continue if the server won't —
+mail never goes over an unencrypted connection). SMTP port 465 is TLS,
+anything else (587) STARTTLS. Before saving, the wizard logs in to both
+servers and shows what failed, if anything.
+
 The name shown to recipients comes from `display_name` in
 `~/.config/email_client/config.toml` (the wizard asks for it; add it by
 hand to an existing account to set one).
@@ -154,13 +180,22 @@ mailc --set-default-account
 | `Ctrl-d` / `Ctrl-u` | Jump 10 messages down / up |
 | `Enter` | Read selected message |
 | `J` / `K`, `Space`, `Ctrl-f` / `Ctrl-b` | Scroll the open message by a line / a page down / a page up |
+| `{` / `}` | Previous / next folder |
+| `gi` | Go to the inbox |
 | `/` | Search (live filter by sender/subject); `Enter` confirms — if there are no local matches, this also runs a server-side search — `Esc` clears |
 | `c` | Compose a new message |
-| `r` | Reply to selected message |
+| `r` / `R` | Reply / reply to all (opens the message first if it isn't already) |
+| `f` | Forward, with the original's attachments |
+| `P` | Saved drafts: `Enter` resumes one, `d` deletes it, `Esc` closes |
+| `m` | Mark read / unread |
+| `s` | Star / unstar (shown as `!` in the list) |
 | `[` / `]` | Cycle selected attachment on an open message |
-| `a` | Download selected attachment |
-| `d` | Delete selected message (asks to confirm; moves to Trash if the provider supports it) |
-| `S` | Manual sync |
+| `a` | Save selected attachment |
+| `o` | Open selected attachment in its default app |
+| `O` | Open the message's HTML version in the browser (which loads its remote images) |
+| `d` | Delete selected message (asks to confirm; moves it to Trash, or deletes it for good when it's already there) |
+| `S` | Manual sync (also re-reads the folder list) |
+| `F` | Send queued mail now (including messages given up on after repeated failures) |
 | `Tab` / `Shift+Tab` | Switch account (when more than one is configured) |
 | `1`–`9` | Jump directly to account N |
 | `D` | Set the current account as the one that opens by default |
@@ -178,8 +213,11 @@ mailc --set-default-account
 | `Esc` (in a header field) | Jump to the body in Normal mode (dismisses an open suggestion dropdown first) |
 
 Esc never discards a draft. To leave compose, use the body's command line:
-`:wq` / `:x` sends, `:q` closes an empty compose (and refuses with a
-reminder if there's anything in it), `:q!` discards whatever's there.
+`:wq` / `:x` sends, `:w` saves it as a draft and keeps writing, `:q`
+closes and keeps anything written as a draft (`P` brings it back), `:q!`
+discards it, saved draft included. While compose is open, what you write
+is also saved automatically every few seconds, so a crash or a closed
+terminal loses at most that much.
 
 **Compose body (vim modes):** the body is a modal editor. Moving into it
 starts in **Insert** mode, so you can just type; `Esc` switches to
@@ -206,7 +244,7 @@ elsewhere.
 | `p P` | Put after / before the cursor |
 | `u`, `Ctrl-r`, `.` | Undo, redo, repeat the last change |
 | `v`, `V`, then `d y c ~ u U J o` | Visual (char / line) selection and what you can do to it |
-| `:{n}`, `:wq` `:x`, `:q` `:q!`, `:w` | Go to line n, send, close / discard (`:w` explains drafts aren't saved yet) |
+| `:{n}`, `:wq` `:x`, `:w`, `:q` `:q!` | Go to line n, send, save as a draft, close keeping / discarding the draft |
 
 In Insert mode: `Ctrl-w` deletes the word before the cursor, `Ctrl-u`
 deletes to the start of the line, `Home`/`End`/`Del` work as usual.
@@ -237,9 +275,10 @@ mode) — display-only; fix the word with the usual vim commands (`ciw`, ...).
 
 Two crates:
 
-- **`mail-core`** — IMAP/SMTP protocol handling, the local SQLite cache, sync
-  engine, IDLE push loop, and sending. No UI dependencies at all — this is
-  what a future GUI frontend would reuse instead of the TUI.
+- **`mail-core`** — IMAP/SMTP protocol handling, the local SQLite cache
+  (messages, folders, drafts, outbox), sync engine, IDLE push loop (on the
+  inbox), and sending. No UI dependencies at all — this is what a future
+  GUI frontend would reuse instead of the TUI.
 - **`mail-tui`** — the [ratatui](https://ratatui.rs)-based terminal
   interface: rendering, keybindings, Omarchy theme integration, desktop
   notifications.

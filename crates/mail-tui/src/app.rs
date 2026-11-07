@@ -3,11 +3,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use mail_core::{Address, Draft, Envelope, Message};
+use mail_core::{Address, Draft, Envelope, FlagKind, Folder, FolderRole, Message, OutboxCounts, SavedDraft};
 
-use crate::attach::AttachmentEntry;
+use crate::attach::{self, AttachmentEntry, AttachmentSource};
 use crate::editable::{TextArea, TextInput};
 use crate::filebrowser::FileBrowser;
+use crate::reply::{self, Respond};
 use crate::vim::Vim;
 
 /// Source of `ComposeState::id` — a fresh, process-wide-unique id per
@@ -30,6 +31,9 @@ pub const PAGE_JUMP: usize = 10;
 /// recipient field in compose.
 pub const MAX_RECIPIENT_SUGGESTIONS: usize = 8;
 
+/// The least time between two automatic saves of a compose's draft.
+pub const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(5);
+
 /// What a currently-open `FileBrowser` is for — decides what happens
 /// when the user picks a file or confirms a save location.
 pub enum BrowserPurpose {
@@ -50,7 +54,8 @@ pub enum BodyState {
     Loading {
         uid: u32,
     },
-    Loaded(Message),
+    /// Boxed: a parsed message is large next to the other states.
+    Loaded(Box<Message>),
     Error(String),
 }
 
@@ -173,6 +178,20 @@ pub struct ComposeState {
     /// Set when no spellchecker could be started for this compose; shown
     /// in the body's title for as long as compose stays open.
     pub spellcheck_note: Option<String>,
+    /// Identifies this compose's saved draft: every save replaces the
+    /// draft stored under it. Carried over when a draft is resumed.
+    pub draft_key: String,
+    /// For a reply, the `Message-ID` it answers (see `Draft::in_reply_to`).
+    pub in_reply_to: Option<String>,
+    /// For a reply, the thread it joins (see `Draft::references`).
+    pub references: Vec<String>,
+    /// For a reply, the message it answers as `(folder_id, uid)` — marked
+    /// answered once the reply is sent.
+    pub answers: Option<(i64, u32)>,
+    /// What was last saved as a draft (or handed off to be saved), to tell
+    /// whether there's anything new to save.
+    pub last_saved: Option<SavedDraft>,
+    pub last_save_at: Option<Instant>,
 }
 
 impl ComposeState {
@@ -193,25 +212,86 @@ impl ComposeState {
             vim: Vim::new(),
             notice: None,
             spellcheck_note: None,
+            draft_key: new_draft_key(),
+            in_reply_to: None,
+            references: Vec::new(),
+            answers: None,
+            last_saved: None,
+            last_save_at: None,
         }
     }
 
-    /// A reply to `source`, prefilled from its envelope (from/subject) —
-    /// doesn't require the body to have been fetched.
-    pub fn reply(source: &Envelope) -> Self {
-        let to = source.from.first().map(|a| a.email.clone()).unwrap_or_default();
-        let subject = if source.subject.to_lowercase().starts_with("re:") {
-            source.subject.clone()
-        } else {
-            format!("Re: {}", source.subject)
-        };
-        let mut compose = Self {
-            to: TextInput::with_value(to),
-            subject: TextInput::with_value(subject),
-            focus: ComposeField::Body,
-            ..Self::blank()
-        };
-        compose.vim.enter_insert(&compose.body);
+    /// A reply to, or forward of, `message` (from folder `folder_id`): its
+    /// recipients, subject and quoted or forwarded text filled in, and for
+    /// a reply the headers that keep it in its thread. A reply starts in
+    /// Insert mode above the quote; a forward in the To field.
+    pub fn respond(message: &Message, kind: Respond, own_email: &str, folder_id: i64) -> Self {
+        let mut compose = Self::blank();
+        match kind {
+            Respond::Reply | Respond::ReplyAll => {
+                let (to, cc) = reply::reply_recipients(message, own_email, kind == Respond::ReplyAll);
+                compose.to = TextInput::with_value(reply::recipient_field(&to));
+                compose.cc = TextInput::with_value(reply::recipient_field(&cc));
+                compose.subject = TextInput::with_value(reply::reply_subject(&message.subject));
+                compose.body.lines = reply::quoted_body(message);
+                compose.in_reply_to = message.message_id.clone();
+                compose.references = reply::thread_references(message);
+                compose.answers = Some((folder_id, message.uid));
+                compose.focus = ComposeField::Body;
+                compose.vim.enter_insert(&compose.body);
+            }
+            Respond::Forward => {
+                compose.subject = TextInput::with_value(reply::forward_subject(&message.subject));
+                compose.body.lines = reply::forwarded_body(message);
+                let mut total = 0;
+                let mut left_out = 0;
+                for (index, a) in message.attachments.iter().enumerate() {
+                    if total + a.size_bytes > attach::MAX_TOTAL_ATTACHMENT_BYTES {
+                        left_out += 1;
+                        continue;
+                    }
+                    total += a.size_bytes;
+                    compose.attachments.items.push(AttachmentEntry {
+                        source: AttachmentSource::Message {
+                            folder_id,
+                            uid: message.uid,
+                            index,
+                        },
+                        filename: a.filename.clone(),
+                        size_bytes: a.size_bytes,
+                    });
+                }
+                if left_out > 0 {
+                    compose.notice = Some(format!(
+                        "Left out {left_out} attachment(s) that would go over the {} limit",
+                        attach::human_size(attach::MAX_TOTAL_ATTACHMENT_BYTES)
+                    ));
+                }
+            }
+        }
+        compose
+    }
+
+    /// A saved draft, reopened where it left off — in the body, in Normal
+    /// mode — and saved again under the same key.
+    pub fn from_saved(saved: SavedDraft) -> Self {
+        let mut compose = Self::blank();
+        let draft = &saved.draft;
+        compose.to = TextInput::with_value(draft.to.clone());
+        compose.cc = TextInput::with_value(draft.cc.clone());
+        compose.bcc = TextInput::with_value(draft.bcc.clone());
+        compose.subject = TextInput::with_value(draft.subject.clone());
+        compose.body.lines = draft.body.split('\n').map(str::to_string).collect();
+        compose.attachments.items = attach::from_json(&saved.attachments);
+        compose.in_reply_to = draft.in_reply_to.clone();
+        compose.references = draft.references.clone();
+        compose.answers = saved.answers;
+        compose.draft_key = saved.key.clone();
+        compose.focus_body_normal();
+        compose.last_saved = Some(SavedDraft {
+            updated_at: None,
+            ..saved
+        });
         compose
     }
 
@@ -277,7 +357,52 @@ impl ComposeState {
             bcc: self.bcc.value.clone(),
             subject: self.subject.value.clone(),
             body: self.body.text(),
+            in_reply_to: self.in_reply_to.clone(),
+            references: self.references.clone(),
         }
+    }
+
+    /// Everything a saved draft holds, as of now.
+    pub fn to_saved(&self) -> SavedDraft {
+        SavedDraft {
+            key: self.draft_key.clone(),
+            draft: self.to_draft(),
+            attachments: attach::to_json(&self.attachments.items),
+            answers: self.answers,
+            updated_at: None,
+        }
+    }
+
+    /// Whether there's anything a saved draft doesn't have yet.
+    pub fn has_unsaved_changes(&self) -> bool {
+        !self.is_blank() && self.last_saved.as_ref() != Some(&self.to_saved())
+    }
+
+    /// The draft to save automatically, if one is due: something changed
+    /// since the last save, and that was at least `AUTOSAVE_INTERVAL` ago.
+    /// Recorded as saved right away, so it isn't handed out twice.
+    pub fn autosave_due(&mut self, now: Instant) -> Option<SavedDraft> {
+        if self.sending
+            || self
+                .last_save_at
+                .is_some_and(|at| now.duration_since(at) < AUTOSAVE_INTERVAL)
+        {
+            return None;
+        }
+        self.has_unsaved_changes().then(|| self.take_save(now))
+    }
+
+    /// The draft to save now (`:w`, closing), recorded as saved.
+    pub fn take_save(&mut self, now: Instant) -> SavedDraft {
+        let saved = self.to_saved();
+        self.last_saved = Some(saved.clone());
+        self.last_save_at = Some(now);
+        saved
+    }
+
+    /// A save didn't go through: forget it, so the next autosave retries.
+    pub fn save_failed(&mut self) {
+        self.last_saved = None;
     }
 
     pub fn attachments_total_bytes(&self) -> u64 {
@@ -329,7 +454,8 @@ impl ComposeState {
             Some(idx) => format!("{} ", field.value[..=idx].trim_end()),
             None => String::new(),
         };
-        field.value = format!("{prefix}{chosen}, ");
+        // Quoted where needed, so a name like "Doe, Jane" stays one recipient.
+        field.value = format!("{prefix}{}, ", chosen.to_recipient());
         field.cursor = field.value.chars().count();
         self.suggestions.clear();
     }
@@ -377,6 +503,18 @@ pub struct App {
     /// owns. Doesn't change after startup; only `current_account` does.
     pub account_emails: Vec<String>,
     pub current_account: usize,
+    /// Each account's folders in sidebar order, index-matched with
+    /// `account_emails`. Empty until first read from the cache.
+    pub folders: Vec<Vec<Folder>>,
+    /// The folder whose messages are shown.
+    pub current_folder_id: i64,
+    /// A reply or forward waiting for its message's body to load, since
+    /// quoting and threading need it: `(uid, what to do)`.
+    pub pending_respond: Option<(u32, Respond)>,
+    /// The current account's queued (not yet sent) messages.
+    pub outbox: OutboxCounts,
+    /// The saved-drafts picker, while it's open.
+    pub drafts: Option<Selectable<SavedDraft>>,
     pub list_state: ListState,
     /// The current account's cached envelopes, newest first. Private so
     /// every change goes through a method that keeps `visible` and
@@ -440,8 +578,13 @@ pub struct App {
 impl App {
     pub fn new(account_emails: Vec<String>) -> Self {
         Self {
+            folders: vec![Vec::new(); account_emails.len()],
             account_emails,
             current_account: 0,
+            current_folder_id: 0,
+            pending_respond: None,
+            outbox: OutboxCounts::default(),
+            drafts: None,
             list_state: ListState::Loading,
             envelopes: Vec::new(),
             selected: 0,
@@ -475,8 +618,18 @@ impl App {
     /// Resets everything that's specific to whichever account was
     /// previously active — called right after `current_account` changes,
     /// before the new account's cached envelopes are loaded in.
-    pub fn reset_for_account_switch(&mut self) {
+    pub fn reset_for_account_switch(&mut self, inbox_id: i64) {
+        self.show_folder(inbox_id);
+        self.known_senders.clear();
+        self.outbox = OutboxCounts::default();
+    }
+
+    /// Switches the list to another folder (of the current account):
+    /// everything about the old folder's list goes.
+    pub fn show_folder(&mut self, folder_id: i64) {
+        self.current_folder_id = folder_id;
         self.envelopes.clear();
+        self.visible.clear();
         self.selected = 0;
         self.selected_attachment = 0;
         self.body = BodyState::Empty;
@@ -486,7 +639,79 @@ impl App {
         self.has_more_older = true;
         self.loading_more = false;
         self.pending_g = false;
-        self.known_senders.clear();
+        self.pending_respond = None;
+        self.confirm_delete = None;
+    }
+
+    // -- folders --------------------------------------------------------------
+
+    pub fn set_folders(&mut self, account: usize, folders: Vec<Folder>) {
+        if let Some(slot) = self.folders.get_mut(account) {
+            *slot = folders;
+        }
+    }
+
+    pub fn current_folder(&self) -> Option<&Folder> {
+        self.folders
+            .get(self.current_account)?
+            .iter()
+            .find(|f| f.id == self.current_folder_id)
+    }
+
+    pub fn current_folder_role(&self) -> Option<FolderRole> {
+        self.current_folder().and_then(|f| f.role)
+    }
+
+    /// The selectable folder before (`forward == false`) or after the
+    /// current one in the sidebar, wrapping around.
+    pub fn neighbor_folder(&self, forward: bool) -> Option<i64> {
+        let folders: Vec<&Folder> = self
+            .folders
+            .get(self.current_account)?
+            .iter()
+            .filter(|f| f.selectable)
+            .collect();
+        if folders.is_empty() {
+            return None;
+        }
+        let len = folders.len();
+        let next = match folders.iter().position(|f| f.id == self.current_folder_id) {
+            Some(i) if forward => (i + 1) % len,
+            Some(i) => (i + len - 1) % len,
+            None => 0,
+        };
+        Some(folders[next].id).filter(|&id| id != self.current_folder_id)
+    }
+
+    /// Changes the current folder's unread count by `delta` — keeps the
+    /// sidebar in step with reads and toggles until the next refresh
+    /// brings the server's count.
+    fn adjust_unseen(&mut self, delta: i64) {
+        let (account, folder_id) = (self.current_account, self.current_folder_id);
+        if let Some(folder) = self
+            .folders
+            .get_mut(account)
+            .and_then(|list| list.iter_mut().find(|f| f.id == folder_id))
+        {
+            if let Some(unseen) = &mut folder.unseen {
+                *unseen = (i64::from(*unseen) + delta).max(0) as u32;
+            }
+        }
+    }
+
+    /// Sets a flag on a listed message, returning whether it changed.
+    pub fn set_envelope_flag(&mut self, uid: u32, flag: FlagKind, on: bool) -> bool {
+        let Some(envelope) = self.envelopes.iter_mut().find(|e| e.uid == uid) else {
+            return false;
+        };
+        if envelope.flags.get(flag) == on {
+            return false;
+        }
+        envelope.flags.set(flag, on);
+        if flag == FlagKind::Seen {
+            self.adjust_unseen(if on { -1 } else { 1 });
+        }
+        true
     }
 
     /// Clears the status message once its TTL has elapsed; called from
@@ -697,6 +922,10 @@ impl App {
     }
 
     pub fn start_loading_body(&mut self, uid: u32) {
+        // A reply waiting for another message's body won't get it now.
+        if self.pending_respond.is_some_and(|(pending, _)| pending != uid) {
+            self.pending_respond = None;
+        }
         self.body = BodyState::Loading { uid };
         self.body_scroll = 0;
     }
@@ -713,13 +942,16 @@ impl App {
             Ok(message) => {
                 // mail-core marked it read in the cache (and on the server);
                 // mirror that in the list right away.
-                if let Some(envelope) = self.envelopes.iter_mut().find(|e| e.uid == uid) {
-                    envelope.flags.seen = true;
-                }
+                self.set_envelope_flag(uid, FlagKind::Seen, true);
                 self.selected_attachment = 0;
-                self.body = BodyState::Loaded(message);
+                self.body = BodyState::Loaded(Box::new(message));
             }
-            Err(e) => self.body = BodyState::Error(e),
+            Err(e) => {
+                self.body = BodyState::Error(e);
+                if self.pending_respond.is_some_and(|(pending, _)| pending == uid) {
+                    self.pending_respond = None;
+                }
+            }
         }
     }
 
@@ -817,6 +1049,16 @@ fn last_recipient_separator(s: &str) -> Option<usize> {
         }
     }
     last
+}
+
+/// A key for a new compose session's draft, unique across runs.
+fn new_draft_key() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{nanos:x}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 fn envelope_matches(e: &Envelope, needle: &str) -> bool {
@@ -999,15 +1241,11 @@ mod tests {
     #[test]
     fn remove_envelope_clears_the_reading_pane_if_it_was_showing_that_message() {
         let mut app = sample_app();
-        app.body = BodyState::Loaded(Message {
+        app.body = BodyState::Loaded(Box::new(Message {
             uid: 3,
             subject: "Invoice #42".to_string(),
-            from: Vec::new(),
-            to: Vec::new(),
-            date: None,
-            body_text: String::new(),
-            attachments: Vec::new(),
-        });
+            ..Message::default()
+        }));
 
         app.remove_envelope(3);
 
@@ -1017,15 +1255,11 @@ mod tests {
     #[test]
     fn remove_envelope_leaves_the_reading_pane_alone_for_a_different_message() {
         let mut app = sample_app();
-        app.body = BodyState::Loaded(Message {
+        app.body = BodyState::Loaded(Box::new(Message {
             uid: 3,
             subject: "Invoice #42".to_string(),
-            from: Vec::new(),
-            to: Vec::new(),
-            date: None,
-            body_text: String::new(),
-            attachments: Vec::new(),
-        });
+            ..Message::default()
+        }));
 
         app.remove_envelope(1);
 
@@ -1033,18 +1267,6 @@ mod tests {
     }
 
     // -- replace_envelopes / merge_envelopes keep the selection by uid ---------
-
-    fn message(uid: u32) -> Message {
-        Message {
-            uid,
-            subject: String::new(),
-            from: Vec::new(),
-            to: Vec::new(),
-            date: None,
-            body_text: String::new(),
-            attachments: Vec::new(),
-        }
-    }
 
     #[test]
     fn new_mail_arriving_at_the_top_keeps_the_cursor_on_the_same_message() {
@@ -1306,18 +1528,16 @@ mod tests {
             name: None,
             email: "x@example.com".to_string(),
         }];
-        app.body = BodyState::Loaded(Message {
+        app.body = BodyState::Loaded(Box::new(Message {
             uid: 1,
-            subject: String::new(),
-            from: Vec::new(),
-            to: Vec::new(),
-            date: None,
-            body_text: String::new(),
-            attachments: Vec::new(),
-        });
+            ..Message::default()
+        }));
+        app.outbox.pending = 2;
 
-        app.reset_for_account_switch();
+        app.reset_for_account_switch(9);
 
+        assert_eq!(app.current_folder_id, 9);
+        assert_eq!(app.outbox, OutboxCounts::default());
         assert!(app.envelopes().is_empty());
         assert_eq!(app.selected, 0);
         assert!(matches!(app.body, BodyState::Empty));
@@ -1338,12 +1558,175 @@ mod tests {
         assert_ne!(a.id, b.id, "each compose session must be individually identifiable");
     }
 
+    fn message(uid: u32) -> Message {
+        Message {
+            uid,
+            subject: "Hi".to_string(),
+            from: vec![Address {
+                name: Some("Alice".to_string()),
+                email: "alice@example.com".to_string(),
+            }],
+            message_id: Some("orig@example.com".to_string()),
+            body_text: "hello".to_string(),
+            attachments: vec![mail_core::MessageAttachment {
+                filename: "a.pdf".to_string(),
+                size_bytes: 10,
+            }],
+            ..Message::default()
+        }
+    }
+
     #[test]
-    fn reply_compose_state_also_gets_a_fresh_id() {
-        let source = env(1, "Hi", "Alice", "alice@example.com");
+    fn reply_compose_state_also_gets_a_fresh_id_and_draft_key() {
         let blank = ComposeState::blank();
-        let reply = ComposeState::reply(&source);
+        let reply = ComposeState::respond(&message(1), Respond::Reply, "me@example.com", 3);
         assert_ne!(blank.id, reply.id);
+        assert_ne!(blank.draft_key, reply.draft_key);
+    }
+
+    #[test]
+    fn a_reply_is_threaded_quoted_and_answers_its_message() {
+        let reply = ComposeState::respond(&message(4), Respond::Reply, "me@example.com", 3);
+        assert_eq!(reply.to.value, "Alice <alice@example.com>");
+        assert_eq!(reply.subject.value, "Re: Hi");
+        assert_eq!(reply.in_reply_to.as_deref(), Some("orig@example.com"));
+        assert_eq!(reply.references, vec!["orig@example.com"]);
+        assert_eq!(reply.answers, Some((3, 4)));
+        assert_eq!(reply.body.lines.last().map(String::as_str), Some("> hello"));
+        assert_eq!((reply.body.cursor_row, reply.body.cursor_col), (0, 0));
+        assert!(reply.attachments.items.is_empty());
+        let draft = reply.to_draft();
+        assert_eq!(draft.in_reply_to.as_deref(), Some("orig@example.com"));
+    }
+
+    #[test]
+    fn a_forward_carries_the_attachments_and_starts_in_to() {
+        let fwd = ComposeState::respond(&message(4), Respond::Forward, "me@example.com", 3);
+        assert_eq!(fwd.focus, ComposeField::To);
+        assert_eq!(fwd.subject.value, "Fwd: Hi");
+        assert!(fwd.to.value.is_empty());
+        assert_eq!(fwd.in_reply_to, None);
+        assert_eq!(
+            fwd.attachments.items[0].source,
+            AttachmentSource::Message {
+                folder_id: 3,
+                uid: 4,
+                index: 0
+            }
+        );
+    }
+
+    // -- drafts -------------------------------------------------------------
+
+    #[test]
+    fn autosave_waits_for_a_change_and_the_interval() {
+        let start = Instant::now();
+        let mut compose = ComposeState::blank();
+        assert!(
+            compose.autosave_due(start).is_none(),
+            "nothing to save in a blank compose"
+        );
+
+        compose.subject = TextInput::with_value("Hi");
+        let first = compose.autosave_due(start).expect("a change is saved");
+        assert_eq!(first.draft.subject, "Hi");
+        assert_eq!(first.key, compose.draft_key);
+        assert!(
+            compose.autosave_due(start + AUTOSAVE_INTERVAL).is_none(),
+            "unchanged since"
+        );
+
+        compose.subject = TextInput::with_value("Hi there");
+        assert!(
+            compose.autosave_due(start + Duration::from_secs(1)).is_none(),
+            "too soon after the last save"
+        );
+        assert!(compose.autosave_due(start + AUTOSAVE_INTERVAL).is_some());
+    }
+
+    #[test]
+    fn a_failed_save_is_retried() {
+        let now = Instant::now();
+        let mut compose = ComposeState::blank();
+        compose.subject = TextInput::with_value("Hi");
+        compose.take_save(now);
+        assert!(!compose.has_unsaved_changes());
+        compose.save_failed();
+        assert!(compose.has_unsaved_changes());
+    }
+
+    #[test]
+    fn a_resumed_draft_comes_back_whole_and_unchanged() {
+        let mut original = ComposeState::respond(&message(4), Respond::ReplyAll, "me@example.com", 3);
+        original.body.lines[0] = "Sounds good".to_string();
+        original.attachments.items.push(AttachmentEntry {
+            source: AttachmentSource::File(std::path::PathBuf::from("/tmp/x")),
+            filename: "x".to_string(),
+            size_bytes: 1,
+        });
+        let saved = original.take_save(Instant::now());
+
+        let resumed = ComposeState::from_saved(saved.clone());
+        assert_eq!(resumed.to_saved(), saved);
+        assert_eq!(resumed.draft_key, original.draft_key);
+        assert!(!resumed.has_unsaved_changes());
+        assert_eq!(resumed.focus, ComposeField::Body);
+        assert_eq!(resumed.vim.mode, VimMode::Normal);
+    }
+
+    // -- folders and flags ----------------------------------------------------
+
+    fn folder(id: i64, name: &str, selectable: bool, unseen: u32) -> Folder {
+        Folder {
+            id,
+            account_id: 1,
+            name: name.to_string(),
+            delimiter: Some("/".to_string()),
+            role: None,
+            selectable,
+            unseen: Some(unseen),
+            total: Some(10),
+        }
+    }
+
+    #[test]
+    fn folder_navigation_skips_containers_and_wraps() {
+        let mut app = sample_app();
+        app.set_folders(
+            0,
+            vec![
+                folder(1, "INBOX", true, 0),
+                folder(2, "[Gmail]", false, 0),
+                folder(3, "[Gmail]/Sent", true, 0),
+            ],
+        );
+        app.current_folder_id = 1;
+        assert_eq!(app.neighbor_folder(true), Some(3));
+        assert_eq!(app.neighbor_folder(false), Some(3));
+        app.show_folder(3);
+        assert_eq!(app.neighbor_folder(true), Some(1));
+        assert_eq!(app.current_folder().unwrap().name, "[Gmail]/Sent");
+        assert!(app.envelopes().is_empty(), "switching folders clears the old list");
+    }
+
+    #[test]
+    fn toggling_read_keeps_the_unread_count_in_step() {
+        let mut app = sample_app();
+        app.set_folders(0, vec![folder(1, "INBOX", true, 5)]);
+        app.current_folder_id = 1;
+
+        assert!(app.set_envelope_flag(4, FlagKind::Seen, true));
+        assert!(
+            !app.set_envelope_flag(4, FlagKind::Seen, true),
+            "no change, no count change"
+        );
+        assert_eq!(app.current_folder().unwrap().unseen, Some(4));
+        assert!(app.set_envelope_flag(4, FlagKind::Seen, false));
+        assert_eq!(app.current_folder().unwrap().unseen, Some(5));
+
+        assert!(app.set_envelope_flag(4, FlagKind::Flagged, true));
+        assert!(app.envelopes()[1].flags.flagged);
+        assert_eq!(app.current_folder().unwrap().unseen, Some(5));
     }
 
     // -- last_recipient_separator ------------------------------------------
@@ -1477,6 +1860,18 @@ mod tests {
             compose.to.value,
             "\"Doe, Jane\" <jane@example.com>, Alice Doe <alice@example.com>, "
         );
+    }
+
+    #[test]
+    fn an_accepted_name_with_a_comma_is_quoted() {
+        let mut compose = ComposeState::blank();
+        compose.to = TextInput::with_value("doe".to_string());
+        compose.suggestions.items = vec![Address {
+            name: Some("Doe, Jane".to_string()),
+            email: "jane@example.com".to_string(),
+        }];
+        compose.accept_suggestion();
+        assert_eq!(compose.to.value, "\"Doe, Jane\" <jane@example.com>, ");
     }
 
     #[test]
@@ -1694,7 +2089,7 @@ mod tests {
 
     #[test]
     fn a_reply_opens_in_insert_mode_in_the_body() {
-        let compose = ComposeState::reply(&env(1, "Hi", "Alice", "alice@example.com"));
+        let compose = ComposeState::respond(&message(1), Respond::Reply, "me@example.com", 1);
         assert_eq!(compose.focus, ComposeField::Body);
         assert_eq!(compose.vim.mode, VimMode::Insert);
     }
@@ -1733,7 +2128,7 @@ mod tests {
             |c: &mut ComposeState| c.body.lines = vec!["text".to_string()],
             |c: &mut ComposeState| {
                 c.attachments.items.push(AttachmentEntry {
-                    path: std::path::PathBuf::from("/tmp/x"),
+                    source: crate::attach::AttachmentSource::File(std::path::PathBuf::from("/tmp/x")),
                     filename: "x".to_string(),
                     size_bytes: 1,
                 })

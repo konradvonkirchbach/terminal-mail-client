@@ -76,16 +76,34 @@ impl Store {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        self.submit(f).await
+    }
+
+    /// Like `run`, but queues `f` on the store thread right away, when
+    /// called, rather than when the returned future is first polled. Jobs
+    /// submitted one after another from the same thread therefore run in
+    /// that order even when their futures are spawned onto separate tasks
+    /// (whose polling order the runtime doesn't guarantee) — which saving
+    /// and then deleting a draft depends on.
+    pub fn submit<F, T>(&self, f: F) -> impl std::future::Future<Output = Result<T>> + Send + 'static
+    where
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
         let (resp_tx, resp_rx) = oneshot::channel();
         let job: Job = Box::new(move |conn| {
             let _ = resp_tx.send(f(conn));
         });
-        self.tx
+        let queued = self
+            .tx
             .send(job)
-            .map_err(|_| Error::Store("store thread is no longer running".into()))?;
-        resp_rx
-            .await
-            .map_err(|_| Error::Store("store thread dropped the response".into()))?
+            .map_err(|_| Error::Store("store thread is no longer running".into()));
+        async move {
+            queued?;
+            resp_rx
+                .await
+                .map_err(|_| Error::Store("store thread dropped the response".into()))?
+        }
     }
 }
 
@@ -113,6 +131,10 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
         conn.execute_batch(super::schema::MIGRATION_V3)?;
         version = 3;
     }
+    if version == 3 {
+        conn.execute_batch(super::schema::MIGRATION_V4)?;
+        version = 4;
+    }
     if version != initial {
         conn.pragma_update(None, "user_version", version)?;
     }
@@ -121,7 +143,7 @@ pub(crate) fn init_connection(conn: &Connection) -> Result<()> {
 
 /// The schema version `init_connection` brings every database to.
 #[cfg(test)]
-pub(crate) const CURRENT_VERSION: i64 = 3;
+pub(crate) const CURRENT_VERSION: i64 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -203,5 +225,29 @@ mod tests {
         };
         assert_eq!(floor(1), Some(17));
         assert_eq!(floor(2), None);
+    }
+
+    #[test]
+    fn migrates_a_version_3_database_marking_inbox_and_keying_drafts() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(super::super::schema::SCHEMA_V1).unwrap();
+        conn.execute_batch(super::super::schema::MIGRATION_V3).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts (id, email) VALUES (1, 'a@example.com');
+             INSERT INTO folders (id, account_id, name) VALUES (1, 1, 'INBOX'), (2, 1, 'Archive');",
+        )
+        .unwrap();
+
+        init_connection(&conn).unwrap();
+
+        assert_eq!(user_version(&conn), CURRENT_VERSION);
+        let role = |id: i64| -> Option<String> {
+            conn.query_row("SELECT role FROM folders WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(role(1).as_deref(), Some("inbox"));
+        assert_eq!(role(2), None);
+        assert!(index_exists(&conn, "drafts_key"));
     }
 }

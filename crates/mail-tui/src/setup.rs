@@ -6,7 +6,7 @@ use mail_core::{Account, Store};
 /// First-run interactive wizard: prompts for one account's connection
 /// details on stdin, stores the password in the OS keyring, and writes
 /// the config file. Runs before the TUI takes over the terminal.
-pub fn run() -> anyhow::Result<Account> {
+pub async fn run() -> anyhow::Result<Account> {
     println!("No accounts configured yet — let's add one.");
     println!(
         "(Stored at {:?}; the password goes to your OS keyring, never to disk.)\n",
@@ -14,6 +14,9 @@ pub fn run() -> anyhow::Result<Account> {
     );
 
     let (account_config, password) = prompt_account_details()?;
+    if !connection_works(&account_config, &password).await? {
+        anyhow::bail!("not saved — run mailc again to re-enter the settings");
+    }
 
     let account = Account::new(account_config.clone());
     account.set_password(&password)?;
@@ -29,7 +32,7 @@ pub fn run() -> anyhow::Result<Account> {
 /// `mailc --add-account`: prompts for another account and appends it to
 /// the existing config, without touching the ones already there. Doesn't
 /// launch the TUI — run `mailc` normally afterward to use it.
-pub fn add_account() -> anyhow::Result<()> {
+pub async fn add_account() -> anyhow::Result<()> {
     let mut config = Config::load()?;
 
     println!("Adding another account.");
@@ -42,6 +45,9 @@ pub fn add_account() -> anyhow::Result<()> {
 
     if config.accounts.iter().any(|a| a.email == account_config.email) {
         anyhow::bail!("an account for {} is already configured", account_config.email);
+    }
+    if !connection_works(&account_config, &password).await? {
+        anyhow::bail!("not saved — run mailc --add-account again to re-enter the settings");
     }
 
     let account = Account::new(account_config.clone());
@@ -150,6 +156,29 @@ pub fn set_password() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Logs in to both servers with the details just entered and reports how
+/// that went. Returns whether to go ahead and save them: yes if both
+/// worked, otherwise only if the user insists (a server can be down for a
+/// moment, or the network may not be up yet).
+async fn connection_works(config: &AccountConfig, password: &str) -> anyhow::Result<bool> {
+    println!("\nChecking the connection...");
+    let check = mail_core::check::connection(&Account::new(config.clone()), password).await;
+    let report = |server: &str, host: &str, port: u16, result: &mail_core::Result<()>| match result {
+        Ok(()) => println!("  {server} {host}:{port}: ok"),
+        Err(e) => println!("  {server} {host}:{port}: {e}"),
+    };
+    report("IMAP", &config.imap_host, config.imap_port, &check.imap);
+    report("SMTP", &config.smtp_host, config.smtp_port, &check.smtp);
+    if check.ok() {
+        return Ok(true);
+    }
+    print!("Save these settings anyway? [y/N] ");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line.trim().eq_ignore_ascii_case("y"))
+}
+
 /// Prompts for which configured account a CLI action applies to, when
 /// there's more than one — returns its index into `accounts` directly
 /// (no picker) when there's only one.
@@ -174,9 +203,13 @@ fn prompt_account_details() -> anyhow::Result<(AccountConfig, String)> {
     let email = prompt("Email address")?;
     let display_name = prompt("Your name, as recipients should see it (optional)")?;
     let imap_host = prompt("IMAP host (e.g. imap.gmail.com)")?;
-    let imap_port = prompt_with_default("IMAP port", "993")?.parse().unwrap_or(993);
+    let imap_port = prompt_with_default("IMAP port (993 = TLS, 143 = STARTTLS)", "993")?
+        .parse()
+        .unwrap_or(993);
     let smtp_host = prompt("SMTP host (e.g. smtp.gmail.com)")?;
-    let smtp_port = prompt_with_default("SMTP port", "587")?.parse().unwrap_or(587);
+    let smtp_port = prompt_with_default("SMTP port (587 = STARTTLS, 465 = TLS)", "587")?
+        .parse()
+        .unwrap_or(587);
     let password = rpassword::prompt_password("Password (or app password): ")?;
 
     let account_config = AccountConfig {

@@ -4,6 +4,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
+use mail_core::FolderRole;
+
 use crate::app::{App, ListState as AppListState};
 use crate::theme::Theme;
 
@@ -17,10 +19,17 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         AppListState::Error(_) => " (offline)",
         AppListState::Loaded => "",
     };
+    let folder = app
+        .current_folder()
+        .map(|f| f.display_name())
+        .unwrap_or_else(|| "Inbox".to_string());
     let title = match app.search() {
-        Some(_) => format!(" inbox{status} ({}/{} match) ", visible.len(), app.envelopes().len()),
-        None => format!(" inbox{status} "),
+        Some(_) => format!(" {folder}{status} ({}/{} match) ", visible.len(), app.envelopes().len()),
+        None => format!(" {folder}{status} "),
     };
+    // In folders of one's own mail, who it went to says more than who
+    // sent it (always oneself).
+    let show_recipient = matches!(app.current_folder_role(), Some(FolderRole::Sent | FolderRole::Drafts));
 
     let block = Block::new()
         .borders(Borders::ALL)
@@ -46,11 +55,16 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .iter()
         .filter_map(|&i| app.envelopes().get(i))
         .map(|env| {
-            let flag = if env.flags.seen { " " } else { "*" };
-            let from = env
-                .from
+            let unread = if env.flags.seen { " " } else { "*" };
+            let starred = if env.flags.flagged { "!" } else { " " };
+            let (prefix, people) = if show_recipient {
+                ("to ", &env.to)
+            } else {
+                ("", &env.from)
+            };
+            let from = people
                 .first()
-                .map(|a| a.name.clone().unwrap_or_else(|| a.email.clone()))
+                .map(|a| format!("{prefix}{}", a.name.clone().unwrap_or_else(|| a.email.clone())))
                 .unwrap_or_else(|| "(unknown)".to_string());
             let date = env
                 .date
@@ -65,7 +79,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             };
 
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{flag} "), Style::new().fg(flag_color)),
+                Span::styled(unread, Style::new().fg(flag_color)),
+                Span::styled(format!("{starred} "), Style::new().fg(theme.yellow)),
                 Span::styled(format!("{from:<22.22} "), Style::new().fg(theme.muted)),
                 Span::styled(env.subject.clone(), subject_style),
                 Span::raw(format!(" {date}")),

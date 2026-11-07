@@ -25,7 +25,9 @@ pub struct AccountCtx {
     pub account: Account,
     pub store: Store,
     pub account_id: i64,
+    /// The folder being shown while this is the current account.
     pub folder_id: i64,
+    pub inbox_id: i64,
 }
 
 /// Every configured account plus which one is currently shown. Background
@@ -47,6 +49,17 @@ impl Accounts {
 
     pub fn is_current(&self, account_id: i64) -> bool {
         self.current().account_id == account_id
+    }
+
+    /// Whether `folder_id` of `account_id` is what's on screen — results
+    /// for any other folder only went to the cache.
+    pub fn is_current_folder(&self, account_id: i64, folder_id: i64) -> bool {
+        let current = self.current();
+        current.account_id == account_id && current.folder_id == folder_id
+    }
+
+    pub fn index_of(&self, account_id: i64) -> Option<usize> {
+        self.list.iter().position(|a| a.account_id == account_id)
     }
 }
 

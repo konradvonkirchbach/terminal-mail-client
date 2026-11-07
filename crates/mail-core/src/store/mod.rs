@@ -3,10 +3,13 @@ mod queries;
 mod schema;
 
 pub use db::Store;
-pub use queries::{FolderRow, OutboxItem};
+pub use queries::{FolderRow, OutboxCounts, OutboxItem, SavedDraft};
+
+use std::future::Future;
 
 use crate::error::Result;
-use crate::types::{Address, Envelope, Flags};
+use crate::folder::{Folder, FolderRole, RemoteFolder};
+use crate::types::{Address, Envelope, FlagKind, Flags};
 
 impl Store {
     pub async fn upsert_account(&self, email: String, display_name: Option<String>) -> Result<i64> {
@@ -63,9 +66,73 @@ impl Store {
             .await
     }
 
-    /// See `queries::mark_seen`.
-    pub async fn mark_seen(&self, folder_id: i64, uid: u32) -> Result<bool> {
-        self.run(move |conn| queries::mark_seen(conn, folder_id, uid)).await
+    /// See `queries::set_flag`.
+    pub async fn set_flag(&self, folder_id: i64, uid: u32, flag: FlagKind, on: bool) -> Result<bool> {
+        self.run(move |conn| queries::set_flag(conn, folder_id, uid, flag, on))
+            .await
+    }
+
+    pub async fn folder(&self, folder_id: i64) -> Result<Folder> {
+        self.run(move |conn| queries::folder(conn, folder_id)).await
+    }
+
+    /// Every folder of an account, in sidebar order.
+    pub async fn list_folders(&self, account_id: i64) -> Result<Vec<Folder>> {
+        self.run(move |conn| queries::list_folders(conn, account_id)).await
+    }
+
+    pub async fn folder_by_role(&self, account_id: i64, role: FolderRole) -> Result<Option<Folder>> {
+        self.run(move |conn| queries::folder_by_role(conn, account_id, role))
+            .await
+    }
+
+    /// See `queries::replace_folders`; one transaction.
+    pub(crate) async fn replace_folders(&self, account_id: i64, remote: Vec<RemoteFolder>) -> Result<Vec<String>> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let paths = queries::replace_folders(&tx, account_id, &remote)?;
+            tx.commit()?;
+            Ok(paths)
+        })
+        .await
+    }
+
+    pub async fn update_folder_counts(&self, folder_id: i64, unseen: u32, total: u32) -> Result<()> {
+        self.run(move |conn| queries::update_folder_counts(conn, folder_id, unseen, total))
+            .await
+    }
+
+    pub async fn update_folder_counts_by_name(
+        &self,
+        account_id: i64,
+        name: String,
+        unseen: u32,
+        total: u32,
+    ) -> Result<()> {
+        self.run(move |conn| queries::update_folder_counts_by_name(conn, account_id, &name, unseen, total))
+            .await
+    }
+
+    /// Saves (or replaces, by `saved.key`) a draft. Queued on the store
+    /// thread when called, not when awaited — see `Store::submit` — so a
+    /// save followed by a `delete_draft` of the same key can't run in the
+    /// opposite order and resurrect the draft.
+    pub fn save_draft(&self, account_id: i64, saved: SavedDraft) -> impl Future<Output = Result<()>> + Send + 'static {
+        self.submit(move |conn| queries::save_draft(conn, account_id, &saved))
+    }
+
+    /// Queued when called, like `save_draft`.
+    pub fn delete_draft(&self, key: String) -> impl Future<Output = Result<()>> + Send + 'static {
+        self.submit(move |conn| queries::delete_draft(conn, &key))
+    }
+
+    pub async fn list_drafts(&self, account_id: i64) -> Result<Vec<SavedDraft>> {
+        self.run(move |conn| queries::list_drafts(conn, account_id)).await
+    }
+
+    pub async fn outbox_counts(&self, account_id: i64, max_attempts: i64) -> Result<OutboxCounts> {
+        self.run(move |conn| queries::outbox_counts(conn, account_id, max_attempts))
+            .await
     }
 
     /// Wrapped in one transaction rather than N auto-committed statements

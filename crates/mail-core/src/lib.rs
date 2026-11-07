@@ -3,9 +3,11 @@
 //! the reuse seam for any future frontend (TUI today, GUI later).
 
 pub mod account;
+pub mod check;
 pub mod config;
 pub mod error;
 pub mod events;
+pub mod folder;
 pub mod idle;
 pub mod imap;
 pub mod send;
@@ -17,9 +19,10 @@ pub mod types;
 pub use account::Account;
 pub use error::{Error, Result};
 pub use events::AppEvent;
+pub use folder::{Folder, FolderRole};
 pub use smtp::{AttachmentFile, Draft};
-pub use store::Store;
-pub use types::{Address, Envelope, Message, MessageAttachment};
+pub use store::{OutboxCounts, SavedDraft, Store};
+pub use types::{Address, Envelope, FlagKind, Flags, Message, MessageAttachment};
 
 /// Both our own IMAP TLS setup and lettre's SMTP TLS setup use `rustls`,
 /// but pull in different crypto backends (`aws-lc-rs` for us, `ring`

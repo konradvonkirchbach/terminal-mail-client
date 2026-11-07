@@ -40,7 +40,7 @@ pub async fn run(account: Account, store: Store, events: UnboundedSender<AppEven
 
 async fn run_once(account: &Account, store: &Store, events: &UnboundedSender<AppEvent>) -> Result<()> {
     let mut session = client::open_session(account).await?;
-    client::select_inbox(&mut session).await?;
+    client::select(&mut session, "INBOX").await?;
 
     loop {
         let mut handle = session.idle();
@@ -54,14 +54,19 @@ async fn run_once(account: &Account, store: &Store, events: &UnboundedSender<App
 
         // Sync on this same connection rather than opening a second one
         // (TCP + TLS + LOGIN) for every wake-up.
-        let outcome = sync::sync_inbox_on(&mut session, account, store).await?;
+        let outcome = sync::sync_folder_on(&mut session, account, store, "INBOX").await?;
         // The server is reachable again, so this is a good moment to retry
         // anything queued while it wasn't. In the background: a slow SMTP
         // server mustn't delay push updates.
         let (flush_account, flush_store, account_id) = (account.clone(), store.clone(), outcome.account_id);
+        let flush_events = events.clone();
         tokio::spawn(async move {
-            if let Err(e) = send::flush_outbox(&flush_account, &flush_store, account_id).await {
-                tracing::warn!("outbox flush failed: {e}");
+            match send::flush_outbox(&flush_account, &flush_store, account_id, false).await {
+                Ok(report) if report.attempted > 0 => {
+                    let _ = flush_events.send(AppEvent::OutboxChanged { account_id });
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("outbox flush failed: {e}"),
             }
         });
         let _ = events.send(AppEvent::NewMail {

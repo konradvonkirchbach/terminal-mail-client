@@ -91,3 +91,30 @@ pub const MIGRATION_V3: &str = r#"
 ALTER TABLE folders ADD COLUMN backfill_floor_uid INTEGER;
 UPDATE folders SET backfill_floor_uid = (SELECT MIN(uid) FROM messages WHERE messages.folder_id = folders.id);
 "#;
+
+/// Version 4: folders beyond INBOX, and saved drafts.
+///
+/// Folders learn what they're for (`role`, from the server's SPECIAL-USE
+/// attributes), their hierarchy separator, whether they can be opened at
+/// all, and the server's unread/total counts for the sidebar.
+///
+/// Drafts (a table that existed from the start but was never written)
+/// gain what a reply needs to stay threaded, the frontend's attachment
+/// list, and a `key` that identifies one compose session's draft, so
+/// repeated saves update it rather than adding copies.
+pub const MIGRATION_V4: &str = r#"
+ALTER TABLE folders ADD COLUMN role TEXT;
+ALTER TABLE folders ADD COLUMN delimiter TEXT;
+ALTER TABLE folders ADD COLUMN selectable INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE folders ADD COLUMN unseen INTEGER;
+ALTER TABLE folders ADD COLUMN total INTEGER;
+UPDATE folders SET role = 'inbox' WHERE name = 'INBOX';
+
+ALTER TABLE drafts ADD COLUMN key TEXT;
+ALTER TABLE drafts ADD COLUMN in_reply_to TEXT;
+ALTER TABLE drafts ADD COLUMN references_hdr TEXT NOT NULL DEFAULT '';
+ALTER TABLE drafts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE drafts ADD COLUMN answers_folder_id INTEGER;
+ALTER TABLE drafts ADD COLUMN answers_uid INTEGER;
+CREATE UNIQUE INDEX drafts_key ON drafts(key);
+"#;

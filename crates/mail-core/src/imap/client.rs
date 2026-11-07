@@ -1,7 +1,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use async_imap::types::{Fetch, Flag as ImapFlag};
+use async_imap::types::{Fetch, Flag as ImapFlag, NameAttribute};
 use async_imap::Session;
 use futures::TryStreamExt;
 use tokio::net::TcpStream;
@@ -11,7 +11,8 @@ use crate::account::Account;
 use crate::error::{Error, Result};
 use mail_parser::MimeHeaders;
 
-use crate::types::{Address, Envelope, Flags, Message, MessageAttachment};
+use crate::folder::{FolderRole, RemoteFolder};
+use crate::types::{Address, Envelope, FlagKind, Flags, Message, MessageAttachment};
 
 pub(crate) type ImapSession = Session<TlsStream<TcpStream>>;
 
@@ -95,6 +96,22 @@ pub(crate) async fn open_session(account: &Account) -> Result<ImapSession> {
         })?
 }
 
+/// The IMAP port that starts in plaintext and upgrades with `STARTTLS`;
+/// every other port (993 above all) is TLS from the first byte. Plaintext
+/// IMAP is never used: a server that won't upgrade fails the connection.
+const STARTTLS_PORT: u16 = 143;
+
+/// Connects and logs in with `password` (rather than the keyring's), then
+/// logs out — the setup wizard's connection test, run before anything is
+/// saved.
+pub(crate) async fn check_login(account: &Account, password: &str) -> Result<()> {
+    let mut session = tokio::time::timeout(CONNECT_TIMEOUT, connect_and_login(account, password))
+        .await
+        .map_err(|_| Error::ImapConnect(format!("timed out after {}s", CONNECT_TIMEOUT.as_secs())))??;
+    logout(&mut session).await;
+    Ok(())
+}
+
 async fn connect_and_login(account: &Account, password: &str) -> Result<ImapSession> {
     let cfg = &account.config;
 
@@ -102,6 +119,12 @@ async fn connect_and_login(account: &Account, password: &str) -> Result<ImapSess
         .await
         .map_err(|e| Error::ImapConnect(format!("{}:{}: {e}", cfg.imap_host, cfg.imap_port)))?;
     harden_socket(&tcp);
+
+    let tcp = if cfg.imap_port == STARTTLS_PORT {
+        starttls(tcp).await?
+    } else {
+        tcp
+    };
 
     let server_name = rustls::pki_types::ServerName::try_from(cfg.imap_host.clone())
         .map_err(|e| Error::Tls(format!("invalid hostname {:?}: {e}", cfg.imap_host)))?;
@@ -119,11 +142,27 @@ async fn connect_and_login(account: &Account, password: &str) -> Result<ImapSess
     Ok(session)
 }
 
-pub(crate) async fn select_inbox(session: &mut ImapSession) -> Result<MailboxInfo> {
-    let mailbox = session
-        .select("INBOX")
+/// Reads the plaintext greeting and asks the server to switch to TLS,
+/// handing back the socket ready for the handshake.
+async fn starttls(tcp: TcpStream) -> Result<TcpStream> {
+    let mut client = async_imap::Client::new(tcp);
+    client
+        .read_response()
         .await
-        .map_err(|e| Error::Imap(format!("SELECT INBOX: {e}")))?;
+        .map_err(|e| Error::ImapConnect(format!("reading the greeting: {e}")))?
+        .ok_or_else(|| Error::ImapConnect("the server closed the connection before greeting".into()))?;
+    client
+        .run_command_and_check_ok("STARTTLS", None)
+        .await
+        .map_err(|e| Error::Tls(format!("the server refused STARTTLS: {e}")))?;
+    Ok(client.into_inner())
+}
+
+pub(crate) async fn select(session: &mut ImapSession, folder: &str) -> Result<MailboxInfo> {
+    let mailbox = session
+        .select(folder)
+        .await
+        .map_err(|e| Error::Imap(format!("SELECT {folder}: {e}")))?;
 
     Ok(MailboxInfo {
         exists: mailbox.exists,
@@ -231,9 +270,9 @@ fn envelope_from_fetch(f: &Fetch) -> Option<Envelope> {
 /// Fetches the raw RFC822 bytes of a single message by UID. Opens its own
 /// connection — called on demand when the user opens a message that isn't
 /// already cached on disk.
-pub(crate) async fn fetch_message_raw(account: &Account, uid: u32) -> Result<Vec<u8>> {
+pub(crate) async fn fetch_message_raw(account: &Account, folder: &str, uid: u32) -> Result<Vec<u8>> {
     let mut session = open_session(account).await?;
-    select_inbox(&mut session).await?;
+    select(&mut session, folder).await?;
 
     let fetches: Vec<_> = session
         .uid_fetch(uid.to_string(), "(UID BODY[])")
@@ -274,19 +313,48 @@ pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
         })
         .collect();
 
+    let ids = |value: &mail_parser::HeaderValue<'_>| -> Vec<String> {
+        value
+            .as_text_list()
+            .map(|list| list.iter().map(|id| id.to_string()).collect())
+            .unwrap_or_default()
+    };
+    let mut references = ids(parsed.references());
+    if references.is_empty() {
+        references = ids(parsed.in_reply_to());
+    }
+    let has_html = matches!(
+        parsed.html_part(0).map(|part| &part.body),
+        Some(mail_parser::PartType::Html(_))
+    );
+
     Ok(Message {
         uid,
         subject: parsed.subject().unwrap_or_default().to_string(),
         from: convert_addresses(parsed.from()),
         to: convert_addresses(parsed.to()),
+        cc: convert_addresses(parsed.cc()),
+        reply_to: convert_addresses(parsed.reply_to()),
         date: parsed.date().and_then(mail_date_to_chrono),
+        message_id: parsed.message_id().map(str::to_string),
+        references,
         body_text: parsed
             .body_text(0)
             .or_else(|| parsed.body_html(0))
             .map(|c| c.into_owned())
             .unwrap_or_default(),
+        has_html,
         attachments,
     })
+}
+
+/// The message's HTML body, if it has a real one (see `Message::has_html`).
+pub(crate) fn html_from_raw(raw: &[u8]) -> Option<String> {
+    let parsed = mail_parser::MessageParser::default().parse(raw)?;
+    match &parsed.html_part(0)?.body {
+        mail_parser::PartType::Html(html) => Some(html.to_string()),
+        _ => None,
+    }
 }
 
 /// The decoded content of the message's `index`-th attachment, in the same
@@ -319,21 +387,120 @@ fn safe_filename(name: &str) -> Option<String> {
     Some(cleaned.to_string())
 }
 
-/// Common `Sent` mailbox names across providers. We don't yet do
-/// SPECIAL-USE detection (`LIST ... RETURN (SPECIAL-USE)`), so this is a
-/// best-effort fallback list rather than a guarantee — filing a sent copy
-/// is not allowed to block the send itself.
+/// Lists every folder on the server with its SPECIAL-USE role, where the
+/// server says. Servers advertising `SPECIAL-USE` are asked for the roles
+/// explicitly (RFC 6154); the rest, and Gmail, send them with a plain
+/// `LIST` or not at all.
+pub(crate) async fn list_folders(session: &mut ImapSession) -> Result<Vec<RemoteFolder>> {
+    let special_use = session
+        .capabilities()
+        .await
+        .map(|caps| caps.has_str("SPECIAL-USE"))
+        .unwrap_or(false);
+    if special_use {
+        match list_with(session, "\"*\" RETURN (SPECIAL-USE)").await {
+            Ok(folders) => return Ok(folders),
+            Err(e) => tracing::warn!("LIST RETURN (SPECIAL-USE) failed, falling back to a plain LIST: {e}"),
+        }
+    }
+    list_with(session, "\"*\"").await
+}
+
+async fn list_with(session: &mut ImapSession, pattern: &str) -> Result<Vec<RemoteFolder>> {
+    let names: Vec<_> = session
+        .list(Some(""), Some(pattern))
+        .await
+        .map_err(|e| Error::Imap(format!("LIST: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| Error::Imap(format!("LIST: {e}")))?;
+
+    Ok(names
+        .iter()
+        .map(|name| {
+            let mut role = None;
+            let mut selectable = true;
+            for attribute in name.attributes() {
+                match attribute {
+                    NameAttribute::NoSelect => selectable = false,
+                    NameAttribute::Extension(ext) if ext.eq_ignore_ascii_case("\\NonExistent") => selectable = false,
+                    NameAttribute::Sent => role = Some(FolderRole::Sent),
+                    NameAttribute::Trash => role = Some(FolderRole::Trash),
+                    NameAttribute::Drafts => role = Some(FolderRole::Drafts),
+                    NameAttribute::Junk => role = Some(FolderRole::Junk),
+                    NameAttribute::Archive => role = Some(FolderRole::Archive),
+                    NameAttribute::All => role = Some(FolderRole::All),
+                    NameAttribute::Flagged => role = Some(FolderRole::Flagged),
+                    _ => {}
+                }
+            }
+            // INBOX is case-insensitive; one spelling keeps it one row.
+            let raw = name.name();
+            RemoteFolder {
+                name: if raw.eq_ignore_ascii_case("INBOX") {
+                    "INBOX".to_string()
+                } else {
+                    raw.to_string()
+                },
+                delimiter: name.delimiter().map(str::to_string),
+                role,
+                selectable,
+            }
+        })
+        .collect())
+}
+
+/// A folder's unread and total message counts, without selecting it.
+pub(crate) async fn status_counts(session: &mut ImapSession, folder: &str) -> Result<(u32, u32)> {
+    let status = session
+        .status(folder, "(MESSAGES UNSEEN)")
+        .await
+        .map_err(|e| Error::Imap(format!("STATUS {folder}: {e}")))?;
+    Ok((status.unseen.unwrap_or(0), status.exists))
+}
+
+/// How many messages in the selected folder are unread. (`SELECT`'s own
+/// `UNSEEN` is the first unread message's position, not a count.)
+pub(crate) async fn count_unseen(session: &mut ImapSession) -> Result<u32> {
+    let unseen = session
+        .search("UNSEEN")
+        .await
+        .map_err(|e| Error::Imap(format!("SEARCH UNSEEN: {e}")))?;
+    Ok(unseen.len() as u32)
+}
+
+/// Gmail files a copy of everything sent through its SMTP server in Sent
+/// Mail by itself; appending another would show every message twice.
+async fn is_gmail(session: &mut ImapSession) -> bool {
+    session
+        .capabilities()
+        .await
+        .map(|caps| caps.has_str("X-GM-EXT-1"))
+        .unwrap_or(false)
+}
+
+/// Common `Sent` mailbox names, for when the folder list hasn't been read
+/// yet (or found none): filing a sent copy is best-effort and must not
+/// block the send itself.
 const SENT_FOLDER_CANDIDATES: &[&str] = &["Sent", "Sent Mail", "Sent Items", "[Gmail]/Sent Mail"];
 
-/// Files a copy of a just-sent message into the account's Sent folder.
-/// Opens its own connection; failures are non-fatal to the caller (the
-/// message was already sent via SMTP) so this returns an error only when
-/// none of the candidate folder names worked.
-pub async fn append_to_sent(account: &Account, raw: &[u8]) -> Result<()> {
+/// Files a copy of a just-sent message in `sent` — the account's Sent
+/// folder, if known — or else the first of the common names that works.
+/// Skipped on Gmail, which does it itself. Opens its own connection;
+/// failures are non-fatal to the caller (the message was already sent).
+pub(crate) async fn append_to_sent(account: &Account, sent: Option<&str>, raw: &[u8]) -> Result<()> {
     let mut session = open_session(account).await?;
+    if is_gmail(&mut session).await {
+        logout(&mut session).await;
+        return Ok(());
+    }
 
+    let candidates: Vec<&str> = match sent {
+        Some(name) => vec![name],
+        None => SENT_FOLDER_CANDIDATES.to_vec(),
+    };
     let mut last_err = None;
-    for name in SENT_FOLDER_CANDIDATES {
+    for name in &candidates {
         match session.append(*name, Some(r"(\Seen)"), None, raw).await {
             Ok(()) => {
                 logout(&mut session).await;
@@ -345,73 +512,97 @@ pub async fn append_to_sent(account: &Account, raw: &[u8]) -> Result<()> {
 
     logout(&mut session).await;
     Err(Error::Imap(format!(
-        "could not file a Sent copy in any of {SENT_FOLDER_CANDIDATES:?}: {}",
+        "could not file a Sent copy in any of {candidates:?}: {}",
         last_err.unwrap_or_default()
     )))
 }
 
-/// Common `Trash` mailbox names across providers, same best-effort
-/// approach as `SENT_FOLDER_CANDIDATES` above.
+/// Common `Trash` mailbox names, used like `SENT_FOLDER_CANDIDATES`.
 const TRASH_FOLDER_CANDIDATES: &[&str] = &["Trash", "Deleted Items", "Deleted Messages", "Bin", "[Gmail]/Trash"];
 
-/// Deletes a message by UID from INBOX: tries moving it to a Trash-like
-/// folder first via the `MOVE` extension (recoverable, matches what most
-/// providers/clients do for "delete"), falling back to marking it
-/// `\Deleted` and expunging in place if no such folder exists or the
-/// server doesn't support `MOVE` at all — the same "try candidates on one
-/// connection" shape as `append_to_sent`.
-pub async fn delete_message(account: &Account, uid: u32) -> Result<()> {
+/// What deleting a message actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// Moved to the Trash folder, where it can still be recovered.
+    MovedToTrash,
+    /// Gone for good: deleted from Trash itself, or no Trash folder exists.
+    Expunged,
+}
+
+/// Deletes a message by UID from `folder`. Unless `trash` is `None` and
+/// none of the common Trash names exist either — or `folder` *is* the
+/// Trash — that means moving it to Trash (recoverable, what "delete" means
+/// in most clients): `MOVE` where the server has it, otherwise
+/// `COPY` + `\Deleted` + expunge. Otherwise it's marked `\Deleted` and
+/// expunged in place.
+pub(crate) async fn delete_message(
+    account: &Account,
+    folder: &str,
+    uid: u32,
+    trash: Option<&str>,
+    in_trash: bool,
+) -> Result<DeleteOutcome> {
     let mut session = open_session(account).await?;
-    select_inbox(&mut session).await?;
-
+    select(&mut session, folder).await?;
     let uid_str = uid.to_string();
-    let mut moved = false;
-    for folder in TRASH_FOLDER_CANDIDATES {
-        if session.uid_mv(&uid_str, *folder).await.is_ok() {
-            moved = true;
-            break;
-        }
-    }
 
-    if !moved {
-        session
-            .uid_store(&uid_str, "+FLAGS (\\Deleted)")
-            .await
-            .map_err(|e| Error::Imap(format!("STORE +Deleted uid {uid}: {e}")))?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| Error::Imap(e.to_string()))?;
-
-        let expunged = match session.uid_expunge(&uid_str).await {
-            Ok(stream) => stream.try_collect::<Vec<_>>().await.is_ok(),
-            Err(_) => false,
+    let mut outcome = DeleteOutcome::Expunged;
+    if !in_trash {
+        let candidates: Vec<&str> = match trash {
+            Some(name) => vec![name],
+            None => TRASH_FOLDER_CANDIDATES.to_vec(),
         };
-        if !expunged {
-            // Server lacks UIDPLUS (no UID EXPUNGE) — fall back to a
-            // blind EXPUNGE. This purges *every* \Deleted message in the
-            // folder, not just this one, but is the documented last
-            // resort for servers without UIDPLUS.
-            if let Ok(stream) = session.expunge().await {
-                let _ = stream.try_collect::<Vec<_>>().await;
+        for target in candidates {
+            if session.uid_mv(&uid_str, target).await.is_ok() {
+                logout(&mut session).await;
+                return Ok(DeleteOutcome::MovedToTrash);
+            }
+            // No MOVE extension: copy, then delete the original below.
+            if session.uid_copy(&uid_str, target).await.is_ok() {
+                outcome = DeleteOutcome::MovedToTrash;
+                break;
             }
         }
     }
 
+    session
+        .uid_store(&uid_str, "+FLAGS (\\Deleted)")
+        .await
+        .map_err(|e| Error::Imap(format!("STORE +Deleted uid {uid}: {e}")))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| Error::Imap(e.to_string()))?;
+
+    let expunged = match session.uid_expunge(&uid_str).await {
+        Ok(stream) => stream.try_collect::<Vec<_>>().await.is_ok(),
+        Err(_) => false,
+    };
+    if !expunged {
+        // Server lacks UIDPLUS (no UID EXPUNGE) — fall back to a blind
+        // EXPUNGE. This purges *every* \Deleted message in the folder, not
+        // just this one, but is the documented last resort for servers
+        // without UIDPLUS.
+        if let Ok(stream) = session.expunge().await {
+            let _ = stream.try_collect::<Vec<_>>().await;
+        }
+    }
+
     logout(&mut session).await;
-    Ok(())
+    Ok(outcome)
 }
 
-/// Sets `\Seen` on a message server-side. Needed when a message is opened
-/// from the on-disk cache: only fetching `BODY[]` over IMAP marks it read
-/// implicitly, so a cache hit would otherwise leave it unread everywhere
-/// else.
-pub(crate) async fn mark_seen(account: &Account, uid: u32) -> Result<()> {
+/// Sets or clears a flag on a message server-side. Also how a message
+/// opened from the on-disk cache gets marked read: only fetching `BODY[]`
+/// over IMAP does that implicitly.
+pub(crate) async fn store_flag(account: &Account, folder: &str, uid: u32, flag: FlagKind, on: bool) -> Result<()> {
     let mut session = open_session(account).await?;
-    select_inbox(&mut session).await?;
+    select(&mut session, folder).await?;
+    let sign = if on { '+' } else { '-' };
+    let name = flag.imap_name();
     session
-        .uid_store(uid.to_string(), "+FLAGS (\\Seen)")
+        .uid_store(uid.to_string(), format!("{sign}FLAGS ({name})"))
         .await
-        .map_err(|e| Error::Imap(format!("STORE +Seen uid {uid}: {e}")))?
+        .map_err(|e| Error::Imap(format!("STORE {sign}{name} uid {uid}: {e}")))?
         .try_collect::<Vec<_>>()
         .await
         .map_err(|e| Error::Imap(e.to_string()))?;
@@ -516,6 +707,67 @@ mod tests {
         assert!(msg.body_text.contains("Hello, world!"));
         assert!(msg.attachments.is_empty());
         assert!(msg.date.is_some());
+    }
+
+    #[test]
+    fn message_from_raw_reads_what_a_reply_needs() {
+        let raw = b"From: Alice <alice@example.com>\r\n\
+                    To: me@example.com, Bob <bob@example.com>\r\n\
+                    Cc: Carol <carol@example.com>\r\n\
+                    Reply-To: List <list@example.com>\r\n\
+                    Message-ID: <three@example.com>\r\n\
+                    In-Reply-To: <two@example.com>\r\n\
+                    References: <one@example.com> <two@example.com>\r\n\
+                    Subject: Thread\r\n\
+                    \r\n\
+                    body"
+            .to_vec();
+        let msg = message_from_raw(1, &raw).unwrap();
+        assert_eq!(msg.message_id.as_deref(), Some("three@example.com"));
+        assert_eq!(msg.references, vec!["one@example.com", "two@example.com"]);
+        assert_eq!(msg.reply_to[0].email, "list@example.com");
+        assert_eq!(msg.cc[0].email, "carol@example.com");
+        assert_eq!(msg.to.len(), 2);
+        assert!(!msg.has_html);
+    }
+
+    #[test]
+    fn without_references_the_thread_falls_back_to_in_reply_to() {
+        let raw = b"From: a@example.com\r\n\
+                    In-Reply-To: <parent@example.com>\r\n\
+                    \r\n\
+                    body"
+            .to_vec();
+        assert_eq!(
+            message_from_raw(1, &raw).unwrap().references,
+            vec!["parent@example.com"]
+        );
+    }
+
+    #[test]
+    fn an_html_part_is_detected_and_extractable() {
+        let raw = b"From: a@example.com\r\n\
+                    Content-Type: multipart/alternative; boundary=\"B\"\r\n\
+                    \r\n\
+                    --B\r\n\
+                    Content-Type: text/plain\r\n\
+                    \r\n\
+                    plain\r\n\
+                    --B\r\n\
+                    Content-Type: text/html\r\n\
+                    \r\n\
+                    <p>rich</p>\r\n\
+                    --B--\r\n"
+            .to_vec();
+        let msg = message_from_raw(1, &raw).unwrap();
+        assert!(msg.has_html);
+        assert!(msg.body_text.contains("plain"));
+        assert!(html_from_raw(&raw).unwrap().contains("<p>rich</p>"));
+        assert_eq!(
+            html_from_raw(&plain_message("x")),
+            None,
+            "plain text isn't worth a browser"
+        );
     }
 
     #[test]

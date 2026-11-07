@@ -7,9 +7,10 @@
 use crate::account::Account;
 use crate::config;
 use crate::error::{Error, Result};
+use crate::folder::FolderRole;
 use crate::imap::client as imap_client;
 use crate::smtp::{self, AttachmentFile, Draft};
-use crate::store::Store;
+use crate::store::{OutboxCounts, Store};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendOutcome {
@@ -30,9 +31,7 @@ pub async fn send_message(
 
     match smtp::send(account, built).await {
         Ok(()) => {
-            if let Err(e) = imap_client::append_to_sent(account, &raw).await {
-                tracing::warn!("sent, but failed to file a Sent copy: {e}");
-            }
+            file_sent_copy(account, store, account_id, &raw).await;
             Ok(SendOutcome::Sent)
         }
         Err(e) if should_queue(&e) => {
@@ -41,6 +40,21 @@ pub async fn send_message(
             Ok(SendOutcome::Queued)
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Best-effort: files a copy of a sent message in the account's Sent
+/// folder (as discovered by the last folder refresh, if any).
+async fn file_sent_copy(account: &Account, store: &Store, account_id: i64, raw: &[u8]) {
+    let sent = match store.folder_by_role(account_id, FolderRole::Sent).await {
+        Ok(folder) => folder.map(|f| f.name),
+        Err(e) => {
+            tracing::warn!("couldn't look up the Sent folder: {e}");
+            None
+        }
+    };
+    if let Err(e) = imap_client::append_to_sent(account, sent.as_deref(), raw).await {
+        tracing::warn!("sent, but failed to file a Sent copy: {e}");
     }
 }
 
@@ -72,23 +86,40 @@ async fn queue_outbox(store: &Store, account_id: i64, raw: &[u8], recipients: &[
 
 /// After this many failed attempts a queued message is left alone (still
 /// on disk and in the outbox table, for inspection) instead of being
-/// retried on every sync forever.
+/// retried on every sync forever — until the user asks for a retry.
 const MAX_OUTBOX_ATTEMPTS: i64 = 10;
 
 /// Serializes outbox flushes. Flushes are triggered from several places
-/// (startup, every successful sync, every IDLE wake), and two running at
+/// (every successful sync, every IDLE wake, the user), and two running at
 /// once could both read the same queued item and send it twice.
 static FLUSH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Attempts to send every message currently sitting in the outbox.
-/// Non-fatal on individual failures — those stay queued for next time.
-pub async fn flush_outbox(account: &Account, store: &Store, account_id: i64) -> Result<usize> {
+/// What one outbox flush did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlushReport {
+    /// How many queued messages it tried to send.
+    pub attempted: usize,
+    pub sent: usize,
+    /// The last failure, if any attempt failed.
+    pub last_error: Option<String>,
+}
+
+/// Attempts to send every message currently sitting in the outbox. Ones
+/// that already failed `MAX_OUTBOX_ATTEMPTS` times are skipped unless
+/// `retry_given_up` (the user asked to send queued mail now). Non-fatal on
+/// individual failures — those stay queued for next time.
+pub async fn flush_outbox(
+    account: &Account,
+    store: &Store,
+    account_id: i64,
+    retry_given_up: bool,
+) -> Result<FlushReport> {
     let _guard = FLUSH_LOCK.lock().await;
     let items = store.list_outbox(account_id).await?;
-    let mut sent = 0;
+    let mut report = FlushReport::default();
 
     for item in items {
-        if item.attempts >= MAX_OUTBOX_ATTEMPTS {
+        if item.attempts >= MAX_OUTBOX_ATTEMPTS && !retry_given_up {
             continue;
         }
         let raw = match tokio::fs::read(&item.raw_mime_path).await {
@@ -100,13 +131,13 @@ pub async fn flush_outbox(account: &Account, store: &Store, account_id: i64) -> 
             }
         };
 
+        report.attempted += 1;
         match smtp::send_raw(account, &raw, &item.recipients).await {
             Ok(()) => {
-                if let Err(e) = imap_client::append_to_sent(account, &raw).await {
-                    tracing::warn!("outbox item {} sent, but Sent filing failed: {e}", item.id);
-                }
+                file_sent_copy(account, store, account_id, &raw).await;
                 store.delete_outbox(item.id).await?;
-                sent += 1;
+                let _ = tokio::fs::remove_file(&item.raw_mime_path).await;
+                report.sent += 1;
             }
             Err(e) => {
                 tracing::warn!(
@@ -115,11 +146,18 @@ pub async fn flush_outbox(account: &Account, store: &Store, account_id: i64) -> 
                     item.attempts + 1
                 );
                 store.record_outbox_failure(item.id, e.to_string()).await?;
+                report.last_error = Some(e.to_string());
             }
         }
     }
 
-    Ok(sent)
+    Ok(report)
+}
+
+/// How many messages are waiting in an account's outbox, and how many of
+/// those have been given up on (see `MAX_OUTBOX_ATTEMPTS`).
+pub async fn outbox_counts(store: &Store, account_id: i64) -> Result<OutboxCounts> {
+    store.outbox_counts(account_id, MAX_OUTBOX_ATTEMPTS).await
 }
 
 /// Cheap, dependency-free unique-enough id for outbox filenames.

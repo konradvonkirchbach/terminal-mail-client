@@ -34,11 +34,18 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     Span::raw(from),
                 ]),
                 Line::from(vec![Span::styled("To: ", Style::new().fg(theme.muted)), Span::raw(to)]),
-                Line::from(vec![
-                    Span::styled("Date: ", Style::new().fg(theme.muted)),
-                    Span::raw(date),
-                ]),
             ];
+            if !message.cc.is_empty() {
+                let cc = message.cc.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+                lines.push(Line::from(vec![
+                    Span::styled("Cc: ", Style::new().fg(theme.muted)),
+                    Span::raw(cc),
+                ]));
+            }
+            lines.push(Line::from(vec![
+                Span::styled("Date: ", Style::new().fg(theme.muted)),
+                Span::raw(date),
+            ]));
 
             if !message.attachments.is_empty() {
                 let mut spans = vec![Span::styled("Attachments: ", Style::new().fg(theme.muted))];
@@ -55,10 +62,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                     spans.push(Span::styled(text, style));
                 }
                 lines.push(Line::from(spans));
-                lines.push(Line::from(Span::styled(
-                    "[ ] select   a download",
-                    Style::new().fg(theme.muted),
-                )));
+            }
+            let hint = match (message.attachments.is_empty(), message.has_html) {
+                (false, true) => "[ ] select   a save   o open   O view as HTML",
+                (false, false) => "[ ] select   a save   o open",
+                (true, true) => "O view as HTML in the browser",
+                (true, false) => "",
+            };
+            if !hint.is_empty() {
+                lines.push(Line::from(Span::styled(hint, Style::new().fg(theme.muted))));
             }
 
             lines.push(Line::from(Span::styled(

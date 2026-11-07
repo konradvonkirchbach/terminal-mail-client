@@ -3,14 +3,17 @@
 //! it into `App` state changes or background work.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyModifiers};
+use mail_core::FlagKind;
 
 use crate::app::{body_change, App, BodyChange, BodyState, BrowserPurpose, ComposeField, ComposeState, ListState};
 use crate::attach;
 use crate::bg;
 use crate::editable::TextInput;
 use crate::filebrowser::FileBrowser;
+use crate::reply::Respond;
 use crate::session::Session;
 use crate::spellcheck::SpellCheckHandle;
 use crate::vim::{Mode as VimMode, Outcome};
@@ -38,6 +41,11 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session
         return;
     }
 
+    if app.drafts.is_some() {
+        handle_drafts_key(app, code, session);
+        return;
+    }
+
     if app.search_editing {
         handle_search_key(app, code, session);
         return;
@@ -51,11 +59,9 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session
         return;
     }
 
-    // `gg` needs to see two `g` presses in a row — any other key cancels
-    // the pending first one instead of being swallowed by it.
-    if !matches!(code, KeyCode::Char('g')) {
-        app.pending_g = false;
-    }
+    // `gg` and `gi` need to see a `g` first — any other key cancels the
+    // pending one instead of being swallowed by it.
+    let g_pending = std::mem::take(&mut app.pending_g);
 
     match code {
         KeyCode::Char('q') => app.should_quit = true,
@@ -68,6 +74,7 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session
             } else {
                 app.body = BodyState::Empty;
                 app.body_scroll = 0;
+                app.pending_respond = None;
             }
         }
         KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('n') => {
@@ -76,11 +83,24 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session
         }
         KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('N') => app.select_prev(),
         KeyCode::Char('g') => {
-            if app.pending_g {
-                app.pending_g = false;
+            if g_pending {
                 app.select_top();
             } else {
                 app.pending_g = true;
+            }
+        }
+        KeyCode::Char('i') if g_pending => {
+            let inbox = session.accounts.current().inbox_id;
+            switch_folder(app, session, inbox);
+        }
+        KeyCode::Char('}') => {
+            if let Some(folder_id) = app.neighbor_folder(true) {
+                switch_folder(app, session, folder_id);
+            }
+        }
+        KeyCode::Char('{') => {
+            if let Some(folder_id) = app.neighbor_folder(false) {
+                switch_folder(app, session, folder_id);
             }
         }
         KeyCode::Char('G') => {
@@ -102,21 +122,23 @@ pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, session
         KeyCode::Char('/') => app.start_search(),
         KeyCode::Char('S') => {
             app.list_state = ListState::Loading;
-            bg::spawn_sync(session.accounts.current().clone(), session.tx.clone());
+            let ctx = session.accounts.current().clone();
+            bg::spawn_sync(ctx.clone(), session.tx.clone());
+            bg::spawn_refresh_folders(ctx, session.tx.clone());
         }
-        KeyCode::Char('c') => {
-            app.status_message = None;
-            app.compose = Some(ComposeState::blank());
-            bg::spawn_spellchecker_reload(session.tx.clone());
+        KeyCode::Char('F') => {
+            app.set_status("Sending queued mail...");
+            bg::spawn_flush_outbox(session.accounts.current().clone(), session.tx.clone(), true);
         }
-        KeyCode::Char('r') => {
-            let reply = app.selected_envelope().map(ComposeState::reply);
-            if let Some(reply) = reply {
-                app.status_message = None;
-                app.compose = Some(reply);
-                bg::spawn_spellchecker_reload(session.tx.clone());
-            }
-        }
+        KeyCode::Char('c') => open_compose(app, session, ComposeState::blank()),
+        KeyCode::Char('P') => bg::spawn_list_drafts(session.accounts.current().clone(), session.tx.clone()),
+        KeyCode::Char('r') => respond(app, session, Respond::Reply),
+        KeyCode::Char('R') => respond(app, session, Respond::ReplyAll),
+        KeyCode::Char('f') => respond(app, session, Respond::Forward),
+        KeyCode::Char('m') => toggle_flag(app, session, FlagKind::Seen),
+        KeyCode::Char('s') => toggle_flag(app, session, FlagKind::Flagged),
+        KeyCode::Char('o') => open_attachment(app, session),
+        KeyCode::Char('O') => open_html(app, session),
         KeyCode::Enter => {
             if let Some(uid) = app.selected_uid() {
                 app.start_loading_body(uid);
@@ -173,6 +195,10 @@ pub fn handle_paste(app: &mut App, text: &str, spellcheck: Option<&SpellCheckHan
             .filter(|c| !c.is_control())
     };
 
+    if app.drafts.is_some() {
+        return;
+    }
+
     if let Some((browser, _)) = &mut app.file_browser {
         if browser.filename_focused {
             if let Some(filename) = &mut browser.filename {
@@ -220,19 +246,143 @@ pub fn handle_paste(app: &mut App, text: &str, spellcheck: Option<&SpellCheckHan
     }
 }
 
-/// Switches the active account: updates the index, resets whatever was
-/// specific to the previous one, and kicks off both a cache read (fast,
-/// for the "instant" feel) and a fresh sync (in case it's gone stale
-/// since the startup sync).
+/// Switches the active account, to its inbox: updates the index, resets
+/// whatever was specific to the previous one, and kicks off both a cache
+/// read (fast, for the "instant" feel) and a fresh sync (in case it's gone
+/// stale since the startup sync).
 fn switch_account(app: &mut App, session: &mut Session, index: usize) {
     session.accounts.current = index;
+    let ctx = &mut session.accounts.list[index];
+    ctx.folder_id = ctx.inbox_id;
     app.current_account = index;
-    app.reset_for_account_switch();
+    app.reset_for_account_switch(ctx.inbox_id);
 
     let ctx = session.accounts.current().clone();
     bg::spawn_account_envelopes(ctx.clone(), session.tx.clone());
     bg::spawn_known_senders(ctx.clone(), session.tx.clone());
+    bg::spawn_outbox_counts(ctx.clone(), session.tx.clone());
+    bg::spawn_load_folders(ctx.clone(), session.tx.clone());
     bg::spawn_sync(ctx, session.tx.clone());
+}
+
+/// Shows another folder of the current account: its cached messages
+/// right away, then whatever a sync of it brings.
+fn switch_folder(app: &mut App, session: &mut Session, folder_id: i64) {
+    if folder_id == app.current_folder_id {
+        return;
+    }
+    let index = session.accounts.current;
+    session.accounts.list[index].folder_id = folder_id;
+    app.show_folder(folder_id);
+
+    let ctx = session.accounts.current().clone();
+    bg::spawn_account_envelopes(ctx.clone(), session.tx.clone());
+    bg::spawn_sync(ctx, session.tx.clone());
+}
+
+/// Opens compose (new, a reply, a resumed draft) over the main view.
+pub fn open_compose(app: &mut App, session: &Session, compose: ComposeState) {
+    app.status_message = None;
+    app.compose = Some(compose);
+    bg::spawn_spellchecker_reload(session.tx.clone());
+}
+
+/// `r`/`R`/`f` on the selected message. Quoting and threading need its
+/// body, so if that isn't the one open in the reading pane it's opened
+/// first, and compose follows once it has loaded (see `bg::apply`).
+fn respond(app: &mut App, session: &Session, kind: Respond) {
+    let Some(uid) = app.selected_uid() else { return };
+    if matches!(&app.body, BodyState::Loaded(message) if message.uid == uid) {
+        start_respond(app, session, kind);
+        return;
+    }
+    app.start_loading_body(uid);
+    app.pending_respond = Some((uid, kind));
+    app.set_status(format!("Opening the message to {}...", kind.verb()));
+    bg::spawn_fetch_body(session.accounts.current().clone(), uid, session.tx.clone());
+}
+
+/// Opens compose replying to (or forwarding) the message in the reading
+/// pane.
+pub fn start_respond(app: &mut App, session: &Session, kind: Respond) {
+    let BodyState::Loaded(message) = &app.body else { return };
+    let own_email = &session.accounts.current().account.config.email;
+    let compose = ComposeState::respond(message, kind, own_email, app.current_folder_id);
+    open_compose(app, session, compose);
+}
+
+/// `m`/`s`: toggles read or starred on the selected message — at once in
+/// the list, then on the server (undone if that fails).
+fn toggle_flag(app: &mut App, session: &Session, flag: FlagKind) {
+    let Some(envelope) = app.selected_envelope() else {
+        return;
+    };
+    let (uid, on) = (envelope.uid, !envelope.flags.get(flag));
+    app.set_envelope_flag(uid, flag, on);
+    let ctx = session.accounts.current().clone();
+    let folder_id = ctx.folder_id;
+    bg::spawn_set_flag(ctx, folder_id, uid, flag, on, session.tx.clone());
+}
+
+/// `o`: opens the selected attachment of the open message with the
+/// desktop's default app for it.
+fn open_attachment(app: &mut App, session: &Session) {
+    let BodyState::Loaded(message) = &app.body else { return };
+    let Some(attachment) = message.attachments.get(app.selected_attachment) else {
+        app.set_status("This message has no attachments.");
+        return;
+    };
+    let (uid, name) = (message.uid, attachment.filename.clone());
+    app.set_status(format!("Opening {name}..."));
+    bg::spawn_open_attachment(
+        session.accounts.current().clone(),
+        uid,
+        app.selected_attachment,
+        name,
+        session.tx.clone(),
+    );
+}
+
+/// `O`: opens the open message's HTML version in the browser.
+fn open_html(app: &mut App, session: &Session) {
+    let BodyState::Loaded(message) = &app.body else { return };
+    if !message.has_html {
+        app.set_status("This message has no HTML version.");
+        return;
+    }
+    let uid = message.uid;
+    app.set_status("Opening the HTML version...");
+    bg::spawn_open_html(session.accounts.current().clone(), uid, session.tx.clone());
+}
+
+/// The saved-drafts picker: `j`/`k` move, Enter resumes, `d` deletes, Esc
+/// closes.
+fn handle_drafts_key(app: &mut App, code: KeyCode, session: &Session) {
+    let Some(drafts) = &mut app.drafts else { return };
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('P') => app.drafts = None,
+        KeyCode::Char('j') | KeyCode::Down => drafts.move_down(),
+        KeyCode::Char('k') | KeyCode::Up => drafts.move_up(),
+        KeyCode::Char('d') | KeyCode::Char('x') => {
+            if let Some(draft) = drafts.selected_item() {
+                bg::spawn_delete_draft(session.accounts.current(), draft.key.clone());
+                drafts.remove_selected();
+                if drafts.items.is_empty() {
+                    app.drafts = None;
+                }
+                app.set_status("Draft deleted.");
+            }
+        }
+        KeyCode::Enter => {
+            if drafts.items.is_empty() {
+                return;
+            }
+            let saved = drafts.items.remove(drafts.selected);
+            app.drafts = None;
+            open_compose(app, session, ComposeState::from_saved(saved));
+        }
+        _ => {}
+    }
 }
 
 /// Checks whether the selection just landed on the last visible row with
@@ -366,16 +516,42 @@ fn handle_body_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, sessio
     }
 
     let before = compose.body.lines.clone();
+    let ctx = session.accounts.current();
     match compose.vim.handle_key(&mut compose.body, code, modifiers) {
         Outcome::None => {}
         Outcome::Notice(message) => compose.notice = Some(message),
         Outcome::Send => start_send(compose, session),
-        Outcome::Quit { force } => {
-            if force || compose.is_blank() {
-                app.compose = None;
-                return;
+        Outcome::Save => {
+            if compose.is_blank() {
+                compose.notice = Some("Nothing to save yet".to_string());
+            } else {
+                let saved = compose.take_save(Instant::now());
+                bg::spawn_save_draft(ctx, saved, true, session.tx.clone());
             }
-            compose.notice = Some("Unsent draft — :wq to send, :q! to discard".to_string());
+        }
+        // `:q!` throws the message away, saved draft included.
+        Outcome::Quit { force: true } => {
+            bg::spawn_delete_draft(ctx, compose.draft_key.clone());
+            let had_draft = compose.last_saved.is_some();
+            app.compose = None;
+            if had_draft {
+                app.set_status("Draft discarded.");
+            }
+            return;
+        }
+        // `:q` keeps anything written as a draft (and drops the draft of a
+        // compose that's been emptied).
+        Outcome::Quit { force: false } => {
+            if compose.is_blank() {
+                bg::spawn_delete_draft(ctx, compose.draft_key.clone());
+            } else if compose.has_unsaved_changes() {
+                let saved = compose.take_save(Instant::now());
+                bg::spawn_save_draft(ctx, saved, true, session.tx.clone());
+            } else {
+                app.set_status("Draft saved — P lists saved drafts.");
+            }
+            app.compose = None;
+            return;
         }
     }
 
@@ -703,12 +879,207 @@ mod tests {
                     store,
                     account_id: 1,
                     folder_id: 1,
+                    inbox_id: 1,
                 }],
                 current: 0,
             },
             tx,
             spellcheck: None,
         }
+    }
+
+    /// A session over a throwaway store that has the account and its inbox,
+    /// plus the receiving end of its background channel — for flows that
+    /// go through the store (drafts) and report back. Nothing here may
+    /// reach the network or the keyring.
+    async fn live_session(dir: &Path) -> (Session, tokio::sync::mpsc::Receiver<bg::BgMsg>) {
+        let mut session = test_session(dir);
+        let ctx = &mut session.accounts.list[0];
+        ctx.account_id = ctx.store.upsert_account("me@example.com".into(), None).await.unwrap();
+        let inbox = ctx
+            .store
+            .get_or_create_folder(ctx.account_id, "INBOX".into())
+            .await
+            .unwrap();
+        (ctx.folder_id, ctx.inbox_id) = (inbox.id, inbox.id);
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        session.tx = tx;
+        (session, rx)
+    }
+
+    /// Applies background results until one matches `wanted`.
+    async fn apply_until(
+        app: &mut App,
+        session: &mut Session,
+        rx: &mut tokio::sync::mpsc::Receiver<bg::BgMsg>,
+        wanted: fn(&bg::BgMsg) -> bool,
+    ) {
+        loop {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a background result")
+                .expect("the channel is open");
+            let done = wanted(&msg);
+            bg::apply(app, session, msg);
+            if done {
+                return;
+            }
+        }
+    }
+
+    fn keys(app: &mut App, session: &mut Session, typed: &str) {
+        for c in typed.chars() {
+            let code = if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) };
+            handle_key(app, code, KeyModifiers::NONE, session);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_closed_compose_is_kept_as_a_draft_and_can_be_resumed_or_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut session, mut rx) = live_session(dir.path()).await;
+        let mut app = app();
+
+        keys(&mut app, &mut session, "c");
+        keys(&mut app, &mut session, "bob@example.com");
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut session); // to the body, Normal mode
+        keys(&mut app, &mut session, ":q\n");
+        assert!(app.compose.is_none(), ":q closes a compose with content");
+        apply_until(&mut app, &mut session, &mut rx, |m| {
+            matches!(m, bg::BgMsg::DraftSaved { .. })
+        })
+        .await;
+        assert!(app.status_message.as_ref().unwrap().0.starts_with("Draft saved"));
+
+        keys(&mut app, &mut session, "P");
+        apply_until(&mut app, &mut session, &mut rx, |m| {
+            matches!(m, bg::BgMsg::Drafts { .. })
+        })
+        .await;
+        assert_eq!(app.drafts.as_ref().unwrap().items.len(), 1);
+
+        keys(&mut app, &mut session, "\n");
+        let compose = app.compose.as_ref().expect("Enter resumes the draft");
+        assert_eq!(compose.to.value, "bob@example.com");
+        assert!(app.drafts.is_none());
+
+        keys(&mut app, &mut session, ":q!\n");
+        assert!(app.compose.is_none());
+        keys(&mut app, &mut session, "P");
+        apply_until(&mut app, &mut session, &mut rx, |m| {
+            matches!(m, bg::BgMsg::Drafts { .. })
+        })
+        .await;
+        assert!(app.drafts.is_none(), ":q! discarded the draft");
+        assert_eq!(app.status_message.as_ref().unwrap().0, "No saved drafts.");
+    }
+
+    #[tokio::test]
+    async fn w_saves_a_draft_without_closing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut session, mut rx) = live_session(dir.path()).await;
+        let mut app = app();
+
+        keys(&mut app, &mut session, "c");
+        handle_key(&mut app, KeyCode::BackTab, KeyModifiers::NONE, &mut session); // To -> Body (Insert)
+        keys(&mut app, &mut session, "note to self");
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut session);
+        keys(&mut app, &mut session, ":w\n");
+        apply_until(&mut app, &mut session, &mut rx, |m| {
+            matches!(m, bg::BgMsg::DraftSaved { .. })
+        })
+        .await;
+
+        let compose = app.compose.as_ref().expect(":w keeps compose open");
+        assert_eq!(compose.notice.as_deref(), Some("Draft saved"));
+        assert!(!compose.has_unsaved_changes());
+        let drafts = session
+            .accounts
+            .current()
+            .store
+            .list_drafts(session.accounts.current().account_id);
+        assert_eq!(drafts.await.unwrap()[0].draft.body, "note to self");
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_an_unopened_message_waits_for_its_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = test_session(dir.path());
+        let mut app = app();
+        app.current_folder_id = 1;
+        app.replace_envelopes(vec![mail_core::Envelope {
+            uid: 5,
+            subject: "Plans".into(),
+            from: Vec::new(),
+            to: Vec::new(),
+            date: None,
+            flags: Default::default(),
+        }]);
+
+        keys(&mut app, &mut session, "R");
+        assert!(app.compose.is_none());
+        assert!(matches!(app.body, BodyState::Loading { uid: 5 }));
+
+        let message = mail_core::Message {
+            uid: 5,
+            subject: "Plans".into(),
+            from: vec![mail_core::Address {
+                name: None,
+                email: "alice@example.com".into(),
+            }],
+            cc: vec![mail_core::Address {
+                name: None,
+                email: "carol@example.com".into(),
+            }],
+            ..Default::default()
+        };
+        bg::apply(
+            &mut app,
+            &mut session,
+            bg::BgMsg::Body {
+                account_id: 1,
+                folder_id: 1,
+                uid: 5,
+                result: Ok(message),
+            },
+        );
+        let compose = app.compose.as_ref().expect("compose opens once the body is in");
+        assert_eq!(compose.subject.value, "Re: Plans");
+        assert_eq!(compose.to.value, "alice@example.com");
+        assert_eq!(compose.cc.value, "carol@example.com", "R replies to all");
+        assert!(app.pending_respond.is_none());
+    }
+
+    #[tokio::test]
+    async fn folder_keys_move_through_the_sidebar_and_gi_goes_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = test_session(dir.path());
+        let folder = |id: i64, name: &str| mail_core::Folder {
+            id,
+            account_id: 1,
+            name: name.to_string(),
+            delimiter: Some("/".into()),
+            role: None,
+            selectable: true,
+            unseen: None,
+            total: None,
+        };
+        // Ids the throwaway store doesn't have, so the syncs these keys
+        // start stop there instead of going online.
+        session.accounts.list[0].folder_id = 101;
+        session.accounts.list[0].inbox_id = 101;
+        let mut app = app();
+        app.set_folders(0, vec![folder(101, "INBOX"), folder(102, "Sent")]);
+        app.current_folder_id = 101;
+
+        keys(&mut app, &mut session, "}");
+        assert_eq!(app.current_folder_id, 102);
+        assert_eq!(session.accounts.current().folder_id, 102);
+
+        keys(&mut app, &mut session, "gi");
+        assert_eq!(app.current_folder_id, 101);
+        assert_eq!(session.accounts.current().folder_id, 101);
+        assert!(!app.pending_g);
     }
 
     #[test]

@@ -28,6 +28,22 @@ pub struct Address {
     pub email: String,
 }
 
+impl Address {
+    /// The address as it goes into a To/Cc/Bcc field: `Name <email>`, with
+    /// the name quoted when it contains characters that would otherwise
+    /// split or break it (a comma in `Doe, Jane`, a dot, brackets, ...).
+    pub fn to_recipient(&self) -> String {
+        match self.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            Some(name) if name.chars().any(|c| ",;:<>@()[]\".\\".contains(c)) => {
+                let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{escaped}\" <{}>", self.email)
+            }
+            Some(name) => format!("{name} <{}>", self.email),
+            None => self.email.clone(),
+        }
+    }
+}
+
 impl std::fmt::Display for Address {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.name {
@@ -37,16 +53,64 @@ impl std::fmt::Display for Address {
     }
 }
 
+/// A message flag the user can change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagKind {
+    Seen,
+    Flagged,
+    Answered,
+}
+
+impl FlagKind {
+    /// The IMAP system flag's name.
+    pub fn imap_name(self) -> &'static str {
+        match self {
+            Self::Seen => "\\Seen",
+            Self::Flagged => "\\Flagged",
+            Self::Answered => "\\Answered",
+        }
+    }
+}
+
+impl Flags {
+    pub fn get(&self, flag: FlagKind) -> bool {
+        match flag {
+            FlagKind::Seen => self.seen,
+            FlagKind::Flagged => self.flagged,
+            FlagKind::Answered => self.answered,
+        }
+    }
+
+    pub fn set(&mut self, flag: FlagKind, on: bool) {
+        match flag {
+            FlagKind::Seen => self.seen = on,
+            FlagKind::Flagged => self.flagged = on,
+            FlagKind::Answered => self.answered = on,
+        }
+    }
+}
+
 /// A fully parsed message body, fetched lazily when the user opens a
 /// message in the reading pane.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Message {
     pub uid: u32,
     pub subject: String,
     pub from: Vec<Address>,
     pub to: Vec<Address>,
+    pub cc: Vec<Address>,
+    /// Where replies should go instead of `from`, if the sender asked.
+    pub reply_to: Vec<Address>,
     pub date: Option<DateTime<Utc>>,
+    /// The `Message-ID` header, without its angle brackets.
+    pub message_id: Option<String>,
+    /// The thread this message belongs to, oldest first, without angle
+    /// brackets: its `References`, or failing that its `In-Reply-To`.
+    pub references: Vec<String>,
     pub body_text: String,
+    /// Whether there's a real HTML part (not just the plain text, which
+    /// can always be rendered as HTML) worth opening in a browser.
+    pub has_html: bool,
     pub attachments: Vec<MessageAttachment>,
 }
 
@@ -81,6 +145,25 @@ mod tests {
             email: "alice@example.com".to_string(),
         };
         assert_eq!(a.to_string(), "alice@example.com");
+    }
+
+    #[test]
+    fn to_recipient_quotes_names_that_would_break_a_recipient_list() {
+        let addr = |name: Option<&str>| Address {
+            name: name.map(str::to_string),
+            email: "jane@example.com".to_string(),
+        };
+        assert_eq!(addr(Some("Jane Doe")).to_recipient(), "Jane Doe <jane@example.com>");
+        assert_eq!(
+            addr(Some("Doe, Jane")).to_recipient(),
+            "\"Doe, Jane\" <jane@example.com>"
+        );
+        assert_eq!(
+            addr(Some("J. \"JD\" Doe")).to_recipient(),
+            "\"J. \\\"JD\\\" Doe\" <jane@example.com>"
+        );
+        assert_eq!(addr(None).to_recipient(), "jane@example.com");
+        assert_eq!(addr(Some(" ")).to_recipient(), "jane@example.com");
     }
 
     #[test]

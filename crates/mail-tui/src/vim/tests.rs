@@ -688,10 +688,7 @@ fn ex_commands_produce_outcomes() {
         (":q!<CR>", Outcome::Quit { force: true }),
         (":wq<CR>", Outcome::Send),
         (":x<CR>", Outcome::Send),
-        (
-            ":w<CR>",
-            Outcome::Notice("Drafts aren't saved yet — :wq sends, :q! discards".into()),
-        ),
+        (":w<CR>", Outcome::Save),
         (":foo<CR>", Outcome::Notice("Not an editor command: foo".into())),
     ];
     for (keys, expected) in cases {

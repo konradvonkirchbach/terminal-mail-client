@@ -134,7 +134,7 @@ pub fn draw(frame: &mut Frame, area: Rect, browser: &FileBrowser, purpose: &Brow
     );
 }
 
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+pub(super) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
     Rect {

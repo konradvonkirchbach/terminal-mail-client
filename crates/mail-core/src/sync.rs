@@ -8,9 +8,12 @@ use std::sync::{Arc, OnceLock};
 use crate::account::Account;
 use crate::config;
 use crate::error::Result;
+use crate::folder::{self, Folder, FolderRole};
 use crate::imap::client;
 use crate::store::Store;
-use crate::types::{Envelope, Flags, Message};
+use crate::types::{Envelope, FlagKind, Flags, Message};
+
+pub use client::DeleteOutcome;
 
 /// How many recently-cached messages to re-check flags for on every sync.
 /// Catches read/starred/deleted changes made from another client without
@@ -33,33 +36,44 @@ pub struct SyncOutcome {
 /// or after a `UIDVALIDITY` change, and a cheap incremental fetch otherwise.
 pub async fn sync_inbox(account: &Account, store: &Store) -> Result<SyncOutcome> {
     let mut session = client::open_session(account).await?;
-    let outcome = sync_inbox_on(&mut session, account, store).await;
+    let outcome = sync_folder_on(&mut session, account, store, "INBOX").await;
     client::logout(&mut session).await;
     outcome
 }
 
-/// `sync_inbox` over an already-open session — the IDLE loop syncs on its
-/// own connection instead of opening another one per wake-up. Leaves INBOX
-/// selected.
+/// `sync_inbox` for any cached folder.
+pub async fn sync_folder(account: &Account, store: &Store, folder_id: i64) -> Result<SyncOutcome> {
+    let folder = store.folder(folder_id).await?;
+    let mut session = client::open_session(account).await?;
+    let outcome = sync_folder_on(&mut session, account, store, &folder.name).await;
+    client::logout(&mut session).await;
+    outcome
+}
+
+/// Syncs folder `name` over an already-open session — the IDLE loop syncs
+/// on its own connection instead of opening another one per wake-up.
+/// Leaves the folder selected. Also records the folder's unread count for
+/// the sidebar.
 ///
-/// Syncs of the same account are serialized: startup, IDLE wakes, a manual
+/// Syncs of the same folder are serialized: startup, IDLE wakes, a manual
 /// refresh and an account switch can all trigger one, and two running at
 /// once would both "discover" the same new mail (two notifications) and
 /// race on the cache.
-pub(crate) async fn sync_inbox_on(
+pub(crate) async fn sync_folder_on(
     session: &mut client::ImapSession,
     account: &Account,
     store: &Store,
+    name: &str,
 ) -> Result<SyncOutcome> {
-    let lock = sync_lock(&account.config.email);
+    let lock = sync_lock(&account.config.email, name);
     let _guard = lock.lock().await;
 
     let account_id = store
         .upsert_account(account.config.email.clone(), account.config.display_name.clone())
         .await?;
-    let folder = store.get_or_create_folder(account_id, "INBOX".to_string()).await?;
+    let folder = store.get_or_create_folder(account_id, name.to_string()).await?;
 
-    let mailbox = client::select_inbox(session).await?;
+    let mailbox = client::select(session, name).await?;
 
     let uidvalidity_changed = folder.uidvalidity != Some(mailbox.uid_validity);
     let had_prior_sync = folder.uidvalidity.is_some();
@@ -77,6 +91,10 @@ pub(crate) async fn sync_inbox_on(
     store
         .update_folder_uid_state(folder.id, mailbox.uid_validity, mailbox.uid_next)
         .await?;
+    match client::count_unseen(session).await {
+        Ok(unseen) => store.update_folder_counts(folder.id, unseen, mailbox.exists).await?,
+        Err(e) => tracing::warn!("couldn't count unread mail in {name}: {e}"),
+    }
 
     Ok(SyncOutcome {
         account_id,
@@ -85,14 +103,49 @@ pub(crate) async fn sync_inbox_on(
     })
 }
 
-/// One lock per account (keyed by email), created on first use.
-fn sync_lock(email: &str) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+/// One lock per account and folder, created on first use.
+type SyncLocks = std::sync::Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
+
+fn sync_lock(email: &str, folder: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<SyncLocks> = OnceLock::new();
     let mut locks = LOCKS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    Arc::clone(locks.entry(email.to_string()).or_default())
+    Arc::clone(locks.entry((email.to_string(), folder.to_string())).or_default())
+}
+
+/// Reads the account's folder list from the server — names, what each is
+/// for, and unread/total counts — into the cache, and returns it in
+/// sidebar order. Folders the server no longer has are dropped, along with
+/// their cached mail.
+pub async fn refresh_folders(account: &Account, store: &Store, account_id: i64) -> Result<Vec<Folder>> {
+    let mut session = client::open_session(account).await?;
+    let result = refresh_folders_on(&mut session, store, account_id).await;
+    client::logout(&mut session).await;
+    result?;
+    store.list_folders(account_id).await
+}
+
+async fn refresh_folders_on(session: &mut client::ImapSession, store: &Store, account_id: i64) -> Result<()> {
+    let mut remote = client::list_folders(session).await?;
+    folder::assign_roles(&mut remote);
+    let selectable: Vec<String> = remote.iter().filter(|f| f.selectable).map(|f| f.name.clone()).collect();
+
+    let stale = store.replace_folders(account_id, remote).await?;
+    remove_cached_files(stale).await;
+
+    for name in selectable {
+        match client::status_counts(session, &name).await {
+            Ok((unseen, total)) => {
+                store
+                    .update_folder_counts_by_name(account_id, name, unseen, total)
+                    .await?
+            }
+            Err(e) => tracing::warn!("couldn't read the message counts of {name}: {e}"),
+        }
+    }
+    Ok(())
 }
 
 async fn initial_sync(
@@ -201,9 +254,10 @@ pub async fn fetch_older(account: &Account, store: &Store, folder_id: i64, batch
     if floor <= 1 {
         return Ok(0); // already down to UID 1 — nothing older can exist
     }
+    let folder = store.folder(folder_id).await?;
 
     let mut session = client::open_session(account).await?;
-    client::select_inbox(&mut session).await?;
+    client::select(&mut session, &folder.name).await?;
 
     let mut candidates = client::uid_search(&mut session, &format!("UID 1:{}", floor - 1)).await?;
     candidates.sort_unstable();
@@ -244,8 +298,9 @@ pub async fn search_remote(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Envelope>> {
+    let folder = store.folder(folder_id).await?;
     let mut session = client::open_session(account).await?;
-    client::select_inbox(&mut session).await?;
+    client::select(&mut session, &folder.name).await?;
 
     let escaped = client::escape_search_term(query);
     let criteria = format!("OR SUBJECT \"{escaped}\" FROM \"{escaped}\"");
@@ -268,7 +323,8 @@ pub async fn search_remote(
 }
 
 /// Returns a message body, reading it from the on-disk cache if present
-/// and fetching + caching it from IMAP otherwise.
+/// and fetching + caching it from IMAP otherwise. Marks it read, locally
+/// and on the server.
 pub async fn fetch_body(
     account: &Account,
     store: &Store,
@@ -276,15 +332,16 @@ pub async fn fetch_body(
     folder_id: i64,
     uid: u32,
 ) -> Result<Message> {
+    let folder = store.folder(folder_id).await?;
     if let Some(raw) = cached_raw(store, folder_id, uid).await? {
         if let Ok(message) = client::message_from_raw(uid, &raw) {
             // Served from the cache, so the server never saw this message
             // being read: mark it there too (in the background — the body
             // is ready now).
-            if store.mark_seen(folder_id, uid).await? {
+            if store.set_flag(folder_id, uid, FlagKind::Seen, true).await? {
                 let account = account.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = client::mark_seen(&account, uid).await {
+                    if let Err(e) = client::store_flag(&account, &folder.name, uid, FlagKind::Seen, true).await {
                         tracing::warn!("failed to mark uid {uid} read on the server: {e}");
                     }
                 });
@@ -298,9 +355,9 @@ pub async fn fetch_body(
     // Fetching `BODY[]` sets `\Seen` on the server by itself; just mirror it
     // locally so the list doesn't keep showing the message as unread until
     // the next flag sweep.
-    let raw = client::fetch_message_raw(account, uid).await?;
+    let raw = client::fetch_message_raw(account, &folder.name, uid).await?;
     let message = client::message_from_raw(uid, &raw)?;
-    store.mark_seen(folder_id, uid).await?;
+    store.set_flag(folder_id, uid, FlagKind::Seen, true).await?;
 
     if let Err(e) = cache_raw_message(store, account_id, folder_id, uid, &raw).await {
         tracing::warn!("failed to cache message uid {uid} on disk: {e}");
@@ -321,17 +378,34 @@ pub async fn attachment_bytes(
     uid: u32,
     index: usize,
 ) -> Result<Vec<u8>> {
-    let raw = match cached_raw(store, folder_id, uid).await? {
-        Some(raw) => raw,
-        None => {
-            let raw = client::fetch_message_raw(account, uid).await?;
-            if let Err(e) = cache_raw_message(store, account_id, folder_id, uid, &raw).await {
-                tracing::warn!("failed to cache message uid {uid} on disk: {e}");
-            }
-            raw
-        }
-    };
+    let raw = raw_message(account, store, account_id, folder_id, uid).await?;
     client::attachment_from_raw(uid, &raw, index)
+}
+
+/// The message's HTML body, if it has a real one (`Message::has_html`),
+/// for opening in a browser. From the cache like `attachment_bytes`.
+pub async fn html_body(
+    account: &Account,
+    store: &Store,
+    account_id: i64,
+    folder_id: i64,
+    uid: u32,
+) -> Result<Option<String>> {
+    let raw = raw_message(account, store, account_id, folder_id, uid).await?;
+    Ok(client::html_from_raw(&raw))
+}
+
+/// The raw message, from the on-disk cache or else fetched (and cached).
+async fn raw_message(account: &Account, store: &Store, account_id: i64, folder_id: i64, uid: u32) -> Result<Vec<u8>> {
+    if let Some(raw) = cached_raw(store, folder_id, uid).await? {
+        return Ok(raw);
+    }
+    let folder = store.folder(folder_id).await?;
+    let raw = client::fetch_message_raw(account, &folder.name, uid).await?;
+    if let Err(e) = cache_raw_message(store, account_id, folder_id, uid, &raw).await {
+        tracing::warn!("failed to cache message uid {uid} on disk: {e}");
+    }
+    Ok(raw)
 }
 
 /// The cached raw message, if one was cached and its file is still readable.
@@ -342,18 +416,45 @@ async fn cached_raw(store: &Store, folder_id: i64, uid: u32) -> Result<Option<Ve
     Ok(tokio::fs::read(&path).await.ok())
 }
 
-/// Deletes a message on the server (moved to Trash if a candidate folder
-/// works, otherwise expunged in place — see `client::delete_message`) and
-/// removes it from the local cache, including its on-disk `.eml` if one
-/// was cached. The server-side delete happens first: if that fails, we'd
-/// rather leave the cache alone (so the message stays visible and the
-/// user can retry) than have the UI drop a message that's still there.
-pub async fn delete_message(account: &Account, store: &Store, folder_id: i64, uid: u32) -> Result<()> {
-    client::delete_message(account, uid).await?;
+/// Deletes a message on the server — moved to the account's Trash folder,
+/// or expunged for good when it's already in Trash or there's no Trash at
+/// all (see `client::delete_message`) — and removes it from the local
+/// cache, including its on-disk `.eml` if one was cached. The server-side
+/// delete happens first: if that fails, we'd rather leave the cache alone
+/// (so the message stays visible and the user can retry) than have the UI
+/// drop a message that's still there.
+pub async fn delete_message(account: &Account, store: &Store, folder_id: i64, uid: u32) -> Result<DeleteOutcome> {
+    let folder = store.folder(folder_id).await?;
+    let trash = store.folder_by_role(folder.account_id, FolderRole::Trash).await?;
+    let in_trash = folder.role == Some(FolderRole::Trash);
+    let outcome = client::delete_message(
+        account,
+        &folder.name,
+        uid,
+        trash.as_ref().map(|t| t.name.as_str()),
+        in_trash,
+    )
+    .await?;
 
     if let Some(raw_path) = store.delete_message(folder_id, uid).await? {
         let _ = tokio::fs::remove_file(raw_path).await;
     }
+    Ok(outcome)
+}
+
+/// Sets or clears a flag (read, starred, answered) on a message: on the
+/// server first, then in the cache, so a failure leaves both unchanged.
+pub async fn set_flag(
+    account: &Account,
+    store: &Store,
+    folder_id: i64,
+    uid: u32,
+    flag: FlagKind,
+    on: bool,
+) -> Result<()> {
+    let folder = store.folder(folder_id).await?;
+    client::store_flag(account, &folder.name, uid, flag, on).await?;
+    store.set_flag(folder_id, uid, flag, on).await?;
     Ok(())
 }
 
@@ -361,7 +462,9 @@ async fn cache_raw_message(store: &Store, account_id: i64, folder_id: i64, uid: 
     let dir = config::messages_dir(account_id)?;
     tokio::fs::create_dir_all(&dir).await?;
     config::restrict_dir(&dir)?;
-    let path = dir.join(format!("{uid}.eml"));
+    // UIDs are only unique within a folder. (INBOX bodies cached before
+    // folders existed are still at `{uid}.eml`, found through `raw_path`.)
+    let path = dir.join(format!("{folder_id}-{uid}.eml"));
     tokio::fs::write(&path, raw).await?;
     config::restrict_file(&path)?;
     store
@@ -375,11 +478,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sync_lock_is_shared_per_account_and_separate_across_accounts() {
-        let a1 = sync_lock("a@example.com");
-        let a2 = sync_lock("a@example.com");
-        let b = sync_lock("b@example.com");
+    fn sync_lock_is_shared_per_folder_and_separate_across_accounts_and_folders() {
+        let a1 = sync_lock("a@example.com", "INBOX");
+        let a2 = sync_lock("a@example.com", "INBOX");
+        let a_sent = sync_lock("a@example.com", "Sent");
+        let b = sync_lock("b@example.com", "INBOX");
         assert!(Arc::ptr_eq(&a1, &a2));
+        assert!(!Arc::ptr_eq(&a1, &a_sent));
         assert!(!Arc::ptr_eq(&a1, &b));
     }
 

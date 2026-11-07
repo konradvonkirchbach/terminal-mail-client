@@ -14,9 +14,14 @@ use crate::types::Envelope;
 
 #[derive(Debug, Clone)]
 pub enum AppEvent {
+    /// A sync of `folder_id` ran (the cache and its unread count may have
+    /// changed); `new_envelopes` is whatever it fetched for the first time.
     NewMail {
         account_id: i64,
         folder_id: i64,
         new_envelopes: Vec<Envelope>,
     },
+    /// A background outbox flush sent or failed something, so the
+    /// account's queued-message counts changed.
+    OutboxChanged { account_id: i64 },
 }

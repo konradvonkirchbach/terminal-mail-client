@@ -8,13 +8,19 @@ use crate::error::{Error, Result};
 
 /// Everything the user typed into the compose view. Address fields are
 /// comma-separated strings straight from the input widgets.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Draft {
     pub to: String,
     pub cc: String,
     pub bcc: String,
     pub subject: String,
     pub body: String,
+    /// For a reply: the `Message-ID` being answered, without angle
+    /// brackets. Becomes `In-Reply-To`, which threads the reply.
+    pub in_reply_to: Option<String>,
+    /// For a reply: the thread so far, oldest first, without angle
+    /// brackets. Becomes `References`.
+    pub references: Vec<String>,
 }
 
 /// A file to attach, already read into memory — the compose view resolves
@@ -47,6 +53,13 @@ pub fn build(account: &Account, draft: &Draft, attachments: &[AttachmentFile]) -
     let from = Mailbox::new(display_name, address);
 
     let mut builder = LettreMessage::builder().from(from).subject(draft.subject.clone());
+    if let Some(id) = draft.in_reply_to.as_deref().filter(|id| !id.is_empty()) {
+        builder = builder.in_reply_to(format!("<{id}>"));
+    }
+    if !draft.references.is_empty() {
+        let references: Vec<String> = draft.references.iter().map(|id| format!("<{id}>")).collect();
+        builder = builder.references(references.join(" "));
+    }
 
     let mut any_recipient = false;
     for mbox in parse_mailboxes(&draft.to)? {
@@ -120,10 +133,27 @@ pub async fn send_raw(account: &Account, raw: &[u8], recipients: &[String]) -> R
     Ok(())
 }
 
+/// Connects and logs in to the account's SMTP server with `password`,
+/// then disconnects without sending anything — the setup wizard's
+/// connection test.
+pub async fn check(account: &Account, password: &str) -> Result<()> {
+    let transport = transport_with(account, password.to_string())?;
+    match transport.test_connection().await? {
+        true => Ok(()),
+        false => Err(Error::Smtp {
+            permanent: false,
+            message: "the server closed the connection".into(),
+        }),
+    }
+}
+
 async fn transport(account: &Account) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
+    transport_with(account, account.password()?)
+}
+
+fn transport_with(account: &Account, password: String) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
     crate::ensure_crypto_provider();
 
-    let password = account.password()?;
     let cfg = &account.config;
     let creds = Credentials::new(cfg.email.clone(), password);
 
@@ -145,8 +175,8 @@ async fn transport(account: &Account) -> Result<AsyncSmtpTransport<Tokio1Executo
 }
 
 fn parse_mailboxes(field: &str) -> Result<Vec<Mailbox>> {
-    field
-        .split(',')
+    split_recipients(field)
+        .into_iter()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| {
@@ -156,10 +186,50 @@ fn parse_mailboxes(field: &str) -> Result<Vec<Mailbox>> {
         .collect()
 }
 
+/// Splits a To/Cc/Bcc field at the commas between recipients — not at one
+/// inside a quoted display name like `"Doe, Jane" <jane@example.com>`.
+pub fn split_recipients(field: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut in_quotes, mut escaped) = (0, false, false);
+    for (i, c) in field.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                parts.push(&field[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&field[start..]);
+    parts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{AccountConfig, AuthMethod};
+
+    #[test]
+    fn recipients_split_at_commas_outside_quoted_names() {
+        assert_eq!(
+            split_recipients("\"Doe, Jane\" <jane@example.com>, bob@example.com"),
+            vec!["\"Doe, Jane\" <jane@example.com>", " bob@example.com"]
+        );
+        assert_eq!(split_recipients("a@x.com"), vec!["a@x.com"]);
+        assert_eq!(
+            split_recipients("\"a \\\", b\" <a@x.com>"),
+            vec!["\"a \\\", b\" <a@x.com>"]
+        );
+    }
+
+    #[test]
+    fn a_quoted_name_with_a_comma_parses_as_one_recipient() {
+        let built = build(&test_account(), &draft("\"Doe, Jane\" <jane@example.com>", "", ""), &[]).unwrap();
+        assert_eq!(built.recipients, vec!["jane@example.com".to_string()]);
+    }
 
     fn test_account() -> Account {
         Account::new(AccountConfig {
@@ -181,7 +251,26 @@ mod tests {
             bcc: bcc.to_string(),
             subject: "Test subject".to_string(),
             body: "Test body".to_string(),
+            ..Draft::default()
         }
+    }
+
+    #[test]
+    fn a_reply_carries_in_reply_to_and_references() {
+        let mut reply = draft("bob@example.com", "", "");
+        reply.in_reply_to = Some("b@example.com".to_string());
+        reply.references = vec!["a@example.com".to_string(), "b@example.com".to_string()];
+        let built = build(&test_account(), &reply, &[]).unwrap();
+        let raw = String::from_utf8_lossy(&built.raw);
+        assert!(raw.contains("In-Reply-To: <b@example.com>"), "{raw}");
+        assert!(raw.contains("References: <a@example.com> <b@example.com>"), "{raw}");
+    }
+
+    #[test]
+    fn a_new_message_has_no_threading_headers() {
+        let built = build(&test_account(), &draft("bob@example.com", "", ""), &[]).unwrap();
+        let raw = String::from_utf8_lossy(&built.raw);
+        assert!(!raw.contains("In-Reply-To") && !raw.contains("References"), "{raw}");
     }
 
     #[test]

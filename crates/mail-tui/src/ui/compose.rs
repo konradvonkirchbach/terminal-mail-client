@@ -421,7 +421,7 @@ fn body_mode_text(mode: VimMode, pending: &str) -> (String, &'static str) {
         VimMode::VisualLine => ("-- VISUAL LINE --".to_string(), VISUAL_HINT),
         VimMode::Normal | VimMode::Command(_) => (
             pending.to_string(),
-            "i insert   v visual   u undo   :wq send   :q! discard   Tab next field",
+            "i insert   u undo   :w save draft   :wq send   :q close   :q! discard   Tab next field",
         ),
     }
 }

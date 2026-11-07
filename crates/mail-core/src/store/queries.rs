@@ -3,8 +3,10 @@ use std::collections::HashMap;
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::error::Result;
-use crate::types::{Address, Envelope, Flags};
+use crate::error::{Error, Result};
+use crate::folder::{Folder, FolderRole, RemoteFolder};
+use crate::smtp::Draft;
+use crate::types::{Address, Envelope, FlagKind, Flags};
 
 pub struct FolderRow {
     pub id: i64,
@@ -34,7 +36,7 @@ pub fn delete_account(conn: &Connection, account_id: i64) -> Result<()> {
 
 pub fn get_or_create_folder(conn: &Connection, account_id: i64, name: &str) -> Result<FolderRow> {
     conn.execute(
-        "INSERT INTO folders (account_id, name) VALUES (?1, ?2)
+        "INSERT INTO folders (account_id, name, role) VALUES (?1, ?2, CASE WHEN ?2 = 'INBOX' THEN 'inbox' END)
          ON CONFLICT(account_id, name) DO NOTHING",
         params![account_id, name],
     )?;
@@ -56,6 +58,123 @@ pub fn update_folder_uid_state(conn: &Connection, folder_id: i64, uidvalidity: u
         "UPDATE folders SET uidvalidity = ?2, uidnext = ?3, last_synced_at = strftime('%s','now')
          WHERE id = ?1",
         params![folder_id, uidvalidity as i64, uidnext as i64],
+    )?;
+    Ok(())
+}
+
+const FOLDER_COLUMNS: &str = "id, account_id, name, delimiter, role, selectable, unseen, total";
+
+fn folder_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Folder> {
+    let role: Option<String> = row.get(4)?;
+    Ok(Folder {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        name: row.get(2)?,
+        delimiter: row.get(3)?,
+        role: role.as_deref().and_then(FolderRole::parse),
+        selectable: row.get(5)?,
+        unseen: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+        total: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
+    })
+}
+
+pub fn folder(conn: &Connection, folder_id: i64) -> Result<Folder> {
+    conn.query_row(
+        &format!("SELECT {FOLDER_COLUMNS} FROM folders WHERE id = ?1"),
+        params![folder_id],
+        folder_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| Error::Store(format!("no folder with id {folder_id}")))
+}
+
+/// Every folder of an account, in sidebar order (see `Folder::sort_key`).
+pub fn list_folders(conn: &Connection, account_id: i64) -> Result<Vec<Folder>> {
+    let mut stmt = conn.prepare(&format!("SELECT {FOLDER_COLUMNS} FROM folders WHERE account_id = ?1"))?;
+    let mut folders = stmt
+        .query_map(params![account_id], folder_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    folders.sort_by_key(Folder::sort_key);
+    Ok(folders)
+}
+
+pub fn folder_by_role(conn: &Connection, account_id: i64, role: FolderRole) -> Result<Option<Folder>> {
+    conn.query_row(
+        &format!("SELECT {FOLDER_COLUMNS} FROM folders WHERE account_id = ?1 AND role = ?2 ORDER BY id LIMIT 1"),
+        params![account_id, role.as_str()],
+        folder_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Brings an account's folder rows in line with what the server just
+/// listed: adds new folders, updates the role/separator/selectability of
+/// known ones, and drops those the server no longer has (deleted or
+/// renamed from another client) along with their cached messages, whose
+/// raw `.eml` paths are returned for the caller to delete. An empty
+/// listing changes nothing — more likely a server hiccup than an account
+/// with no folders at all — and INBOX is never dropped.
+pub(crate) fn replace_folders(conn: &Connection, account_id: i64, remote: &[RemoteFolder]) -> Result<Vec<String>> {
+    if remote.is_empty() {
+        return Ok(Vec::new());
+    }
+    for f in remote {
+        conn.execute(
+            "INSERT INTO folders (account_id, name, delimiter, role, selectable) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(account_id, name) DO UPDATE SET
+                delimiter = excluded.delimiter,
+                role = excluded.role,
+                selectable = excluded.selectable",
+            params![
+                account_id,
+                f.name,
+                f.delimiter,
+                f.role.map(FolderRole::as_str),
+                f.selectable
+            ],
+        )?;
+    }
+
+    let listed: std::collections::HashSet<&str> = remote.iter().map(|f| f.name.as_str()).collect();
+    let mut stmt = conn.prepare("SELECT id, name FROM folders WHERE account_id = ?1")?;
+    let gone: Vec<i64> = stmt
+        .query_map(params![account_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, name)| !listed.contains(name.as_str()) && name != "INBOX")
+        .map(|(id, _)| id)
+        .collect();
+
+    let mut paths = Vec::new();
+    for id in gone {
+        paths.extend(clear_folder_messages(conn, id)?);
+        conn.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
+    }
+    Ok(paths)
+}
+
+/// Records the server's unread and total message counts for a folder.
+pub fn update_folder_counts(conn: &Connection, folder_id: i64, unseen: u32, total: u32) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET unseen = ?2, total = ?3 WHERE id = ?1",
+        params![folder_id, unseen, total],
+    )?;
+    Ok(())
+}
+
+pub fn update_folder_counts_by_name(
+    conn: &Connection,
+    account_id: i64,
+    name: &str,
+    unseen: u32,
+    total: u32,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE folders SET unseen = ?3, total = ?4 WHERE account_id = ?1 AND name = ?2",
+        params![account_id, name, unseen, total],
     )?;
     Ok(())
 }
@@ -106,12 +225,17 @@ pub fn lower_backfill_floor(conn: &Connection, folder_id: i64, uid: u32) -> Resu
     Ok(())
 }
 
-/// Marks a message read in the cache. Returns whether it was unread
-/// before, i.e. whether anything changed.
-pub fn mark_seen(conn: &Connection, folder_id: i64, uid: u32) -> Result<bool> {
+/// Sets or clears one flag on a cached message. Returns whether that
+/// changed anything (the message is cached and the flag was different).
+pub fn set_flag(conn: &Connection, folder_id: i64, uid: u32, flag: FlagKind, on: bool) -> Result<bool> {
+    let column = match flag {
+        FlagKind::Seen => "seen",
+        FlagKind::Flagged => "flagged",
+        FlagKind::Answered => "answered",
+    };
     let changed = conn.execute(
-        "UPDATE messages SET seen = 1 WHERE folder_id = ?1 AND uid = ?2 AND seen = 0",
-        params![folder_id, uid],
+        &format!("UPDATE messages SET {column} = ?3 WHERE folder_id = ?1 AND uid = ?2 AND {column} != ?3"),
+        params![folder_id, uid, on],
     )?;
     Ok(changed > 0)
 }
@@ -261,6 +385,118 @@ pub fn delete_message(conn: &Connection, folder_id: i64, uid: u32) -> Result<Opt
     Ok(raw_path)
 }
 
+/// A compose session saved for later.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SavedDraft {
+    /// Identifies one compose session's draft across saves: saving again
+    /// under the same key replaces it.
+    pub key: String,
+    pub draft: Draft,
+    /// The frontend's own description of the attached files, opaque to
+    /// mail-core.
+    pub attachments: String,
+    /// The message this draft replies to, as `(folder_id, uid)`, so it
+    /// can be marked answered once the reply goes out.
+    pub answers: Option<(i64, u32)>,
+    /// When it was last saved; filled in by the store.
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+pub fn save_draft(conn: &Connection, account_id: i64, saved: &SavedDraft) -> Result<()> {
+    let d = &saved.draft;
+    conn.execute(
+        "INSERT INTO drafts (account_id, key, to_addrs, cc_addrs, bcc_addrs, subject, body,
+                             in_reply_to, references_hdr, attachments, answers_folder_id, answers_uid, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, strftime('%s','now'))
+         ON CONFLICT(key) DO UPDATE SET
+            to_addrs = excluded.to_addrs,
+            cc_addrs = excluded.cc_addrs,
+            bcc_addrs = excluded.bcc_addrs,
+            subject = excluded.subject,
+            body = excluded.body,
+            in_reply_to = excluded.in_reply_to,
+            references_hdr = excluded.references_hdr,
+            attachments = excluded.attachments,
+            answers_folder_id = excluded.answers_folder_id,
+            answers_uid = excluded.answers_uid,
+            updated_at = excluded.updated_at",
+        params![
+            account_id,
+            saved.key,
+            d.to,
+            d.cc,
+            d.bcc,
+            d.subject,
+            d.body,
+            d.in_reply_to,
+            d.references.join(" "),
+            saved.attachments,
+            saved.answers.map(|(folder_id, _)| folder_id),
+            saved.answers.map(|(_, uid)| uid),
+        ],
+    )?;
+    Ok(())
+}
+
+/// An account's saved drafts, most recently saved first.
+pub fn list_drafts(conn: &Connection, account_id: i64) -> Result<Vec<SavedDraft>> {
+    let mut stmt = conn.prepare(
+        "SELECT key, to_addrs, cc_addrs, bcc_addrs, subject, body, in_reply_to, references_hdr,
+                attachments, answers_folder_id, answers_uid, updated_at
+         FROM drafts WHERE account_id = ?1 AND key IS NOT NULL ORDER BY updated_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map(params![account_id], |row| {
+        let references: String = row.get(7)?;
+        let answers = match (row.get::<_, Option<i64>>(9)?, row.get::<_, Option<i64>>(10)?) {
+            (Some(folder_id), Some(uid)) => Some((folder_id, uid as u32)),
+            _ => None,
+        };
+        Ok(SavedDraft {
+            key: row.get(0)?,
+            draft: Draft {
+                to: row.get(1)?,
+                cc: row.get(2)?,
+                bcc: row.get(3)?,
+                subject: row.get(4)?,
+                body: row.get(5)?,
+                in_reply_to: row.get(6)?,
+                references: references.split_whitespace().map(str::to_string).collect(),
+            },
+            attachments: row.get(8)?,
+            answers,
+            updated_at: row.get::<_, i64>(11).ok().and_then(ts_to_datetime),
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
+pub fn delete_draft(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM drafts WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
+/// How many queued messages an account has: still being retried, and
+/// given up on after `max_attempts` failures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutboxCounts {
+    pub pending: u32,
+    pub failed: u32,
+}
+
+pub fn outbox_counts(conn: &Connection, account_id: i64, max_attempts: i64) -> Result<OutboxCounts> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(attempts < ?2), 0), COALESCE(SUM(attempts >= ?2), 0) FROM outbox WHERE account_id = ?1",
+        params![account_id, max_attempts],
+        |row| {
+            Ok(OutboxCounts {
+                pending: row.get::<_, i64>(0)? as u32,
+                failed: row.get::<_, i64>(1)? as u32,
+            })
+        },
+    )
+    .map_err(Into::into)
+}
+
 pub struct OutboxItem {
     pub id: i64,
     pub raw_mime_path: String,
@@ -326,11 +562,20 @@ pub fn known_senders(conn: &Connection, account_id: i64) -> Result<Vec<Address>>
          WHERE f.account_id = ?1",
     )?;
     let rows = stmt.query_map(params![account_id], |row| row.get::<_, String>(0))?;
+    // Mail in Sent (or a reply to oneself) has the account itself as
+    // sender — never a useful suggestion.
+    let own: Option<String> = conn
+        .query_row("SELECT email FROM accounts WHERE id = ?1", params![account_id], |row| {
+            row.get(0)
+        })
+        .optional()?;
 
     let mut by_email: HashMap<String, Address> = HashMap::new();
     for json in rows {
         for addr in parse_addrs(&json?) {
-            if is_no_reply_address(&addr.email) {
+            if is_no_reply_address(&addr.email)
+                || own.as_deref().is_some_and(|own| own.eq_ignore_ascii_case(&addr.email))
+            {
                 continue;
             }
             let key = addr.email.to_lowercase();
@@ -527,16 +772,147 @@ mod tests {
     }
 
     #[test]
-    fn mark_seen_reports_whether_the_message_was_unread() {
+    fn set_flag_reports_whether_anything_changed() {
         let conn = test_conn();
         let account_id = upsert_account(&conn, "a@example.com", None).unwrap();
         let folder = get_or_create_folder(&conn, account_id, "INBOX").unwrap();
         upsert_envelope(&conn, folder.id, &sample_envelope(1, "x")).unwrap();
 
-        assert!(mark_seen(&conn, folder.id, 1).unwrap());
-        assert!(!mark_seen(&conn, folder.id, 1).unwrap(), "already read");
+        assert!(set_flag(&conn, folder.id, 1, FlagKind::Seen, true).unwrap());
+        assert!(
+            !set_flag(&conn, folder.id, 1, FlagKind::Seen, true).unwrap(),
+            "already read"
+        );
         assert!(list_envelopes(&conn, folder.id, 10).unwrap()[0].flags.seen);
-        assert!(!mark_seen(&conn, folder.id, 999).unwrap(), "missing uid is a no-op");
+        assert!(
+            !set_flag(&conn, folder.id, 999, FlagKind::Seen, true).unwrap(),
+            "missing uid is a no-op"
+        );
+
+        assert!(set_flag(&conn, folder.id, 1, FlagKind::Flagged, true).unwrap());
+        assert!(set_flag(&conn, folder.id, 1, FlagKind::Seen, false).unwrap());
+        let flags = list_envelopes(&conn, folder.id, 10).unwrap()[0].flags;
+        assert!(flags.flagged && !flags.seen && !flags.answered);
+    }
+
+    fn remote(name: &str, role: Option<FolderRole>) -> RemoteFolder {
+        RemoteFolder {
+            name: name.to_string(),
+            delimiter: Some("/".to_string()),
+            role,
+            selectable: true,
+        }
+    }
+
+    #[test]
+    fn replace_folders_adds_updates_and_drops_with_inbox_first() {
+        let conn = test_conn();
+        let account_id = upsert_account(&conn, "a@example.com", None).unwrap();
+        let inbox = get_or_create_folder(&conn, account_id, "INBOX").unwrap();
+        let old = get_or_create_folder(&conn, account_id, "Old").unwrap();
+        upsert_envelope(&conn, old.id, &sample_envelope(3, "in a folder about to vanish")).unwrap();
+        set_message_raw_path(&conn, old.id, 3, "/cache/3.eml").unwrap();
+
+        let paths = replace_folders(
+            &conn,
+            account_id,
+            &[
+                remote("Trash", Some(FolderRole::Trash)),
+                remote("Archive", None),
+                remote("INBOX", Some(FolderRole::Inbox)),
+                remote("Sent", Some(FolderRole::Sent)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(paths, vec!["/cache/3.eml".to_string()]);
+        let names: Vec<String> = list_folders(&conn, account_id)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(names, vec!["INBOX", "Sent", "Trash", "Archive"]);
+        assert_eq!(folder(&conn, inbox.id).unwrap().role, Some(FolderRole::Inbox));
+        assert!(folder(&conn, old.id).is_err(), "gone from the server, gone here");
+        assert_eq!(
+            folder_by_role(&conn, account_id, FolderRole::Trash)
+                .unwrap()
+                .unwrap()
+                .name,
+            "Trash"
+        );
+
+        // An empty listing is a hiccup, not "every folder was deleted".
+        assert!(replace_folders(&conn, account_id, &[]).unwrap().is_empty());
+        assert_eq!(list_folders(&conn, account_id).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn folder_counts_are_stored() {
+        let conn = test_conn();
+        let account_id = upsert_account(&conn, "a@example.com", None).unwrap();
+        let inbox = get_or_create_folder(&conn, account_id, "INBOX").unwrap();
+        update_folder_counts(&conn, inbox.id, 3, 120).unwrap();
+        let f = folder(&conn, inbox.id).unwrap();
+        assert_eq!((f.unseen, f.total), (Some(3), Some(120)));
+        update_folder_counts_by_name(&conn, account_id, "INBOX", 0, 121).unwrap();
+        assert_eq!(folder(&conn, inbox.id).unwrap().unseen, Some(0));
+    }
+
+    fn saved(key: &str, subject: &str) -> SavedDraft {
+        SavedDraft {
+            key: key.to_string(),
+            draft: Draft {
+                to: "bob@example.com".into(),
+                subject: subject.into(),
+                body: "hi".into(),
+                in_reply_to: Some("orig@example.com".into()),
+                references: vec!["root@example.com".into(), "orig@example.com".into()],
+                ..Draft::default()
+            },
+            attachments: "[]".into(),
+            answers: Some((1, 42)),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn drafts_save_under_their_key_and_round_trip() {
+        let conn = test_conn();
+        let account_id = upsert_account(&conn, "a@example.com", None).unwrap();
+
+        save_draft(&conn, account_id, &saved("k1", "first")).unwrap();
+        save_draft(&conn, account_id, &saved("k1", "first, edited")).unwrap();
+        save_draft(&conn, account_id, &saved("k2", "second")).unwrap();
+
+        let drafts = list_drafts(&conn, account_id).unwrap();
+        assert_eq!(drafts.len(), 2, "saving again under a key replaces that draft");
+        let first = drafts.iter().find(|d| d.key == "k1").unwrap();
+        assert_eq!(first.draft.subject, "first, edited");
+        assert_eq!(first.draft.references, saved("k1", "").draft.references);
+        assert_eq!(first.draft.in_reply_to.as_deref(), Some("orig@example.com"));
+        assert_eq!(first.answers, Some((1, 42)));
+        assert!(first.updated_at.is_some());
+
+        delete_draft(&conn, "k1").unwrap();
+        assert_eq!(list_drafts(&conn, account_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn outbox_counts_split_pending_from_given_up() {
+        let conn = test_conn();
+        let account_id = upsert_account(&conn, "a@example.com", None).unwrap();
+        assert_eq!(outbox_counts(&conn, account_id, 3).unwrap(), OutboxCounts::default());
+
+        let a = insert_outbox(&conn, account_id, "/a.eml", &["x@example.com".into()]).unwrap();
+        insert_outbox(&conn, account_id, "/b.eml", &["y@example.com".into()]).unwrap();
+        for _ in 0..3 {
+            record_outbox_failure(&conn, a, "nope").unwrap();
+        }
+        assert_eq!(
+            outbox_counts(&conn, account_id, 3).unwrap(),
+            OutboxCounts { pending: 1, failed: 1 }
+        );
     }
 
     #[test]

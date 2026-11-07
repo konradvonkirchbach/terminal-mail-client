@@ -109,6 +109,14 @@ pub fn log_dir() -> Result<PathBuf> {
     Ok(dirs.state_dir().unwrap_or_else(|| dirs.cache_dir()).join("logs"))
 }
 
+/// Where attachments and HTML bodies are written for another app (via
+/// `xdg-open`) to open: the per-user runtime directory, which lives in
+/// memory and is cleared at logout, or the cache directory without one.
+pub fn open_dir() -> Result<PathBuf> {
+    let dirs = project_dirs()?;
+    Ok(dirs.runtime_dir().unwrap_or_else(|| dirs.cache_dir()).join("open"))
+}
+
 /// Path to the local SQLite cache.
 pub fn db_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("mail.db"))
