@@ -25,7 +25,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             let to = message.to.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
             let date = message
                 .date
-                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_default();
 
             let mut lines = vec![

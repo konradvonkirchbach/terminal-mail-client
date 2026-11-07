@@ -164,7 +164,7 @@ fn envelope_from_fetch(f: &Fetch) -> Option<Envelope> {
             msg.subject().unwrap_or_default().to_string(),
             convert_addresses(msg.from()),
             convert_addresses(msg.to()),
-            msg.date().map(mail_date_to_chrono),
+            msg.date().and_then(mail_date_to_chrono),
         ),
         None => (String::new(), Vec::new(), Vec::new(), None),
     };
@@ -251,7 +251,7 @@ pub(crate) fn message_from_raw(uid: u32, raw: &[u8]) -> Result<Message> {
         subject: parsed.subject().unwrap_or_default().to_string(),
         from: convert_addresses(parsed.from()),
         to: convert_addresses(parsed.to()),
-        date: parsed.date().map(mail_date_to_chrono),
+        date: parsed.date().and_then(mail_date_to_chrono),
         body_text: parsed
             .body_text(0)
             .or_else(|| parsed.body_html(0))
@@ -385,19 +385,16 @@ fn convert_addresses(addr: Option<&mail_parser::Address<'_>>) -> Vec<Address> {
     }
 }
 
-fn mail_date_to_chrono(d: &mail_parser::DateTime) -> chrono::DateTime<chrono::Utc> {
+/// Converts a parsed `Date:` header to a UTC instant, honoring its
+/// timezone offset (`to_timestamp` applies it). An invalid date (out-of-range
+/// fields from a malformed header) yields `None` rather than a stand-in like
+/// "now", which would make a broken old message look brand new.
+fn mail_date_to_chrono(d: &mail_parser::DateTime) -> Option<chrono::DateTime<chrono::Utc>> {
     use chrono::TimeZone;
-    chrono::Utc
-        .with_ymd_and_hms(
-            d.year as i32,
-            d.month as u32,
-            d.day as u32,
-            d.hour as u32,
-            d.minute as u32,
-            d.second as u32,
-        )
-        .single()
-        .unwrap_or_else(chrono::Utc::now)
+    if !d.is_valid() {
+        return None;
+    }
+    chrono::Utc.timestamp_opt(d.to_timestamp(), 0).single()
 }
 
 #[cfg(test)]
@@ -443,6 +440,47 @@ mod tests {
         assert!(msg.body_text.contains("Hello, world!"));
         assert!(msg.attachments.is_empty());
         assert!(msg.date.is_some());
+    }
+
+    #[test]
+    fn message_from_raw_applies_the_date_headers_timezone_offset() {
+        let raw = b"From: a@example.com\r\n\
+                    Subject: tz\r\n\
+                    Date: Mon, 1 Jan 2024 14:00:00 +0200\r\n\
+                    \r\n\
+                    body"
+            .to_vec();
+        let msg = message_from_raw(1, &raw).unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339("2024-01-01T12:00:00Z").unwrap();
+        assert_eq!(msg.date.unwrap(), expected, "14:00 at +0200 is 12:00 UTC");
+    }
+
+    #[test]
+    fn message_from_raw_applies_a_negative_timezone_offset() {
+        let raw = b"From: a@example.com\r\n\
+                    Date: Mon, 1 Jan 2024 07:30:00 -0500\r\n\
+                    \r\n\
+                    body"
+            .to_vec();
+        let msg = message_from_raw(1, &raw).unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339("2024-01-01T12:30:00Z").unwrap();
+        assert_eq!(msg.date.unwrap(), expected);
+    }
+
+    #[test]
+    fn an_invalid_date_is_none_rather_than_now() {
+        let invalid = mail_parser::DateTime {
+            year: 2024,
+            month: 13,
+            day: 40,
+            hour: 25,
+            minute: 0,
+            second: 0,
+            tz_before_gmt: false,
+            tz_hour: 0,
+            tz_minute: 0,
+        };
+        assert_eq!(mail_date_to_chrono(&invalid), None);
     }
 
     fn multipart_message_with_attachment(disposition_and_filename: &str) -> Vec<u8> {

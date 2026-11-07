@@ -48,7 +48,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 .unwrap_or_else(|| "(unknown)".to_string());
             let date = env
                 .date
-                .map(|d| d.format("%m-%d %H:%M").to_string())
+                .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
                 .unwrap_or_default();
 
             let flag_color = if env.flags.seen { theme.muted } else { theme.accent };
