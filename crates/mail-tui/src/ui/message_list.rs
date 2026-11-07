@@ -9,13 +9,17 @@ use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let visible = app.visible_indices();
-    let title = match &app.list_state {
-        AppListState::Loading => " inbox (loading...) ".to_string(),
-        AppListState::Loaded if app.search.is_some() => {
-            format!(" inbox ({}/{} match) ", visible.len(), app.envelopes.len())
-        }
-        AppListState::Loaded => " inbox ".to_string(),
-        AppListState::Error(_) => " inbox (error) ".to_string(),
+    let status = match &app.list_state {
+        AppListState::Loading => " (loading...)",
+        // A failed sync leaves whatever's cached on screen — the title is
+        // the persistent hint that it may be stale (the full error went to
+        // the status bar when it happened).
+        AppListState::Error(_) => " (offline)",
+        AppListState::Loaded => "",
+    };
+    let title = match app.search() {
+        Some(_) => format!(" inbox{status} ({}/{} match) ", visible.len(), app.envelopes().len()),
+        None => format!(" inbox{status} "),
     };
 
     let block = Block::new()
@@ -25,7 +29,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .style(Style::new().bg(theme.background).fg(theme.foreground))
         .title(Span::styled(title, Style::new().fg(theme.bright_foreground)));
 
-    if let AppListState::Error(msg) = &app.list_state {
+    // Only when there's nothing cached to show does the error take over
+    // the pane — otherwise offline reading of the cache must keep working.
+    if let (AppListState::Error(msg), true) = (&app.list_state, app.envelopes().is_empty()) {
         // A List doesn't wrap long items — it just clips them at the pane
         // edge, which for a real IMAP error (often a whole server response
         // line) hides the one detail that explains what went wrong. Use a
@@ -38,7 +44,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     let items: Vec<ListItem> = visible
         .iter()
-        .filter_map(|&i| app.envelopes.get(i))
+        .filter_map(|&i| app.envelopes().get(i))
         .map(|env| {
             let flag = if env.flags.seen { " " } else { "*" };
             let from = env

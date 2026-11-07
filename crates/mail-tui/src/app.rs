@@ -43,7 +43,11 @@ pub enum BrowserPurpose {
 
 pub enum BodyState {
     Empty,
-    Loading,
+    /// A fetch for `uid` is in flight — its result is applied only while
+    /// this is still the pending request (see `App::finish_body`).
+    Loading {
+        uid: u32,
+    },
     Loaded(Message),
     Error(String),
 }
@@ -357,24 +361,39 @@ pub struct App {
     pub account_emails: Vec<String>,
     pub current_account: usize,
     pub list_state: ListState,
-    pub envelopes: Vec<Envelope>,
+    /// The current account's cached envelopes, newest first. Private so
+    /// every change goes through a method that keeps `visible` and
+    /// `selected` consistent with it — see `replace_envelopes`.
+    envelopes: Vec<Envelope>,
+    /// Index into `visible` (not into `envelopes`): the highlighted row.
     pub selected: usize,
     pub body: BodyState,
+    /// How many lines the reading pane is scrolled down. Reset whenever a
+    /// different message is opened.
+    pub body_scroll: u16,
     /// Which of the open message's attachments is highlighted for
     /// download — reset to 0 whenever a new message body loads.
     pub selected_attachment: usize,
     pub compose: Option<ComposeState>,
     /// The address book fuzzy-matched against while typing a recipient in
     /// compose: every sender the current account has received mail from,
-    /// minus no-reply senders. Loaded asynchronously (see `main.rs`'s
+    /// minus no-reply senders. Loaded asynchronously (see `bg.rs`'s
     /// `spawn_known_senders`), so it may briefly be empty right after
     /// startup or an account switch.
     pub known_senders: Vec<Address>,
     pub status_message: Option<(String, Instant)>,
     /// `Some` whenever a filter is showing (being edited or confirmed).
-    /// An empty query is equivalent to no filter.
-    pub search: Option<TextInput>,
+    /// An empty query is equivalent to no filter. Private for the same
+    /// reason as `envelopes`: editing it must refresh `visible`.
+    search: Option<TextInput>,
     pub search_editing: bool,
+    /// Indices into `envelopes` that match the active search, in display
+    /// order. Cached rather than recomputed on demand — with up to
+    /// `DISPLAY_LIMIT` envelopes and a filter active, recomputing means
+    /// lowercasing thousands of subjects, several times per key and
+    /// frame. Refreshed by every method that changes `envelopes` or
+    /// `search`.
+    visible: Vec<usize>,
     /// A modal directory browser, open either from compose (attach) or
     /// the reading pane (save an attachment). Rendered as one overlay
     /// regardless of which triggered it.
@@ -408,12 +427,14 @@ impl App {
             envelopes: Vec::new(),
             selected: 0,
             body: BodyState::Empty,
+            body_scroll: 0,
             selected_attachment: 0,
             compose: None,
             known_senders: Vec::new(),
             status_message: None,
             search: None,
             search_editing: false,
+            visible: Vec::new(),
             file_browser: None,
             has_more_older: true,
             loading_more: false,
@@ -439,6 +460,7 @@ impl App {
         self.selected = 0;
         self.selected_attachment = 0;
         self.body = BodyState::Empty;
+        self.body_scroll = 0;
         self.list_state = ListState::Loading;
         self.clear_search();
         self.has_more_older = true;
@@ -462,14 +484,22 @@ impl App {
         }
     }
 
-    /// Indices into `envelopes` that match the active search query, in
-    /// display order — all of them when there's no query. Recomputed on
-    /// demand rather than cached: the envelope list is small (bounded by
-    /// `fetch_limit`), so this stays cheap enough to call every frame.
-    pub fn visible_indices(&self) -> Vec<usize> {
-        match &self.search {
-            Some(q) if !q.value.trim().is_empty() => {
-                let needle = q.value.to_lowercase();
+    // -- envelope list ------------------------------------------------------
+
+    pub fn envelopes(&self) -> &[Envelope] {
+        &self.envelopes
+    }
+
+    /// Indices into `envelopes()` that match the active search query, in
+    /// display order — all of them when there's no query.
+    pub fn visible_indices(&self) -> &[usize] {
+        &self.visible
+    }
+
+    fn recompute_visible(&mut self) {
+        self.visible = match self.search_query() {
+            Some(query) => {
+                let needle = query.to_lowercase();
                 self.envelopes
                     .iter()
                     .enumerate()
@@ -477,16 +507,100 @@ impl App {
                     .map(|(i, _)| i)
                     .collect()
             }
-            _ => (0..self.envelopes.len()).collect(),
+            None => (0..self.envelopes.len()).collect(),
+        };
+    }
+
+    /// Swaps in a freshly read envelope list (a sync, a cache re-read after
+    /// new mail or a backfill, ...) while keeping the cursor on the same
+    /// *message* rather than the same row index — new mail lands at the
+    /// top, so an unchanged index would silently point `r`/`Enter` at a
+    /// different message. Falls back to the same row (clamped) if the
+    /// selected message is gone.
+    pub fn replace_envelopes(&mut self, envelopes: Vec<Envelope>) {
+        let selected_uid = self.selected_uid();
+        self.envelopes = envelopes;
+        self.recompute_visible();
+        self.reselect(selected_uid);
+    }
+
+    /// Adds server-side search results that aren't already in the list,
+    /// keeping it newest-first and the selection on the same message.
+    /// Returns how many were actually new.
+    pub fn merge_envelopes(&mut self, extra: Vec<Envelope>) -> usize {
+        let existing: std::collections::HashSet<u32> = self.envelopes.iter().map(|e| e.uid).collect();
+        let new: Vec<Envelope> = extra.into_iter().filter(|e| !existing.contains(&e.uid)).collect();
+        let added = new.len();
+        if added > 0 {
+            let selected_uid = self.selected_uid();
+            self.envelopes.extend(new);
+            self.envelopes.sort_by_key(|e| std::cmp::Reverse(e.uid));
+            self.recompute_visible();
+            self.reselect(selected_uid);
+        }
+        added
+    }
+
+    /// Drops a deleted message from view and keeps `selected` in bounds,
+    /// clearing the reading pane too if that's the message it was showing.
+    pub fn remove_envelope(&mut self, uid: u32) {
+        self.envelopes.retain(|e| e.uid != uid);
+        self.recompute_visible();
+        self.clamp_selection();
+
+        if self.body_uid() == Some(uid) {
+            self.body = BodyState::Empty;
         }
     }
 
+    /// Puts the cursor back on `uid` if it's still visible, otherwise
+    /// keeps the current row (clamped to the new list's bounds).
+    fn reselect(&mut self, uid: Option<u32>) {
+        let found = uid.and_then(|uid| self.visible.iter().position(|&i| self.envelopes[i].uid == uid));
+        match found {
+            Some(row) => self.selected = row,
+            None => self.clamp_selection(),
+        }
+    }
+
+    fn clamp_selection(&mut self) {
+        self.selected = self.selected.min(self.visible.len().saturating_sub(1));
+    }
+
+    /// Applies a finished sync's freshly re-read list. A failure leaves the
+    /// cached list in place (offline reading must keep working) and only
+    /// records the error for the title and status bar.
+    pub fn apply_sync_result(&mut self, result: Result<Vec<Envelope>, String>) {
+        match result {
+            Ok(envelopes) => {
+                self.replace_envelopes(envelopes);
+                self.list_state = ListState::Loaded;
+            }
+            Err(e) => {
+                self.set_status(format!("Sync failed: {e}"));
+                self.list_state = ListState::Error(e);
+            }
+        }
+    }
+
+    /// Applies a plain cache re-read (account switch, new mail, a backfill).
+    /// Only ever upgrades `Loading` to `Loaded` — it isn't evidence that a
+    /// previously failed sync has recovered.
+    pub fn apply_cached_envelopes(&mut self, envelopes: Vec<Envelope>) {
+        let empty = envelopes.is_empty();
+        self.replace_envelopes(envelopes);
+        if !empty && matches!(self.list_state, ListState::Loading) {
+            self.list_state = ListState::Loaded;
+        }
+    }
+
+    // -- selection ------------------------------------------------------------
+
     pub fn select_next(&mut self) {
-        let visible = self.visible_indices();
-        if visible.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
-        self.selected = (self.selected + 1).min(visible.len() - 1);
+        self.selected = (self.selected + 1).min(self.visible.len() - 1);
     }
 
     /// Whether the selection is on the last visible row — the trigger
@@ -495,8 +609,7 @@ impl App {
     /// active, since "end of the filtered results" isn't the same thing
     /// as "end of what's cached".
     pub fn is_at_end_of_list(&self) -> bool {
-        let visible_len = self.visible_indices().len();
-        visible_len > 0 && self.selected + 1 >= visible_len
+        !self.visible.is_empty() && self.selected + 1 >= self.visible.len()
     }
 
     pub fn select_prev(&mut self) {
@@ -510,18 +623,16 @@ impl App {
 
     /// Vim-style `G` — jump to the last visible row.
     pub fn select_bottom(&mut self) {
-        let visible_len = self.visible_indices().len();
-        self.selected = visible_len.saturating_sub(1);
+        self.selected = self.visible.len().saturating_sub(1);
     }
 
     /// Vim-style `Ctrl-d` — jump `PAGE_JUMP` rows down, clamped to the
     /// last visible row.
     pub fn select_page_down(&mut self) {
-        let visible = self.visible_indices();
-        if visible.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
-        self.selected = (self.selected + PAGE_JUMP).min(visible.len() - 1);
+        self.selected = (self.selected + PAGE_JUMP).min(self.visible.len() - 1);
     }
 
     /// Vim-style `Ctrl-u` — jump `PAGE_JUMP` rows up, clamped to the top.
@@ -534,30 +645,71 @@ impl App {
     }
 
     pub fn selected_envelope(&self) -> Option<&Envelope> {
-        let visible = self.visible_indices();
-        visible.get(self.selected).and_then(|&i| self.envelopes.get(i))
+        self.visible.get(self.selected).and_then(|&i| self.envelopes.get(i))
+    }
+
+    // -- reading pane -----------------------------------------------------------
+
+    /// The message the reading pane is showing or fetching, if any.
+    pub fn body_uid(&self) -> Option<u32> {
+        match &self.body {
+            BodyState::Loading { uid } => Some(*uid),
+            BodyState::Loaded(message) => Some(message.uid),
+            BodyState::Empty | BodyState::Error(_) => None,
+        }
+    }
+
+    pub fn start_loading_body(&mut self, uid: u32) {
+        self.body = BodyState::Loading { uid };
+        self.body_scroll = 0;
+    }
+
+    /// Applies a finished body fetch — but only if it's the one the reading
+    /// pane is still waiting for. Keyed on the *requested* uid rather than
+    /// the current selection: moving the cursor while a fetch is in flight
+    /// used to drop the result and leave "Loading..." up forever.
+    pub fn finish_body(&mut self, uid: u32, result: Result<Message, String>) {
+        if !matches!(self.body, BodyState::Loading { uid: pending } if pending == uid) {
+            return;
+        }
+        match result {
+            Ok(message) => {
+                self.selected_attachment = 0;
+                self.body = BodyState::Loaded(message);
+            }
+            Err(e) => self.body = BodyState::Error(e),
+        }
+    }
+
+    // -- search ---------------------------------------------------------------
+
+    pub fn search(&self) -> Option<&TextInput> {
+        self.search.as_ref()
+    }
+
+    /// The active filter, trimmed — `None` when there's no search or it's
+    /// blank (which filters nothing).
+    pub fn search_query(&self) -> Option<&str> {
+        self.search.as_ref().map(|s| s.value.trim()).filter(|q| !q.is_empty())
     }
 
     pub fn start_search(&mut self) {
         self.search = Some(TextInput::default());
         self.search_editing = true;
         self.selected = 0;
+        self.recompute_visible();
     }
 
-    /// Drops a deleted message from view and keeps `selected` in bounds,
-    /// clearing the reading pane too if that's the message it was showing.
-    pub fn remove_envelope(&mut self, uid: u32) {
-        self.envelopes.retain(|e| e.uid != uid);
-
-        let visible_len = self.visible_indices().len();
-        if self.selected >= visible_len {
-            self.selected = visible_len.saturating_sub(1);
-        }
-
-        if let BodyState::Loaded(message) = &self.body {
-            if message.uid == uid {
-                self.body = BodyState::Empty;
-            }
+    /// Applies an edit to the search field, refreshing the filter and
+    /// jumping back to the first match if the query actually changed (a
+    /// cursor move within the field leaves the selection alone).
+    pub fn edit_search(&mut self, op: impl FnOnce(&mut TextInput)) {
+        let Some(search) = &mut self.search else { return };
+        let before = search.value.clone();
+        op(search);
+        if search.value != before {
+            self.selected = 0;
+            self.recompute_visible();
         }
     }
 
@@ -565,6 +717,15 @@ impl App {
         self.search = None;
         self.search_editing = false;
         self.selected = 0;
+        self.recompute_visible();
+    }
+
+    /// Sets the filter outright — the test-side counterpart of typing it.
+    #[cfg(test)]
+    pub fn set_search_query(&mut self, query: &str) {
+        self.search = Some(TextInput::with_value(query));
+        self.recompute_visible();
+        self.clamp_selection();
     }
 }
 
@@ -644,7 +805,7 @@ mod tests {
 
     fn app_with(envelopes: Vec<Envelope>) -> App {
         let mut app = App::new(vec!["me@example.com".to_string()]);
-        app.envelopes = envelopes;
+        app.replace_envelopes(envelopes);
         app
     }
 
@@ -669,24 +830,24 @@ mod tests {
     #[test]
     fn visible_indices_filters_by_subject_case_insensitively() {
         let mut app = sample_app();
-        app.search = Some(TextInput::with_value("invoice".to_string()));
+        app.set_search_query("invoice");
         assert_eq!(app.visible_indices(), vec![2]);
     }
 
     #[test]
     fn visible_indices_filters_by_sender_name_or_email() {
         let mut app = sample_app();
-        app.search = Some(TextInput::with_value("alice".to_string()));
+        app.set_search_query("alice");
         assert_eq!(app.visible_indices(), vec![1]);
 
-        app.search = Some(TextInput::with_value("bob@example.com".to_string()));
+        app.set_search_query("bob@example.com");
         assert_eq!(app.visible_indices(), vec![3]);
     }
 
     #[test]
     fn visible_indices_treats_blank_or_whitespace_query_as_no_filter() {
         let mut app = sample_app();
-        app.search = Some(TextInput::with_value("   ".to_string()));
+        app.set_search_query("   ");
         assert_eq!(app.visible_indices(), vec![0, 1, 2, 3, 4]);
     }
 
@@ -767,16 +928,16 @@ mod tests {
     #[test]
     fn selected_uid_maps_through_the_active_filter() {
         let mut app = sample_app();
-        app.search = Some(TextInput::with_value("a".to_string())); // matches several
+        app.set_search_query("a"); // matches several
         let visible = app.visible_indices();
         assert!(!visible.is_empty());
-        assert_eq!(app.selected_uid(), Some(app.envelopes[visible[0]].uid));
+        assert_eq!(app.selected_uid(), Some(app.envelopes()[visible[0]].uid));
     }
 
     #[test]
     fn selected_uid_is_none_when_filter_matches_nothing() {
         let mut app = sample_app();
-        app.search = Some(TextInput::with_value("zzz_no_match".to_string()));
+        app.set_search_query("zzz_no_match");
         assert_eq!(app.selected_uid(), None);
     }
 
@@ -788,8 +949,8 @@ mod tests {
         app.selected = 4; // last row (uid 1)
         app.remove_envelope(1);
 
-        assert_eq!(app.envelopes.len(), 4);
-        assert!(app.envelopes.iter().all(|e| e.uid != 1));
+        assert_eq!(app.envelopes().len(), 4);
+        assert!(app.envelopes().iter().all(|e| e.uid != 1));
         assert_eq!(app.selected, 3, "selection must move back onto the new last row");
     }
 
@@ -829,6 +990,168 @@ mod tests {
         assert!(matches!(app.body, BodyState::Loaded(_)));
     }
 
+    // -- replace_envelopes / merge_envelopes keep the selection by uid ---------
+
+    fn message(uid: u32) -> Message {
+        Message {
+            uid,
+            subject: String::new(),
+            from: Vec::new(),
+            to: Vec::new(),
+            date: None,
+            body_text: String::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn new_mail_arriving_at_the_top_keeps_the_cursor_on_the_same_message() {
+        let mut app = sample_app();
+        app.selected = 2; // uid 3
+        let mut refreshed = vec![
+            env(7, "Newer", "X", "x@example.com"),
+            env(6, "New", "Y", "y@example.com"),
+        ];
+        refreshed.extend(app.envelopes().to_vec());
+
+        app.replace_envelopes(refreshed);
+
+        assert_eq!(
+            app.selected_uid(),
+            Some(3),
+            "the cursor must follow the message, not the row index"
+        );
+        assert_eq!(app.selected, 4);
+    }
+
+    #[test]
+    fn replace_envelopes_maps_the_selection_through_an_active_filter() {
+        let mut app = sample_app();
+        app.set_search_query("o"); // matches several, in list order
+        let target = app.visible_indices()[1];
+        let target_uid = app.envelopes()[target].uid;
+        app.selected = 1;
+
+        let mut refreshed = vec![env(9, "Something new", "Bob", "bob@example.com")];
+        refreshed.extend(app.envelopes().to_vec());
+        app.replace_envelopes(refreshed);
+
+        assert_eq!(
+            app.selected_uid(),
+            Some(target_uid),
+            "the selection is a row in the *filtered* list and must stay on the same message"
+        );
+    }
+
+    #[test]
+    fn replace_envelopes_clamps_when_the_selected_message_disappeared() {
+        let mut app = sample_app();
+        app.selected = 4; // uid 1, last row
+        app.replace_envelopes(app.envelopes()[..3].to_vec());
+        assert_eq!(app.selected, 2, "falls back to the nearest remaining row");
+    }
+
+    #[test]
+    fn merge_envelopes_adds_only_new_uids_sorted_and_keeps_the_selection() {
+        let mut app = sample_app();
+        app.selected = 1; // uid 4
+        let added = app.merge_envelopes(vec![
+            env(4, "Re: project plan", "Alice", "alice@example.com"), // already there
+            env(10, "Older?", "Zed", "zed@example.com"),
+        ]);
+
+        assert_eq!(added, 1);
+        let uids: Vec<u32> = app.envelopes().iter().map(|e| e.uid).collect();
+        assert_eq!(uids, vec![10, 5, 4, 3, 2, 1]);
+        assert_eq!(app.selected_uid(), Some(4));
+    }
+
+    // -- sync results ---------------------------------------------------------
+
+    #[test]
+    fn a_failed_sync_keeps_the_cached_list_and_reports_the_error() {
+        let mut app = sample_app();
+        app.list_state = ListState::Loaded;
+
+        app.apply_sync_result(Err("connection refused".to_string()));
+
+        assert_eq!(
+            app.envelopes().len(),
+            5,
+            "offline reading of the cache must keep working"
+        );
+        assert!(matches!(app.list_state, ListState::Error(_)));
+        assert!(app.status_message.as_ref().unwrap().0.contains("connection refused"));
+    }
+
+    #[test]
+    fn a_cache_reread_does_not_clear_a_sync_error() {
+        let mut app = sample_app();
+        app.apply_sync_result(Err("offline".to_string()));
+        app.apply_cached_envelopes(app.envelopes().to_vec());
+        assert!(matches!(app.list_state, ListState::Error(_)));
+    }
+
+    #[test]
+    fn a_nonempty_cache_read_upgrades_loading_to_loaded() {
+        let mut app = App::new(vec!["me@example.com".to_string()]);
+        app.apply_cached_envelopes(Vec::new());
+        assert!(
+            matches!(app.list_state, ListState::Loading),
+            "an empty cache still waits for the sync"
+        );
+        app.apply_cached_envelopes(vec![env(1, "Hi", "A", "a@example.com")]);
+        assert!(matches!(app.list_state, ListState::Loaded));
+    }
+
+    // -- body fetch results -----------------------------------------------------
+
+    #[test]
+    fn a_body_result_still_lands_after_the_selection_moved_on() {
+        let mut app = sample_app();
+        app.start_loading_body(5);
+        app.select_next(); // cursor moves away while the fetch is in flight
+
+        app.finish_body(5, Ok(message(5)));
+
+        assert!(matches!(&app.body, BodyState::Loaded(m) if m.uid == 5));
+    }
+
+    #[test]
+    fn a_stale_body_result_for_an_older_request_is_ignored() {
+        let mut app = sample_app();
+        app.start_loading_body(5);
+        app.start_loading_body(4); // the user opened another message meanwhile
+
+        app.finish_body(5, Ok(message(5)));
+        assert!(matches!(app.body, BodyState::Loading { uid: 4 }));
+
+        app.finish_body(4, Err("boom".to_string()));
+        assert!(matches!(&app.body, BodyState::Error(e) if e == "boom"));
+    }
+
+    #[test]
+    fn removing_the_message_being_loaded_clears_the_reading_pane() {
+        let mut app = sample_app();
+        app.start_loading_body(3);
+        app.remove_envelope(3);
+        assert!(matches!(app.body, BodyState::Empty));
+    }
+
+    #[test]
+    fn editing_the_search_refilters_and_a_cursor_move_keeps_the_selection() {
+        let mut app = sample_app();
+        app.start_search();
+        app.selected = 3;
+        app.edit_search(|s| s.insert('b'));
+        assert_eq!(app.selected, 0, "a changed query jumps back to the first match");
+        assert!(app.visible_indices().len() < 5);
+
+        app.selected = 1;
+        app.edit_search(TextInput::left);
+        assert_eq!(app.selected, 1, "moving within the field doesn't change the query");
+    }
+
     // -- search lifecycle -----------------------------------------------------
 
     #[test]
@@ -838,20 +1161,20 @@ mod tests {
         app.start_search();
 
         assert!(app.search_editing);
-        assert_eq!(app.search.as_ref().unwrap().value, "");
+        assert_eq!(app.search().unwrap().value, "");
         assert_eq!(app.selected, 0);
     }
 
     #[test]
     fn clear_search_removes_the_filter_and_resets_selection() {
         let mut app = sample_app();
-        app.search = Some(TextInput::with_value("invoice".to_string()));
+        app.set_search_query("invoice");
         app.search_editing = true;
         app.selected = 0;
 
         app.clear_search();
 
-        assert!(app.search.is_none());
+        assert!(app.search().is_none());
         assert!(!app.search_editing);
         assert_eq!(app.visible_indices().len(), 5);
     }
@@ -889,7 +1212,7 @@ mod tests {
     fn reset_for_account_switch_clears_everything_specific_to_the_previous_account() {
         let mut app = sample_app();
         app.selected = 3;
-        app.search = Some(TextInput::with_value("x".to_string()));
+        app.set_search_query("x");
         app.has_more_older = false;
         app.loading_more = true;
         app.pending_g = true;
@@ -909,11 +1232,11 @@ mod tests {
 
         app.reset_for_account_switch();
 
-        assert!(app.envelopes.is_empty());
+        assert!(app.envelopes().is_empty());
         assert_eq!(app.selected, 0);
         assert!(matches!(app.body, BodyState::Empty));
         assert!(matches!(app.list_state, ListState::Loading));
-        assert!(app.search.is_none());
+        assert!(app.search().is_none());
         assert!(app.has_more_older);
         assert!(!app.loading_more);
         assert!(!app.pending_g);

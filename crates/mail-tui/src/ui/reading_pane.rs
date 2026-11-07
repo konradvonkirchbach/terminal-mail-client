@@ -18,7 +18,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     let text = match &app.body {
         BodyState::Empty => Text::from("Select a message and press Enter to read it."),
-        BodyState::Loading => Text::from("Loading..."),
+        BodyState::Loading { .. } => Text::from("Loading..."),
         BodyState::Error(msg) => Text::from(Span::styled(msg.clone(), Style::new().fg(theme.red))),
         BodyState::Loaded(message) => {
             let from = message.from.first().map(|a| a.to_string()).unwrap_or_default();

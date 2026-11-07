@@ -33,7 +33,7 @@ fn draw_base(frame: &mut Frame, app: &App, theme: &Theme) {
         return;
     }
 
-    let search_bar_height = if app.search.is_some() { 1 } else { 0 };
+    let search_bar_height = if app.search().is_some() { 1 } else { 0 };
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -55,7 +55,7 @@ fn draw_base(frame: &mut Frame, app: &App, theme: &Theme) {
     sidebar::draw(frame, columns[0], app, theme);
     message_list::draw(frame, columns[1], app, theme);
     reading_pane::draw(frame, columns[2], app, theme);
-    if let Some(search) = &app.search {
+    if let Some(search) = app.search() {
         search_bar::draw(frame, root[1], search, app.search_editing, theme);
     }
     statusline::draw(frame, root[2], app, theme);

@@ -8,7 +8,7 @@ use crate::app::App;
 use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let count = app.envelopes.len();
+    let count = app.envelopes().len();
     let hints = if app.account_emails.len() > 1 {
         "j/k move  gg/G top/bottom  Ctrl-d/u page  / find  Enter read  d delete  a download  c compose  r reply  S sync  Tab switch  D set default  q quit"
     } else {
