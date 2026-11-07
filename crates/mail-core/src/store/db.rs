@@ -55,11 +55,11 @@ impl Store {
                     job(&mut conn);
                 }
             })
-            .map_err(|e| Error::Config(format!("failed to spawn store thread: {e}")))?;
+            .map_err(|e| Error::Store(format!("failed to spawn store thread: {e}")))?;
 
         ready_rx
             .recv()
-            .map_err(|_| Error::Config("store thread exited during init".into()))??;
+            .map_err(|_| Error::Store("store thread exited during init".into()))??;
 
         Ok(Self { tx })
     }
@@ -82,10 +82,10 @@ impl Store {
         });
         self.tx
             .send(job)
-            .map_err(|_| Error::Config("store thread is no longer running".into()))?;
+            .map_err(|_| Error::Store("store thread is no longer running".into()))?;
         resp_rx
             .await
-            .map_err(|_| Error::Config("store thread dropped the response".into()))?
+            .map_err(|_| Error::Store("store thread dropped the response".into()))?
     }
 }
 

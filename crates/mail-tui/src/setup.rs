@@ -172,6 +172,7 @@ fn pick_account(accounts: &[AccountConfig], verb: &str) -> anyhow::Result<usize>
 
 fn prompt_account_details() -> anyhow::Result<(AccountConfig, String)> {
     let email = prompt("Email address")?;
+    let display_name = prompt("Your name, as recipients should see it (optional)")?;
     let imap_host = prompt("IMAP host (e.g. imap.gmail.com)")?;
     let imap_port = prompt_with_default("IMAP port", "993")?.parse().unwrap_or(993);
     let smtp_host = prompt("SMTP host (e.g. smtp.gmail.com)")?;
@@ -180,7 +181,7 @@ fn prompt_account_details() -> anyhow::Result<(AccountConfig, String)> {
 
     let account_config = AccountConfig {
         email,
-        display_name: None,
+        display_name: (!display_name.is_empty()).then_some(display_name),
         imap_host,
         imap_port,
         smtp_host,

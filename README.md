@@ -113,6 +113,10 @@ You'll need your IMAP/SMTP host and port (e.g. `imap.gmail.com` / 993 and
 enabled require an **app password** rather than your normal one — Gmail,
 Yahoo, and most others generate these under Account Security settings.
 
+The name shown to recipients comes from `display_name` in
+`~/.config/email_client/config.toml` (the wizard asks for it; add it by
+hand to an existing account to set one).
+
 Add more accounts later:
 
 ```sh

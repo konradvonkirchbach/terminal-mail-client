@@ -150,7 +150,7 @@ pub fn apply(app: &mut App, session: &mut Session, msg: BgMsg) {
             app.compose = None;
             app.set_status(match outcome {
                 SendOutcome::Sent => "Sent.".to_string(),
-                SendOutcome::Queued => "Offline — queued, will retry.".to_string(),
+                SendOutcome::Queued => "Offline — queued, will retry after the next sync.".to_string(),
             });
         }
         BgMsg::SendDone(Err(e)) => {
@@ -288,6 +288,9 @@ pub fn spawn_sync(ctx: AccountCtx, tx: mpsc::Sender<BgMsg>) {
         tx,
         async move {
             mail_core::sync::sync_inbox(&ctx.account, &ctx.store).await?;
+            // Reachable again: retry anything queued while offline, without
+            // holding up the list refresh.
+            spawn_flush_outbox(ctx.clone());
             ctx.store.list_envelopes(ctx.folder_id, DISPLAY_LIMIT).await
         },
         move |result| BgMsg::SyncDone { account_id, result },

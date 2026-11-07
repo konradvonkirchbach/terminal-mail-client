@@ -156,7 +156,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, account
         spellcheck: spellcheck_handle,
     };
 
-    // Every account gets synced (and its outbox flushed) concurrently at
+    // Every account gets synced (which also flushes its outbox) concurrently at
     // startup, not just whichever is currently shown — so switching to
     // one later is likely to already have fresh data waiting in the
     // cache instead of starting cold. Each also gets its own persistent
@@ -164,7 +164,6 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, account
     // on the next manual/account-switch sync.
     for account in &session.accounts.list {
         bg::spawn_sync(account.clone(), session.tx.clone());
-        bg::spawn_flush_outbox(account.clone());
         tokio::spawn(mail_core::idle::run(
             account.account.clone(),
             account.store.clone(),

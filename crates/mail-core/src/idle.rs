@@ -9,6 +9,7 @@ use crate::account::Account;
 use crate::error::{Error, Result};
 use crate::events::AppEvent;
 use crate::imap::client;
+use crate::send;
 use crate::store::Store;
 use crate::sync;
 
@@ -45,6 +46,15 @@ async fn run_once(account: &Account, store: &Store, events: &UnboundedSender<App
         session = handle.done().await.map_err(|e| Error::Imap(e.to_string()))?;
 
         let outcome = sync::sync_inbox(account, store).await?;
+        // The server is reachable again, so this is a good moment to retry
+        // anything queued while it wasn't. In the background: a slow SMTP
+        // server mustn't delay push updates.
+        let (flush_account, flush_store, account_id) = (account.clone(), store.clone(), outcome.account_id);
+        tokio::spawn(async move {
+            if let Err(e) = send::flush_outbox(&flush_account, &flush_store, account_id).await {
+                tracing::warn!("outbox flush failed: {e}");
+            }
+        });
         let _ = events.send(AppEvent::NewMail {
             account_id: outcome.account_id,
             folder_id: outcome.folder_id,

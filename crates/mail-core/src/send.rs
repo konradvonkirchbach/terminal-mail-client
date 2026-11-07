@@ -1,10 +1,12 @@
 //! Orchestrates sending: builds the MIME message, sends it over SMTP,
 //! best-effort files a copy in Sent, and — if SMTP itself is unreachable —
-//! queues the message in the local outbox instead of losing it.
+//! queues the message in the local outbox instead of losing it. A failure
+//! a retry can't fix (bad credentials, a rejected recipient) is returned
+//! to the caller instead of queued.
 
 use crate::account::Account;
 use crate::config;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::imap::client as imap_client;
 use crate::smtp::{self, AttachmentFile, Draft};
 use crate::store::Store;
@@ -33,11 +35,25 @@ pub async fn send_message(
             }
             Ok(SendOutcome::Sent)
         }
-        Err(e) => {
+        Err(e) if should_queue(&e) => {
             tracing::warn!("SMTP send failed, queuing to outbox: {e}");
             queue_outbox(store, account_id, &raw, &recipients).await?;
             Ok(SendOutcome::Queued)
         }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a send failure is worth queuing for a later retry: anything
+/// network-shaped (connection refused, timeouts, TLS hiccups, a 4xx
+/// "try again later") is; a server's permanent 5xx rejection, an invalid
+/// address, or a missing password isn't — those need the user, so
+/// queuing would just hide them behind "Offline — queued".
+fn should_queue(e: &Error) -> bool {
+    match e {
+        Error::Smtp { permanent, .. } => !permanent,
+        Error::Io(_) => true,
+        _ => false,
     }
 }
 
@@ -54,13 +70,27 @@ async fn queue_outbox(store: &Store, account_id: i64, raw: &[u8], recipients: &[
     Ok(())
 }
 
+/// After this many failed attempts a queued message is left alone (still
+/// on disk and in the outbox table, for inspection) instead of being
+/// retried on every sync forever.
+const MAX_OUTBOX_ATTEMPTS: i64 = 10;
+
+/// Serializes outbox flushes. Flushes are triggered from several places
+/// (startup, every successful sync, every IDLE wake), and two running at
+/// once could both read the same queued item and send it twice.
+static FLUSH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Attempts to send every message currently sitting in the outbox.
 /// Non-fatal on individual failures — those stay queued for next time.
 pub async fn flush_outbox(account: &Account, store: &Store, account_id: i64) -> Result<usize> {
+    let _guard = FLUSH_LOCK.lock().await;
     let items = store.list_outbox(account_id).await?;
     let mut sent = 0;
 
     for item in items {
+        if item.attempts >= MAX_OUTBOX_ATTEMPTS {
+            continue;
+        }
         let raw = match tokio::fs::read(&item.raw_mime_path).await {
             Ok(raw) => raw,
             Err(e) => {
@@ -79,6 +109,11 @@ pub async fn flush_outbox(account: &Account, store: &Store, account_id: i64) -> 
                 sent += 1;
             }
             Err(e) => {
+                tracing::warn!(
+                    "outbox item {} failed to send (attempt {}): {e}",
+                    item.id,
+                    item.attempts + 1
+                );
                 store.record_outbox_failure(item.id, e.to_string()).await?;
             }
         }
@@ -95,4 +130,26 @@ fn uuid_like() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("{nanos:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_failures_a_retry_could_fix_are_queued() {
+        let transient = Error::Smtp {
+            permanent: false,
+            message: "connection refused".into(),
+        };
+        let permanent = Error::Smtp {
+            permanent: true,
+            message: "535 authentication failed".into(),
+        };
+        assert!(should_queue(&transient));
+        assert!(should_queue(&Error::Io(std::io::Error::other("network down"))));
+        assert!(!should_queue(&permanent), "a 5xx must reach the user, not the outbox");
+        assert!(!should_queue(&Error::InvalidAddress("x".into())));
+        assert!(!should_queue(&Error::MissingSecret("me@example.com".into())));
+    }
 }

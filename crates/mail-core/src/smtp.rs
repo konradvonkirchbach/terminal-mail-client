@@ -38,11 +38,13 @@ pub struct BuiltMessage {
 }
 
 pub fn build(account: &Account, draft: &Draft, attachments: &[AttachmentFile]) -> Result<BuiltMessage> {
-    let from: Mailbox = account
+    let address: lettre::Address = account
         .config
         .email
         .parse()
-        .map_err(|e| Error::Config(format!("invalid account address: {e}")))?;
+        .map_err(|e| Error::InvalidAddress(format!("account address: {e}")))?;
+    let display_name = account.config.display_name.clone().filter(|n| !n.trim().is_empty());
+    let from = Mailbox::new(display_name, address);
 
     let mut builder = LettreMessage::builder().from(from).subject(draft.subject.clone());
 
@@ -60,25 +62,25 @@ pub fn build(account: &Account, draft: &Draft, attachments: &[AttachmentFile]) -
         builder = builder.bcc(mbox);
     }
     if !any_recipient {
-        return Err(Error::Config("message has no recipients".into()));
+        return Err(Error::Compose("message has no recipients".into()));
     }
 
     let message = if attachments.is_empty() {
         builder
             .body(draft.body.clone())
-            .map_err(|e| Error::Config(format!("failed to build message: {e}")))?
+            .map_err(|e| Error::Compose(e.to_string()))?
     } else {
         let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(draft.body.clone()));
         for att in attachments {
             let content_type =
                 ContentType::parse(mime_guess::from_path(&att.filename).first_or_octet_stream().as_ref())
-                    .map_err(|e| Error::Config(format!("invalid attachment content type: {e}")))?;
+                    .map_err(|e| Error::Compose(format!("invalid attachment content type: {e}")))?;
             multipart =
                 multipart.singlepart(Attachment::new(att.filename.clone()).body(att.bytes.clone(), content_type));
         }
         builder
             .multipart(multipart)
-            .map_err(|e| Error::Config(format!("failed to build message: {e}")))?
+            .map_err(|e| Error::Compose(e.to_string()))?
     };
 
     let raw = message.formatted();
@@ -93,10 +95,7 @@ pub fn build(account: &Account, draft: &Draft, attachments: &[AttachmentFile]) -
 
 pub async fn send(account: &Account, built: BuiltMessage) -> Result<()> {
     let transport = transport(account).await?;
-    transport
-        .send(built.message)
-        .await
-        .map_err(|e| Error::Smtp(e.to_string()))?;
+    transport.send(built.message).await?;
     Ok(())
 }
 
@@ -107,20 +106,17 @@ pub async fn send_raw(account: &Account, raw: &[u8], recipients: &[String]) -> R
         .config
         .email
         .parse()
-        .map_err(|e| Error::Config(format!("invalid account address: {e}")))?;
+        .map_err(|e| Error::InvalidAddress(format!("account address: {e}")))?;
     let to = recipients
         .iter()
         .map(|r| r.parse::<lettre::Address>())
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| Error::Config(format!("invalid saved recipient: {e}")))?;
+        .map_err(|e| Error::InvalidAddress(format!("saved recipient: {e}")))?;
     let envelope =
-        lettre::address::Envelope::new(Some(from), to).map_err(|e| Error::Config(format!("invalid envelope: {e}")))?;
+        lettre::address::Envelope::new(Some(from), to).map_err(|e| Error::Compose(format!("invalid envelope: {e}")))?;
 
     let transport = transport(account).await?;
-    transport
-        .send_raw(&envelope, raw)
-        .await
-        .map_err(|e| Error::Smtp(e.to_string()))?;
+    transport.send_raw(&envelope, raw).await?;
     Ok(())
 }
 
@@ -138,7 +134,12 @@ async fn transport(account: &Account) -> Result<AsyncSmtpTransport<Tokio1Executo
     } else {
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.smtp_host)
     }
-    .map_err(|e| Error::Smtp(e.to_string()))?;
+    // A bad host/TLS setup is a configuration problem, not something a
+    // retry fixes — mark it permanent so it isn't queued.
+    .map_err(|e| Error::Smtp {
+        permanent: true,
+        message: format!("invalid SMTP host {:?}: {e}", cfg.smtp_host),
+    })?;
 
     Ok(builder.port(cfg.smtp_port).credentials(creds).build())
 }
@@ -150,7 +151,7 @@ fn parse_mailboxes(field: &str) -> Result<Vec<Mailbox>> {
         .filter(|s| !s.is_empty())
         .map(|s| {
             s.parse::<Mailbox>()
-                .map_err(|e| Error::Config(format!("invalid address {s:?}: {e}")))
+                .map_err(|e| Error::InvalidAddress(format!("{s:?}: {e}")))
         })
         .collect()
 }
@@ -196,6 +197,18 @@ mod tests {
     }
 
     #[test]
+    fn build_puts_the_configured_display_name_in_the_from_header() {
+        let mut account = test_account();
+        account.config.display_name = Some("Jane Doe".to_string());
+        let built = build(&account, &draft("bob@example.com", "", ""), &[]).unwrap();
+        let raw = String::from_utf8_lossy(&built.raw);
+        assert!(
+            raw.contains("From: \"Jane Doe\" <me@example.com>") || raw.contains("From: Jane Doe <me@example.com>"),
+            "{raw}"
+        );
+    }
+
+    #[test]
     fn build_with_no_recipients_at_all_is_rejected() {
         match build(&test_account(), &draft("", "", ""), &[]) {
             Err(e) => assert!(e.to_string().contains("no recipients")),
@@ -206,8 +219,8 @@ mod tests {
     #[test]
     fn build_rejects_an_unparsable_address() {
         match build(&test_account(), &draft("not-an-email", "", ""), &[]) {
-            Err(Error::Config(_)) => {}
-            Err(other) => panic!("expected Error::Config, got {other:?}"),
+            Err(Error::InvalidAddress(_)) => {}
+            Err(other) => panic!("expected Error::InvalidAddress, got {other:?}"),
             Ok(_) => panic!("expected an error for an unparsable address"),
         }
     }

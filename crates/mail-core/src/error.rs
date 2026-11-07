@@ -1,5 +1,14 @@
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl From<lettre::transport::smtp::Error> for Error {
+    fn from(e: lettre::transport::smtp::Error) -> Self {
+        Error::Smtp {
+            permanent: e.is_permanent(),
+            message: e.to_string(),
+        }
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("config error: {0}")]
@@ -17,8 +26,21 @@ pub enum Error {
     #[error("IMAP protocol error: {0}")]
     Imap(String),
 
-    #[error("SMTP error: {0}")]
-    Smtp(String),
+    /// `permanent` is lettre's classification of the server's reply: a
+    /// 5xx (bad credentials, a rejected recipient, a message too large)
+    /// won't succeed on retry, so it must be shown to the user rather than
+    /// queued. Everything else (connection failures, timeouts, 4xx) might.
+    #[error("SMTP error: {message}")]
+    Smtp { permanent: bool, message: String },
+
+    #[error("invalid address: {0}")]
+    InvalidAddress(String),
+
+    #[error("couldn't build the message: {0}")]
+    Compose(String),
+
+    #[error("local cache error: {0}")]
+    Store(String),
 
     #[error("TLS error: {0}")]
     Tls(String),
