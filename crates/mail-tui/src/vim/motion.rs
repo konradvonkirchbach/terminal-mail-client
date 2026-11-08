@@ -593,7 +593,7 @@ fn quote_object(b: &Chars, p: Pos, q: char, inner: bool) -> Option<Range> {
         .filter(|(_, &c)| c == q)
         .map(|(i, _)| i)
         .collect();
-    let pairs: Vec<(usize, usize)> = quotes.chunks_exact(2).map(|w| (w[0], w[1])).collect();
+    let pairs: Vec<(usize, usize)> = quotes.as_chunks::<2>().0.iter().map(|&[o, c]| (o, c)).collect();
     let (open, close) = pairs
         .iter()
         .find(|&&(o, c)| o <= p.col && p.col <= c)
