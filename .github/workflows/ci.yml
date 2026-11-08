@@ -11,7 +11,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Pinned so new lints in a Rust release can't fail CI on their own;
       # bump this version deliberately and fix what it reports.
       - uses: dtolnay/rust-toolchain@1.99.0
